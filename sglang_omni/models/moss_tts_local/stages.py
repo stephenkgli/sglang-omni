@@ -558,6 +558,12 @@ def create_sglang_tts_engine_executor(
         model=model
     )
 
+    def abort_request(request_id: str) -> None:
+        # Drop any prepared handoff and release any held pool row; both are
+        # idempotent no-ops if the request never reached them.
+        cleanup_prepared_moss_tts_local_request(request_id)
+        model.reset_request(request_id)
+
     return OmniScheduler(
         tp_worker=model_worker,
         tree_cache=tree_cache,
@@ -570,7 +576,7 @@ def create_sglang_tts_engine_executor(
         model_runner=MossTTSLocalModelRunner(model_worker, output_proc),
         request_builder=request_builder,
         result_adapter=result_adapter,
-        abort_callback=cleanup_prepared_moss_tts_local_request,
+        abort_callback=abort_request,
     )
 
 

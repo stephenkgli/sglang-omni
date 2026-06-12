@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import collections
 import threading
 import time
 from dataclasses import dataclass, field
@@ -45,7 +44,6 @@ class MossTTSLocalSGLangRequestData(ARRequestData):
     model_config: Any = None
     prompt_rows: torch.Tensor | None = None
     output_rows: list[torch.Tensor] = field(default_factory=list)
-    pending_feedback_queue: Any = field(default_factory=collections.deque)
     # Checkpoint generate() defaults: the binary continue/stop head samples at
     # plain temperature 1.0 while the audio channels use the model-card
     # recommendation (1.7 / 0.8 / 25, repetition penalty off).
@@ -438,6 +436,11 @@ def make_moss_tts_local_scheduler_adapters(*, model: Any):
         return build_sglang_moss_tts_local_request(payload, model=model)
 
     def result_adapter(data: MossTTSLocalSGLangRequestData) -> StagePayload:
-        return apply_sglang_moss_tts_local_result(data.stage_payload, data)
+        try:
+            return apply_sglang_moss_tts_local_result(data.stage_payload, data)
+        finally:
+            # Release the finished request's decode-state pool row (mirrors
+            # Higgs request_builders.py:186); recycles the row for a waiter.
+            model.reset_request(data.stage_payload.request_id)
 
     return request_builder, result_adapter

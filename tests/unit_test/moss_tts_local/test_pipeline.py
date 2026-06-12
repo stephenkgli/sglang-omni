@@ -411,7 +411,6 @@ def test_audio_repetition_penalty_matches_upstream_semantics():
 
 
 def test_row_radix_token_ids_hash_rows_and_keep_eos():
-    from sglang_omni.models.moss_tts.request_builders import build_row_cache_key_ids
     from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
 
     end_id = 151670
@@ -422,14 +421,17 @@ def test_row_radix_token_ids_hash_rows_and_keep_eos():
     next_text = rows[:, 0].clone()
 
     out = MossTTSLocalModelRunner._row_radix_token_ids(rows, next_text, end_id)
-    expected = [k % 151643 for k in build_row_cache_key_ids(rows)]
+    # Post-090c9cf the generated-row key is the capture-safe GPU polynomial hash
+    # (gpu_radix_row_hash), not the host blake2b; assert the spec the key must
+    # satisfy, not a specific digest. Exact hash semantics live in
+    # test_radix_hash.py / docs/design/gpu_radix_hash.md.
     assert int(out[1]) == end_id  # stop decision keeps the raw eos id
-    assert int(out[0]) == expected[0]
-    assert int(out[2]) == expected[2]
-    assert int(out[0]) != int(out[2])  # different codes -> different keys
+    assert int(out[0]) != int(out[2])  # full-row dependence: codes differ -> keys
     assert int(out[0]) != slot_id  # no longer the constant slot id
-    # Generated ids must stay inside the vocab: the scheduler finishes any
-    # request whose output id crosses the vocab boundary.
+    # Hashed (non-eos) rows fold below the special-token band so the scheduler's
+    # vocab-boundary finish never trips on a generated frame.
+    assert int(out[0]) < 151643
+    assert int(out[2]) < 151643
     assert all(0 <= int(v) < 151936 for v in out)
 
 
@@ -1131,3 +1133,142 @@ def test_encode_audio_stereo_wav_and_mono_fallback():
         np.ones(64, dtype=np.float32) * 0.1, response_format="wav", sample_rate=48000
     )
     assert struct.unpack("<H", mono_blob[22:24])[0] == 1
+
+
+def test_post_process_outputs_skips_chunked_rows():
+    """Chunked-prefill rows must not be appended to output_rows."""
+    pytest.importorskip("sglang")
+    import types
+
+    from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
+    from sglang_omni.models.moss_tts_local.state_pool import MossTTSLocalDecodeJournal
+
+    batch_size = 2
+
+    # Minimal model stub providing only what post_process_outputs needs.
+    model_stub = types.SimpleNamespace(
+        config=types.SimpleNamespace(audio_end_token_id=151670)
+    )
+    runner = MossTTSLocalModelRunner.__new__(MossTTSLocalModelRunner)
+    runner.model = model_stub
+
+    # Two rows: row 0 is chunked (mid-prefill), row 1 is normal.
+    rows = torch.arange(batch_size * (N_VQ + 1), dtype=torch.long).reshape(
+        batch_size, N_VQ + 1
+    )
+
+    # Build minimal sched_req stubs.
+    def _req(is_chunked):
+        return types.SimpleNamespace(is_chunked=is_chunked)
+
+    def _sched_req(rid, is_chunked):
+        data = types.SimpleNamespace(req=_req(is_chunked), output_rows=[])
+        return types.SimpleNamespace(request_id=rid, data=data)
+
+    req_a = _sched_req("r0", is_chunked=1)  # mid-prefill chunk, must be skipped
+    req_b = _sched_req("r1", is_chunked=0)  # normal decode row
+
+    sched_output = types.SimpleNamespace(requests=[req_a, req_b])
+    outputs = {
+        "r0": types.SimpleNamespace(data=1000),  # non-end token
+        "r1": types.SimpleNamespace(data=1001),  # non-end token
+    }
+
+    # Output collection goes solely through the per-step journal. Chunked rows
+    # are not journaled because no frame should be emitted or fed back.
+    result = types.SimpleNamespace(
+        moss_journal=MossTTSLocalDecodeJournal(
+            rids=["r1"], pool_rows=[1], rows=rows[1:]
+        )
+    )
+    runner.post_process_outputs(result, sched_output, outputs)
+
+    assert req_a.data.output_rows == [], "chunked row must not be appended"
+    assert len(req_b.data.output_rows) == 1, "normal row must be appended"
+
+
+def test_finalize_skip_rids_selects_chunked_rows():
+    pytest.importorskip("sglang")
+    import types
+
+    from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
+
+    runner = MossTTSLocalModelRunner.__new__(MossTTSLocalModelRunner)
+
+    def _sched_req(rid, is_chunked):
+        data = types.SimpleNamespace(req=types.SimpleNamespace(is_chunked=is_chunked))
+        return types.SimpleNamespace(request_id=rid, data=data)
+
+    sched_output = types.SimpleNamespace(
+        requests=[
+            _sched_req("c0", is_chunked=1),
+            _sched_req("c1", is_chunked=2),
+            _sched_req("final", is_chunked=0),
+        ]
+    )
+    assert runner.finalize_skip_rids(sched_output) == {"c0", "c1"}
+
+
+def test_chunked_prefill_generation_steps_matches_single_shot():
+    # A K-chunk prefill (mid chunks is_chunked>0, final is_chunked==0) must leave
+    # generation_steps identical to a single-shot prefill, so the first decode
+    # frame samples at the same position (position = generation_steps *
+    # num_channels + channel) — bit-identical to the no-chunk path.
+    pytest.importorskip("sglang")
+    import types
+
+    from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
+
+    class _OutputProcessor:
+        def process(self, batch_result, scheduler_output):
+            del batch_result
+            return {
+                req.request_id: types.SimpleNamespace(extra=None)
+                for req in scheduler_output.requests
+            }
+
+    def _make_runner():
+        runner = MossTTSLocalModelRunner.__new__(MossTTSLocalModelRunner)
+        runner.model = types.SimpleNamespace(
+            config=types.SimpleNamespace(audio_end_token_id=151670)
+        )
+        runner.output_processor = _OutputProcessor()
+        return runner
+
+    def _finalize_once(runner, sched_req):
+        runner._finalize(
+            types.SimpleNamespace(
+                next_token_ids=torch.tensor([0]),
+                logits_output=None,
+                can_run_cuda_graph=False,
+                moss_journal=None,
+            ),
+            types.SimpleNamespace(),
+            types.SimpleNamespace(is_prefill_only=False, output_ids=None),
+            types.SimpleNamespace(),
+            types.SimpleNamespace(requests=[sched_req]),
+        )
+
+    # Single-shot prefill: the only chunk is final → exactly one advance.
+    runner = _make_runner()
+    data = types.SimpleNamespace(
+        req=types.SimpleNamespace(is_chunked=0),
+        generation_steps=0,
+        extra_model_outputs={},
+    )
+    _finalize_once(runner, types.SimpleNamespace(request_id="r", data=data))
+    assert data.generation_steps == 1
+
+    # 3-chunk prefill on the same request: mid chunks (is_chunked>0) suppressed,
+    # final chunk advances → same end state as single-shot.
+    runner = _make_runner()
+    data = types.SimpleNamespace(
+        req=types.SimpleNamespace(is_chunked=2),
+        generation_steps=0,
+        extra_model_outputs={},
+    )
+    sched_req = types.SimpleNamespace(request_id="r", data=data)
+    for is_chunked in (2, 1, 0):
+        data.req.is_chunked = is_chunked
+        _finalize_once(runner, sched_req)
+    assert data.generation_steps == 1
