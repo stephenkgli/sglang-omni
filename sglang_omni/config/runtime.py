@@ -61,14 +61,11 @@ def resolve_stage_factory_arg_defaults(
 ) -> dict[str, Any]:
     """Return standard factory kwargs used only when the factory declares them."""
 
-    defaults: dict[str, Any] = {
-        "model_path": global_cfg.model_path,
-        "gpu_id": (
-            gpu_id
-            if gpu_id is not None
-            else _resolve_primary_gpu_id(stage_cfg, global_cfg)
-        ),
-    }
+    defaults: dict[str, Any] = {"model_path": global_cfg.model_path}
+    if gpu_id is None:
+        gpu_id = _resolve_primary_gpu_id(stage_cfg, global_cfg)
+    if gpu_id is not None:
+        defaults["gpu_id"] = gpu_id
     total_gpu_memory_fraction = stage_cfg.runtime.resources.total_gpu_memory_fraction
     if total_gpu_memory_fraction is not None:
         defaults["total_gpu_memory_fraction"] = total_gpu_memory_fraction
