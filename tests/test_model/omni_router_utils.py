@@ -19,13 +19,13 @@ import pytest
 import requests
 import yaml
 
+from sglang_omni.utils import find_available_port
 from tests.utils import (
     disable_proxy,
     server_log_file,
     start_server_from_cmd,
     stop_server,
 )
-from sglang_omni.utils import find_available_port
 
 REQUEST_TIMEOUT = 20
 LOG_TAIL_LINES = 120
