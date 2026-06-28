@@ -62,6 +62,7 @@ def test_tp_child_keeps_parent_mapped_visible_device(monkeypatch) -> None:
         tp_size=2,
         gpu_id=1,
         factory_args={"gpu_id": 1},
+        factory_arg_defaults={"gpu_id": 1},
         relay_config={"gpu_id": 1},
     )
 
@@ -69,6 +70,7 @@ def test_tp_child_keeps_parent_mapped_visible_device(monkeypatch) -> None:
 
     assert spec.gpu_id == 0
     assert spec.factory_args["gpu_id"] == 0
+    assert spec.factory_arg_defaults["gpu_id"] == 0
     assert spec.relay_config["gpu_id"] == 0
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "4"
 
@@ -143,6 +145,40 @@ def test_gpu_scheduler_construction_uses_startup_lock(monkeypatch) -> None:
 
     assert isinstance(scheduler, FakeScheduler)
     assert seen_gpu_ids == [0]
+
+
+def test_scheduler_applies_child_defaults_without_overriding_explicit_args(
+    monkeypatch,
+) -> None:
+    seen_gpu_ids: list[int] = []
+
+    @contextmanager
+    def _fake_lock(gpu_id: int):
+        seen_gpu_ids.append(gpu_id)
+        yield Path("/tmp/test.lock")
+
+    monkeypatch.setattr(stage_workers, "gpu_startup_lock", _fake_lock)
+    spec = StageLaunchConfig(
+        stage_name="thinker",
+        factory=fake_factory_path("runtime_factory"),
+        factory_args={
+            "model_path": "runtime-model",
+            "thinker_max_seq_len": 128,
+        },
+        factory_arg_defaults={
+            "model_path": "global-model",
+            "gpu_id": 7,
+            "total_gpu_memory_fraction": 0.25,
+        },
+    )
+
+    result = stage_workers._construct_scheduler(spec, 3, _RecordingLog())
+
+    assert result["model_path"] == "runtime-model"
+    assert result["gpu_id"] == 3
+    assert result["thinker_max_seq_len"] == 128
+    assert result["total_gpu_memory_fraction"] == 0.25
+    assert seen_gpu_ids == [3]
 
 
 def test_construct_stage_uses_factory_gpu_id_for_device_and_startup_lock(
