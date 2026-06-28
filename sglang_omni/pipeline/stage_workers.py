@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Sequence
 
+from sglang_omni.config.runtime import resolve_factory_signature_args
 from sglang_omni.pipeline.control_plane import StageControlPlane
 from sglang_omni.pipeline.local_dispatch import LocalStageDispatcher
 from sglang_omni.pipeline.stage.input import AggregatedInput, DirectInput
@@ -53,6 +54,7 @@ class StageLaunchConfig:
     # Factory
     factory: str = ""
     factory_args: dict[str, Any] = field(default_factory=dict)
+    factory_arg_defaults: dict[str, Any] = field(default_factory=dict)
     env_defaults: dict[str, str] = field(default_factory=dict)
 
     # Routing: static next stage(s)
@@ -438,6 +440,8 @@ def _construct_stage(
     gpu_id = spec.relay_config.get("gpu_id")
     if gpu_id is None:
         gpu_id = spec.factory_args.get("gpu_id")
+    if gpu_id is None and spec.gpu_id is not None:
+        gpu_id = spec.gpu_id
     if gpu_id is None and _factory_args_use_cuda(spec.factory_args):
         gpu_id = spec.gpu_id
     if gpu_id is not None:
@@ -635,12 +639,19 @@ def _construct_scheduler(
     """Build a scheduler, serializing GPU factory work per visible device."""
 
     factory = import_string(spec.factory)
+    factory_arg_defaults = dict(spec.factory_arg_defaults)
+    factory_arg_defaults["gpu_id"] = gpu_id
+    factory_args = resolve_factory_signature_args(
+        factory,
+        spec.factory_args,
+        defaults=factory_arg_defaults,
+    )
     if gpu_id is None:
-        return factory(**spec.factory_args)
+        return factory(**factory_args)
 
     with gpu_startup_lock(int(gpu_id)) as lock_path:
         log.info(f"Acquired GPU startup lock for stage {spec.stage_name}: {lock_path}")
-        return factory(**spec.factory_args)
+        return factory(**factory_args)
 
 
 def _factory_args_use_cuda(factory_args: Mapping[str, Any]) -> bool:
@@ -716,6 +727,8 @@ def _prepare_cuda_environment(
 def _normalize_spec_gpu_id_to_local_device(spec: StageLaunchConfig) -> None:
     if "gpu_id" in spec.factory_args:
         spec.factory_args["gpu_id"] = 0
+    if "gpu_id" in spec.factory_arg_defaults:
+        spec.factory_arg_defaults["gpu_id"] = 0
     if "gpu_id" in spec.relay_config:
         spec.relay_config["gpu_id"] = 0
     spec.gpu_id = 0

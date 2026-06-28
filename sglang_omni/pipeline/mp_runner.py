@@ -18,7 +18,10 @@ from sglang_omni.config.placement import (
     resolve_same_gpu_stream_targets,
     resolve_stage_gpu_ids,
 )
-from sglang_omni.config.runtime import resolve_stage_factory_args
+from sglang_omni.config.runtime import (
+    resolve_stage_factory_arg_defaults,
+    resolve_stage_static_factory_args,
+)
 from sglang_omni.config.schema import PipelineConfig, StageConfig
 from sglang_omni.config.topology import ProcessTopologyPlan
 from sglang_omni.pipeline import Coordinator
@@ -83,8 +86,10 @@ def _build_stage_groups(
             process_plan,
         )
 
-        # Pre-resolve factory args (inject model_path, gpu_id)
-        base_factory_args = resolve_stage_factory_args(stage_cfg, config)
+        # Avoid importing stage factories in the parent process. The child
+        # injects signature-dependent args after importing the factory it must
+        # construct anyway.
+        base_factory_args = resolve_stage_static_factory_args(stage_cfg, config)
 
         stage_kwargs = dict(
             stage_name=stage_cfg.name,
@@ -215,6 +220,11 @@ def _build_single_stage_spec(
         gpu_id=gpu_id,
         nccl_port=None,
         factory_args=factory_args,
+        factory_arg_defaults=resolve_stage_factory_arg_defaults(
+            stage_cfg,
+            config,
+            gpu_id=gpu_id,
+        ),
         relay_config=relay_config,
         recv_endpoint=recv_endpoint,
         **stage_kwargs,
@@ -259,6 +269,11 @@ def _build_tp_stage_specs(
                     gpu_id=gpu_id,
                     nccl_port=nccl_port,
                     factory_args=factory_args,
+                    factory_arg_defaults=resolve_stage_factory_arg_defaults(
+                        stage_cfg,
+                        config,
+                        gpu_id=gpu_id,
+                    ),
                     relay_config=relay_config,
                     recv_endpoint=recv_endpoint,
                     follower_work_queues=follower_work_queues,
@@ -278,6 +293,11 @@ def _build_tp_stage_specs(
                 gpu_id=gpu_id,
                 nccl_port=nccl_port,
                 factory_args=factory_args,
+                factory_arg_defaults=resolve_stage_factory_arg_defaults(
+                    stage_cfg,
+                    config,
+                    gpu_id=gpu_id,
+                ),
                 relay_config=relay_config,
                 recv_endpoint="",
                 internal_work_queue=follower_work_queues[idx],
