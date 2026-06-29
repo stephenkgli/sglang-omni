@@ -142,7 +142,6 @@ def _build_stage_groups(
                         spec.tp_rank
                     ],
                     stage_specs=[spec],
-                    gpu_id=spec.gpu_id,
                 )
                 for spec in specs
             ]
@@ -160,7 +159,6 @@ def _build_stage_groups(
                             single_stage_specs[stage_name]
                             for stage_name in group.stage_names
                         ],
-                        gpu_id=group.gpu_id,
                     )
                 ],
             )
@@ -210,8 +208,6 @@ def _build_single_stage_spec(
     stage_kwargs: dict[str, Any],
 ) -> StageLaunchConfig:
     factory_args = dict(base_factory_args)
-    if "gpu_id" in base_factory_args:
-        factory_args["gpu_id"] = gpu_id
     relay_config = _resolve_relay_config(stage_cfg, config, gpu_id=gpu_id)
     return StageLaunchConfig(
         role="single",
@@ -221,9 +217,7 @@ def _build_single_stage_spec(
         nccl_port=None,
         factory_args=factory_args,
         factory_arg_defaults=resolve_stage_factory_arg_defaults(
-            stage_cfg,
-            config,
-            gpu_id=gpu_id,
+            stage_cfg, config, gpu_id=gpu_id
         ),
         relay_config=relay_config,
         recv_endpoint=recv_endpoint,
@@ -252,8 +246,6 @@ def _build_tp_stage_specs(
         if gpu_id is None:
             raise ValueError(f"TP stage {stage_cfg.name!r} requires GPU placement")
         factory_args = dict(base_factory_args)
-        if "gpu_id" in base_factory_args:
-            factory_args["gpu_id"] = gpu_id
         factory_args["tp_rank"] = tp_rank
         factory_args["tp_size"] = stage_cfg.tp_size
         factory_args["nccl_port"] = nccl_port
@@ -270,9 +262,7 @@ def _build_tp_stage_specs(
                     nccl_port=nccl_port,
                     factory_args=factory_args,
                     factory_arg_defaults=resolve_stage_factory_arg_defaults(
-                        stage_cfg,
-                        config,
-                        gpu_id=gpu_id,
+                        stage_cfg, config, gpu_id=gpu_id
                     ),
                     relay_config=relay_config,
                     recv_endpoint=recv_endpoint,
@@ -294,9 +284,7 @@ def _build_tp_stage_specs(
                 nccl_port=nccl_port,
                 factory_args=factory_args,
                 factory_arg_defaults=resolve_stage_factory_arg_defaults(
-                    stage_cfg,
-                    config,
-                    gpu_id=gpu_id,
+                    stage_cfg, config, gpu_id=gpu_id
                 ),
                 relay_config=relay_config,
                 recv_endpoint="",

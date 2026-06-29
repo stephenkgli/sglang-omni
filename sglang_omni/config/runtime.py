@@ -107,6 +107,19 @@ def reject_untyped_total_gpu_memory_fraction(
     )
 
 
+def reject_gpu_id_in_factory_args(
+    stage_name: str,
+    factory_args: dict[str, Any],
+    runtime_overrides: dict[str, Any],
+) -> None:
+    if "gpu_id" not in factory_args and "gpu_id" not in runtime_overrides:
+        return
+    raise ValueError(
+        f"Stage {stage_name!r} sets gpu_id through factory_args/runtime_overrides; "
+        "gpu_id is owned by placement — set the device via stage.gpu instead"
+    )
+
+
 def _validate_runtime_sources(
     stage_cfg: StageConfig,
     factory_args: dict[str, Any],
@@ -126,6 +139,12 @@ def _validate_runtime_sources(
         )
 
     reject_untyped_total_gpu_memory_fraction(
+        stage_cfg.name,
+        factory_args,
+        runtime_overrides,
+    )
+
+    reject_gpu_id_in_factory_args(
         stage_cfg.name,
         factory_args,
         runtime_overrides,
