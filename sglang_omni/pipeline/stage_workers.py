@@ -442,8 +442,6 @@ def _construct_stage(
         gpu_id = spec.factory_args.get("gpu_id")
     if gpu_id is None and spec.gpu_id is not None:
         gpu_id = spec.gpu_id
-    if gpu_id is None and _factory_args_use_cuda(spec.factory_args):
-        gpu_id = spec.gpu_id
     if gpu_id is not None:
         import torch
 
@@ -652,13 +650,6 @@ def _construct_scheduler(
     with gpu_startup_lock(int(gpu_id)) as lock_path:
         log.info(f"Acquired GPU startup lock for stage {spec.stage_name}: {lock_path}")
         return factory(**factory_args)
-
-
-def _factory_args_use_cuda(factory_args: Mapping[str, Any]) -> bool:
-    for value in factory_args.values():
-        if isinstance(value, str) and value.startswith("cuda"):
-            return True
-    return False
 
 
 def get_stage_process_env(
