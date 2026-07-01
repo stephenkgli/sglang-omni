@@ -73,7 +73,7 @@ stages = [
 | --- | --- | --- | --- |
 | `name` | `str` | required | Unique stage identifier. |
 | `factory` | `str` | required | Dotted import path to the stage factory. |
-| `factory_args` | `dict[str, Any]` | `{}` | Arguments forwarded to the factory. Runtime prep may inject `model_path` and `gpu_id` if the factory accepts them and they are not already set. |
+| `factory_args` | `dict[str, Any]` | `{}` | Arguments forwarded to the factory. Runtime prep injects `model_path` when the factory accepts it and it is not already set. `gpu_id` is owned by placement and is **rejected** here (set the device via `gpu` instead); when the factory accepts `gpu_id`, the worker injects the resolved placement device. |
 | `next` | `str`, `list[str]`, or `None` | `None` | Static downstream stage or stages for normal result routing. |
 | `terminal` | `bool` | `False` | Marks a stage as terminal; terminal results are sent to the coordinator. |
 | `route_fn` | `str` or `None` | `None` | Dotted function path for request-aware result routing. The function receives `(request_id, stage_output)` and returns a downstream stage name or list of stage names. |
@@ -162,8 +162,9 @@ Runtime prep builds the resolved state used by the runner:
 - allocate ZMQ endpoints
 - resolve dotted factory, merge, and projection functions
 - merge `factory_args` with `runtime_overrides`
-- inject global values such as `model_path` and `gpu_id` into factory args when
-  accepted by the factory
+- inject `model_path` into factory args when accepted by the factory and not
+  already set; `gpu_id` is rejected from `factory_args` and injected from stage
+  placement in the worker when the factory accepts it
 - build relay config from stage placement and relay backend
 - wire stream targets and same-GPU stream fast paths
 

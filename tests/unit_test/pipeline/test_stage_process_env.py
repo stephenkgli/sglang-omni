@@ -61,7 +61,6 @@ def test_tp_child_keeps_parent_mapped_visible_device(monkeypatch) -> None:
         tp_rank=1,
         tp_size=2,
         gpu_id=1,
-        factory_args={"gpu_id": 1},
         factory_arg_defaults={"gpu_id": 1},
         relay_config={"gpu_id": 1},
     )
@@ -69,7 +68,6 @@ def test_tp_child_keeps_parent_mapped_visible_device(monkeypatch) -> None:
     stage_workers._prepare_cuda_environment(spec, _RecordingLog())
 
     assert spec.gpu_id == 0
-    assert spec.factory_args["gpu_id"] == 0
     assert spec.factory_arg_defaults["gpu_id"] == 0
     assert spec.relay_config["gpu_id"] == 0
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "4"
@@ -167,7 +165,7 @@ def test_scheduler_applies_child_defaults_without_overriding_explicit_args(
         },
         factory_arg_defaults={
             "model_path": "global-model",
-            "gpu_id": 7,
+            "gpu_id": 3,
             "total_gpu_memory_fraction": 0.25,
         },
     )
