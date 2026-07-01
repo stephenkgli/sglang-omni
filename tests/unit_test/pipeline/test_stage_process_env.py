@@ -179,10 +179,10 @@ def test_scheduler_applies_child_defaults_without_overriding_explicit_args(
     assert seen_gpu_ids == [3]
 
 
-def test_construct_stage_uses_factory_gpu_id_for_device_and_startup_lock(
+def test_construct_stage_uses_placement_gpu_id_for_device_and_startup_lock(
     monkeypatch,
 ) -> None:
-    """Config-owned gpu_id must drive both current device and startup lock."""
+    """Placement-owned gpu_id must drive device setup and startup lock."""
     import torch
 
     class _FakeStage:
@@ -209,7 +209,7 @@ def test_construct_stage_uses_factory_gpu_id_for_device_and_startup_lock(
         StageLaunchConfig(
             stage_name=f"gpu_stage_{idx}",
             factory=fake_factory_path("make_scheduler_accepting_gpu_id"),
-            factory_args={"gpu_id": 0},
+            factory_arg_defaults={"gpu_id": 0},
             gpu_id=0,
         )
         for idx in range(2)
