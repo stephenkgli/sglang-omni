@@ -73,7 +73,7 @@ stages = [
 | --- | --- | --- | --- |
 | `name` | `str` | required | Unique stage identifier. |
 | `factory` | `str` | required | Dotted import path to the stage factory. |
-| `factory_args` | `dict[str, Any]` | `{}` | Arguments forwarded to the factory. Runtime prep injects `model_path` when the factory accepts it and it is not already set. `gpu_id` is owned by placement and is **rejected** here (set the device via `gpu` instead); when the factory accepts `gpu_id`, the worker injects the resolved placement device. |
+| `factory_args` | `dict[str, Any]` | `{}` | Explicit arguments forwarded to the factory after runtime overrides and typed runtime fields are merged. Signature-dependent defaults such as `model_path`, `gpu_id`, and `total_gpu_memory_fraction` are not written here during runtime prep; the worker injects them after importing the factory. `gpu_id` is owned by placement and is **rejected** here (set the device via `gpu` instead). |
 | `next` | `str`, `list[str]`, or `None` | `None` | Static downstream stage or stages for normal result routing. |
 | `terminal` | `bool` | `False` | Marks a stage as terminal; terminal results are sent to the coordinator. |
 | `route_fn` | `str` or `None` | `None` | Dotted function path for request-aware result routing. The function receives `(request_id, stage_output)` and returns a downstream stage name or list of stage names. |
@@ -160,11 +160,12 @@ Runtime prep builds the resolved state used by the runner:
 - validate stage names and static topology
 - compute the entry stage and terminal stages
 - allocate ZMQ endpoints
-- resolve dotted factory, merge, and projection functions
-- merge `factory_args` with `runtime_overrides`
-- inject `model_path` into factory args when accepted by the factory and not
-  already set; `gpu_id` is rejected from `factory_args` and injected from stage
-  placement in the worker when the factory accepts it
+- carry dotted factory, merge, route, and projection paths into worker specs
+- merge `factory_args` with `runtime_overrides` and typed runtime fields without
+  importing stage factories
+- prepare signature-dependent defaults such as `model_path`, `gpu_id`, and
+  `total_gpu_memory_fraction`; the worker injects them after importing the
+  factory when the factory accepts them
 - build relay config from stage placement and relay backend
 - wire stream targets and same-GPU stream fast paths
 
