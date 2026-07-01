@@ -64,8 +64,7 @@ def resolve_stage_factory_arg_defaults(
     defaults: dict[str, Any] = {"model_path": global_cfg.model_path}
     if gpu_id is None:
         gpu_id = _resolve_primary_gpu_id(stage_cfg, global_cfg)
-    if gpu_id is not None:
-        defaults["gpu_id"] = gpu_id
+    defaults["gpu_id"] = gpu_id
     total_gpu_memory_fraction = stage_cfg.runtime.resources.total_gpu_memory_fraction
     if total_gpu_memory_fraction is not None:
         defaults["total_gpu_memory_fraction"] = total_gpu_memory_fraction
