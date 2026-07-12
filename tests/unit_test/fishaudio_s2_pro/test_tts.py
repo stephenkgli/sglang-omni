@@ -644,7 +644,7 @@ def test_fish_req_hits_max_new_tokens_and_scheduler_reports_length() -> None:
         assert not req.finished()
         req.output_ids.append(value)
         data.output_codes.append(torch.tensor([[value], [5]], dtype=torch.long))
-        req.check_finished()
+        req.update_finish_state()
     assert req.finished()
 
     scheduler = object.__new__(OmniScheduler)

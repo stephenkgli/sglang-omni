@@ -344,7 +344,7 @@ def test_voxtral_steady_decode_reports_cuda_graph_ready(
     monkeypatch.setattr(
         forward_batch_info.ForwardBatch,
         "init_new",
-        staticmethod(lambda model_worker_batch, model_runner: fake_forward_batch),
+        staticmethod(lambda schedule_batch, model_runner: fake_forward_batch),
     )
 
     class FakeVoxtralModel:
@@ -400,7 +400,7 @@ def test_voxtral_steady_decode_reports_cuda_graph_ready(
         forward_mode=SimpleNamespace(is_extend=lambda: False),
         is_prefill_only=False,
         output_ids=None,
-        get_model_worker_batch=lambda: SimpleNamespace(),
+        capture_hidden_mode=None,
     )
 
     output = runner.execute(

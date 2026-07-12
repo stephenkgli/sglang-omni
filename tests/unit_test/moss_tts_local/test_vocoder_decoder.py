@@ -326,7 +326,7 @@ def test_local_causal_flash_plan_skips_identity_kv_gather() -> None:
     assert plan.kv_indices is None
 
 
-def test_local_causal_attention_keeps_packed_flash_cuda() -> None:
+def test_packed_flash_matches_sglang_fa3_supported_architectures_cuda() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
 
@@ -338,7 +338,8 @@ def test_local_causal_attention_keeps_packed_flash_cuda() -> None:
     attn._flash_attn_varlen = lambda *_, **__: torch.empty(0, device="cuda")
     x = torch.empty(1, 6, device="cuda", dtype=torch.bfloat16)
 
-    assert attn._can_run_packed_flash(x)
+    device_major, _ = torch.cuda.get_device_capability(x.device)
+    assert attn._can_run_packed_flash(x) is (device_major in {8, 9})
 
 
 def test_projected_transformer_skips_flash_for_zero_valid_length(monkeypatch) -> None:
@@ -537,6 +538,8 @@ def test_sglang_packed_flash_matches_sdpa_reference_cuda() -> None:
     source.context = None
     wrapper = MossTTSLocalAttention(source)
     x = torch.randn(2, 6, 128, device=device, dtype=torch.bfloat16)
+    if not wrapper._can_run_packed_flash(x):
+        pytest.skip("requires an architecture supported by SGLang FA3")
     input_lengths = torch.tensor([6, 4], device=device)
 
     packed_x, valid_mask, cu_seqlens, position_ids = (
@@ -571,6 +574,8 @@ def test_sglang_chunked_local_flash_matches_sdpa_reference_cuda() -> None:
     source.context = 400
     wrapper = MossTTSLocalAttention(source)
     x = torch.randn(2, 1024, 128, device=device, dtype=torch.bfloat16)
+    if not wrapper._can_run_packed_flash(x):
+        pytest.skip("requires an architecture supported by SGLang FA3")
     input_lengths = torch.tensor([1024, 701], device=device)
 
     packed_x, valid_mask, cu_seqlens, position_ids = (

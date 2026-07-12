@@ -75,7 +75,7 @@ def install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
             self.vocab_size = vocab_size
             self.output_ids = []
             self.prefix_indices = []
-            self.extend_input_len = len(origin_input_ids)
+            self.extend_range = SimpleNamespace(length=len(origin_input_ids))
 
     class FakeSamplingParams:
         def __init__(self, **kwargs) -> None:
@@ -1690,7 +1690,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     monkeypatch.setattr(
         forward_batch_info.ForwardBatch,
         "init_new",
-        staticmethod(lambda model_worker_batch, model_runner: fake_forward_batch),
+        staticmethod(lambda schedule_batch, model_runner: fake_forward_batch),
     )
     monkeypatch.setattr(
         QwenTalkerModelRunner,
@@ -1765,7 +1765,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
         forward_mode=SimpleNamespace(is_extend=lambda: False),
         is_prefill_only=False,
         output_ids=None,
-        get_model_worker_batch=lambda: SimpleNamespace(),
+        capture_hidden_mode=None,
     )
 
     output = runner.execute(

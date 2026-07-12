@@ -221,9 +221,9 @@ def test_qwen_hidden_states_skip_only_explicit_text_output_requests():
         requests=[text_request, audio_request, default_request],
         batch_data=SimpleNamespace(
             reqs=[
-                SimpleNamespace(extend_input_len=1),
-                SimpleNamespace(extend_input_len=1),
-                SimpleNamespace(extend_input_len=1),
+                SimpleNamespace(extend_range=SimpleNamespace(length=1)),
+                SimpleNamespace(extend_range=SimpleNamespace(length=1)),
+                SimpleNamespace(extend_range=SimpleNamespace(length=1)),
             ]
         ),
     )
@@ -262,9 +262,9 @@ def test_qwen_aux_hidden_states_clone_only_audio_request_slice():
         ],
         batch_data=SimpleNamespace(
             reqs=[
-                SimpleNamespace(extend_input_len=1),
-                SimpleNamespace(extend_input_len=1),
-                SimpleNamespace(extend_input_len=1),
+                SimpleNamespace(extend_range=SimpleNamespace(length=1)),
+                SimpleNamespace(extend_range=SimpleNamespace(length=1)),
+                SimpleNamespace(extend_range=SimpleNamespace(length=1)),
             ]
         ),
     )
@@ -320,9 +320,9 @@ def test_qwen_aux_hidden_states_clear_when_no_request_emits_hidden():
         ],
         batch_data=SimpleNamespace(
             reqs=[
-                SimpleNamespace(extend_input_len=1),
-                SimpleNamespace(extend_input_len=1),
-                SimpleNamespace(extend_input_len=1),
+                SimpleNamespace(extend_range=SimpleNamespace(length=1)),
+                SimpleNamespace(extend_range=SimpleNamespace(length=1)),
+                SimpleNamespace(extend_range=SimpleNamespace(length=1)),
             ]
         ),
     )

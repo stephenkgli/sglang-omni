@@ -26,11 +26,11 @@ def _install_fake_forward_batch_module(monkeypatch: pytest.MonkeyPatch) -> None:
 
     class ForwardBatch:
         @staticmethod
-        def init_new(model_worker_batch, model_runner):
+        def init_new(schedule_batch, model_runner):
             del model_runner
             return SimpleNamespace(
                 input_ids=torch.tensor([1]),
-                marker=model_worker_batch.marker,
+                marker=schedule_batch.marker,
             )
 
     forward_batch_info = types.ModuleType(
@@ -54,12 +54,12 @@ class _ForwardMode:
 
 
 def _scheduler_output(*, is_prefill: bool):
-    model_worker_batch = SimpleNamespace(marker="worker-batch")
     schedule_batch = SimpleNamespace(
+        marker="schedule-batch",
         forward_mode=_ForwardMode(is_prefill=is_prefill),
         is_prefill_only=False,
         output_ids=None,
-        get_model_worker_batch=lambda: model_worker_batch,
+        capture_hidden_mode=None,
     )
     request_data = SimpleNamespace(generation_steps=0, extra_model_outputs={})
     request = SimpleNamespace(request_id="req-1", data=request_data)
@@ -205,9 +205,8 @@ def test_finalize_default_batch_generation_hook_calls_single_hook() -> None:
             logits_output=None,
             can_run_cuda_graph=False,
         ),
-        SimpleNamespace(),
-        SimpleNamespace(is_prefill_only=False, output_ids=None),
         SimpleNamespace(seq_lens=[1, 1], input_ids=torch.zeros(2, dtype=torch.long)),
+        SimpleNamespace(is_prefill_only=False, output_ids=None),
         SimpleNamespace(requests=requests),
     )
 

@@ -23,7 +23,6 @@ try:
 except ImportError:
     flash_attn_varlen_func = None
 
-
 # note (Zhang Yiyang): FA3 local-window attention diverges from SDPA when one
 # varlen sequence spans multiple 128-token query tiles. Pack each tile as an
 # independent sequence in one kernel launch.
@@ -329,6 +328,9 @@ class MossTTSLocalAttention(nn.Module):
         if self._flash_attn_varlen is None:
             return False
         if x.device.type != "cuda":
+            return False
+        device_major, _ = torch.cuda.get_device_capability(x.device)
+        if device_major not in {8, 9}:
             return False
         return self.source._get_backend_check_dtype(x) == torch.bfloat16
 

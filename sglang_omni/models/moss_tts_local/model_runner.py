@@ -129,7 +129,8 @@ class MossTTSLocalModelRunner(ModelRunner):
             rows = data.prompt_rows
             if rows is None:
                 raise RuntimeError("MOSS-TTS Local prefill requires prompt_rows")
-            req_len = int(req.extend_input_len)
+            assert req.extend_range is not None
+            req_len = int(req.extend_range.length)
             prefix_len = len(req.prefix_indices)
             pool = self.model._state_pool
             if data.output_rows:

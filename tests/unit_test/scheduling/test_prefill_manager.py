@@ -13,7 +13,7 @@ def test_chunked_request_uses_inflight_middle_chunk_counter(monkeypatch) -> None
         rid="chunked",
         _input_embeds_are_projected=False,
         inflight_middle_chunks=0,
-        extend_input_len=4,
+        extend_range=SimpleNamespace(length=4),
         init_next_round_input=lambda: None,
     )
 

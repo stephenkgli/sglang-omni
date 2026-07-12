@@ -402,10 +402,12 @@ class MultiModalResourceConnector:
         timeout: float,
         max_bytes: int | None,
     ) -> tuple[bytes, str | None]:
-        client = self.connection.get_sync_client()
+        client = None
         current_url = url
         for _ in range(_MAX_HTTP_REDIRECTS + 1):
             self._assert_url_allowed(urlparse(current_url))
+            if client is None:
+                client = self.connection.get_sync_client()
             try:
                 with client.stream(
                     "GET",
@@ -432,10 +434,12 @@ class MultiModalResourceConnector:
         timeout: float,
         max_bytes: int | None,
     ) -> tuple[bytes, str | None]:
-        client = await self.connection.get_async_client()
+        client = None
         current_url = url
         for _ in range(_MAX_HTTP_REDIRECTS + 1):
             await self._assert_url_allowed_async(urlparse(current_url))
+            if client is None:
+                client = await self.connection.get_async_client()
             try:
                 async with client.stream(
                     "GET",

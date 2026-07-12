@@ -767,7 +767,6 @@ def test_cached_pool_rows_drive_collect_and_batched_step_commit():
         result,
         forward_batch,
         schedule_batch,
-        SimpleNamespace(seq_lens=[1, 1], input_ids=torch.zeros(2, dtype=torch.long)),
         scheduler_output,
     )
 
@@ -808,7 +807,6 @@ def test_finalize_commits_generation_steps_to_pool():
         ),
         SimpleNamespace(),
         SimpleNamespace(is_prefill_only=False, output_ids=None),
-        SimpleNamespace(seq_lens=[1], input_ids=torch.zeros(1, dtype=torch.long)),
         SimpleNamespace(requests=[sched_req]),
     )
 
@@ -848,7 +846,9 @@ def test_resume_reprefill_overwrites_stranded_feedback():
         row_t[1:] = token
         generated.append(row_t)
     data = SimpleNamespace(
-        req=SimpleNamespace(extend_input_len=5, prefix_indices=[], rid="a"),
+        req=SimpleNamespace(
+            extend_range=SimpleNamespace(length=5), prefix_indices=[], rid="a"
+        ),
         prompt_rows=prompt_rows,
         output_rows=generated,
         generation_steps=3,
@@ -1003,7 +1003,9 @@ def test_resume_resets_sampling_steps_to_generation_steps():
 
     width = 13
     data = SimpleNamespace(
-        req=SimpleNamespace(extend_input_len=5, prefix_indices=[], rid="a"),
+        req=SimpleNamespace(
+            extend_range=SimpleNamespace(length=5), prefix_indices=[], rid="a"
+        ),
         prompt_rows=torch.zeros((2, width), dtype=torch.long),
         output_rows=[torch.zeros(width, dtype=torch.long) for _ in range(3)],
         generation_steps=3,
@@ -1042,7 +1044,9 @@ def test_resume_with_empty_output_rows_still_resets_sampling_steps():
 
     width = 13
     data = SimpleNamespace(
-        req=SimpleNamespace(extend_input_len=2, prefix_indices=[], rid="a"),
+        req=SimpleNamespace(
+            extend_range=SimpleNamespace(length=2), prefix_indices=[], rid="a"
+        ),
         prompt_rows=torch.zeros((2, width), dtype=torch.long),
         output_rows=[],  # retracted before emitting any frame
         generation_steps=0,

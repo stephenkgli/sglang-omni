@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from array import array
 from collections import deque
 from queue import Queue
 from types import SimpleNamespace
@@ -11,8 +12,10 @@ import pytest
 import torch
 
 from sglang_omni.scheduling import omni_scheduler as omni_scheduler_module
+from sglang_omni.scheduling.dllm_scheduler import DllmScheduler
 from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+from sglang_omni.scheduling.sglang_compat import normalize_req_token_storage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
@@ -26,6 +29,26 @@ def _init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler._pending_request_builds = {}
     scheduler._backlogged_request_build_payloads = []
     scheduler._request_build_max_pending_observed = 0
+
+
+def test_generation_scheduler_loops_disable_grad_mode() -> None:
+    observed: list[tuple[str, bool]] = []
+
+    omni = object.__new__(OmniScheduler)
+    omni.enable_async_decode = False
+    omni.enable_overlap = False
+    omni._request_build_executor = None
+    omni._event_loop_normal = lambda: observed.append(("omni", torch.is_grad_enabled()))
+
+    dllm = object.__new__(DllmScheduler)
+    dllm._event_loop = lambda: observed.append(("dllm", torch.is_grad_enabled()))
+
+    with torch.enable_grad():
+        omni.start()
+        dllm.start()
+        assert torch.is_grad_enabled()
+
+    assert observed == [("omni", False), ("dllm", False)]
 
 
 def test_simple_scheduler_batch_and_error_contracts() -> None:
@@ -182,6 +205,11 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
         "release_kv_cache",
         lambda req, cache: release_calls.append((req.rid, cache)),
     )
+    monkeypatch.setattr(
+        omni_scheduler_module,
+        "resolve_forward_inputs",
+        lambda _batch, _future_map: None,
+    )
 
     class BoomModelRunner:
         def execute(self, sched_output):
@@ -209,6 +237,7 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
     scheduler.last_batch = None
     scheduler._first_emit_done = set()
     scheduler._prefill_start_done = set()
+    scheduler.future_map = object()
 
     batch = SimpleNamespace(
         reqs=[
@@ -250,8 +279,8 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
     assert scheduler._dirty_deferred_request_ids == set()
 
 
-def test_omni_scheduler_custom_runner_updates_next_input_ids() -> None:
-    """Custom AR runners must preserve SGLang's decode handoff contract."""
+def test_omni_scheduler_custom_runner_relays_next_input_ids(monkeypatch) -> None:
+    """Custom AR runners must preserve SGLang's FutureMap handoff contract."""
 
     next_token_ids = torch.tensor([11, 12], dtype=torch.int32)
 
@@ -264,6 +293,16 @@ def test_omni_scheduler_custom_runner_updates_next_input_ids() -> None:
     scheduler._model_runner = FakeModelRunner()
     scheduler._stream_output_builder = None
     scheduler._prefill_start_done = set()
+    scheduler.future_map = object()
+    relay_calls = []
+    scheduler._relay_forward_payload = lambda indices, result: relay_calls.append(
+        (indices, result)
+    )
+    monkeypatch.setattr(
+        omni_scheduler_module,
+        "resolve_forward_inputs",
+        lambda _batch, _future_map: None,
+    )
 
     batch = SimpleNamespace(
         reqs=[
@@ -271,6 +310,8 @@ def test_omni_scheduler_custom_runner_updates_next_input_ids() -> None:
             SimpleNamespace(rid="req-2", _omni_data=SimpleNamespace()),
         ],
         output_ids=None,
+        input_ids=torch.tensor([9, 10]),
+        req_pool_indices=torch.tensor([1, 2]),
         is_prefill_only=False,
         is_extend_in_batch=False,
     )
@@ -278,11 +319,11 @@ def test_omni_scheduler_custom_runner_updates_next_input_ids() -> None:
     result = scheduler._run_batch(batch)
 
     assert result.next_token_ids is next_token_ids
-    assert batch.input_ids.dtype == torch.int64
-    assert batch.input_ids.tolist() == [11, 12]
+    assert relay_calls == [(batch.req_pool_indices, result)]
+    assert batch.input_ids is None
 
 
-def test_omni_scheduler_custom_runner_advances_forward_ct() -> None:
+def test_omni_scheduler_custom_runner_advances_forward_ct(monkeypatch) -> None:
     """OmniScheduler overrides upstream run_batch, so it must count forwards
     itself; otherwise forward_ct stays 0 and the SGLANG_TEST_RETRACT_INTERVAL
     gate (``forward_ct % INTERVAL == 0``) fires every step. One forward per
@@ -295,18 +336,29 @@ def test_omni_scheduler_custom_runner_advances_forward_ct() -> None:
             return SimpleNamespace(outputs={}, can_run_cuda_graph=False)
 
         def execute_launch(self, sched_output):
-            return SimpleNamespace()
+            return SimpleNamespace(
+                batch_result=SimpleNamespace(has_sampled_token_ids=False)
+            )
 
     scheduler = object.__new__(OmniScheduler)
     scheduler._model_runner = FakeModelRunner()
     scheduler._stream_output_builder = None
     scheduler._prefill_start_done = set()
     scheduler.forward_ct = 0
+    scheduler.future_map = object()
+    scheduler._relay_forward_payload = lambda _indices, _result: None
+    monkeypatch.setattr(
+        omni_scheduler_module,
+        "resolve_forward_inputs",
+        lambda _batch, _future_map: None,
+    )
 
     def _batch():
         return SimpleNamespace(
             reqs=[SimpleNamespace(rid="r", _omni_data=SimpleNamespace())],
             output_ids=None,
+            input_ids=torch.tensor([0]),
+            req_pool_indices=torch.tensor([1]),
             is_prefill_only=False,
             is_extend_in_batch=False,
         )
@@ -713,8 +765,28 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         OmniScheduler,
-        "init_metrics",
+        "init_overlap",
+        lambda self: setattr(self, "future_map", SimpleNamespace()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        OmniScheduler,
+        "init_metrics_collector",
         lambda self, *_args, **_kwargs: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        OmniScheduler,
+        "init_metrics_reporter",
+        lambda self, *_args, **_kwargs: setattr(
+            self,
+            "metrics_reporter",
+            SimpleNamespace(
+                stats=SimpleNamespace(),
+                spec_total_num_accept_tokens=0,
+                spec_total_num_forward_ct=0,
+            ),
+        ),
         raising=False,
     )
     monkeypatch.setattr(
@@ -724,7 +796,7 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     tp_worker = SimpleNamespace(
         gpu_id=0,
         tp_rank=0,
-        model_runner=SimpleNamespace(max_total_num_tokens=128),
+        model_runner=SimpleNamespace(max_total_num_tokens=128, forward_stream=None),
         random_seed=0,
         device=torch.device("cpu"),
     )
@@ -748,6 +820,11 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
         schedule_conservativeness=1.0,
         enable_metrics=False,
         enable_metrics_for_all_schedulers=False,
+        enable_dp_attention=False,
+        attn_cp_size=1,
+        min_free_slots_delay=None,
+        enable_prefill_delayer=False,
+        dcp_size=1,
     )
 
     scheduler = OmniScheduler(
@@ -761,6 +838,33 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
 
     assert scheduler.max_queued_requests == 7
     assert scheduler._abort_on_queued_limit(object()) is False
+    assert scheduler.get_next_batch_to_run() is None
+    assert scheduler._pending_chunked_abort_req is None
+    assert scheduler.pool_stats_observer is not None
+    assert scheduler.load_inquirer is not None
+    assert scheduler.batch_result_processor is not None
+
+
+def test_omni_scheduler_normalizes_req_token_storage_for_sglang() -> None:
+    origin_input_ids = [1, 2, 3]
+    req = SimpleNamespace(
+        origin_input_ids=origin_input_ids,
+        origin_input_ids_unpadded=origin_input_ids,
+    )
+
+    normalize_req_token_storage(req)
+
+    assert req.origin_input_ids.typecode == "q"
+    assert req.origin_input_ids_unpadded is req.origin_input_ids
+    assert req.origin_input_ids + array("q", [4]) == array("q", [1, 2, 3, 4])
+
+
+def test_req_token_storage_initializes_missing_unpadded_alias() -> None:
+    req = SimpleNamespace(origin_input_ids=[1, 2, 3])
+
+    normalize_req_token_storage(req)
+
+    assert req.origin_input_ids_unpadded is req.origin_input_ids
 
 
 def test_stage_output_cache_eviction_uses_lru_order() -> None:

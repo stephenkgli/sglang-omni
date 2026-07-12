@@ -65,7 +65,6 @@ class _PendingStep:
     scheduler_output: Any  # this step's SchedulerOutput (routing + output proc)
     forward_batch: Any  # for resolve-time finalize sampling
     schedule_batch: Any  # to set .output_ids during resolve
-    model_worker_batch: Any  # for the prefill-only finalize branch (unused in decode)
     batch_result: Any  # carries logits_output (device of next_token_ids)
 
 
@@ -141,7 +140,7 @@ class ModelRunner:
         built = self._build_forward_batch(scheduler_output)
         if built is None:
             return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
-        forward_batch, schedule_batch, model_worker_batch, is_prefill = built
+        forward_batch, schedule_batch, is_prefill = built
         batch_result = self._prepare_and_forward(
             forward_batch, schedule_batch, scheduler_output.requests, is_prefill
         )
@@ -157,7 +156,6 @@ class ModelRunner:
             batch_result,
             forward_batch,
             schedule_batch,
-            model_worker_batch,
             scheduler_output,
         )
 
@@ -180,7 +178,7 @@ class ModelRunner:
         built = self._build_forward_batch(scheduler_output)
         if built is None:
             return None
-        forward_batch, schedule_batch, model_worker_batch, is_prefill = built
+        forward_batch, schedule_batch, is_prefill = built
         assert not is_prefill, "async lookahead launch is decode-only"
         batch_result = self._prepare_and_forward(
             forward_batch,
@@ -209,7 +207,6 @@ class ModelRunner:
             scheduler_output=scheduler_output,
             forward_batch=forward_batch,
             schedule_batch=schedule_batch,
-            model_worker_batch=model_worker_batch,
             batch_result=batch_result,
         )
 
@@ -248,7 +245,6 @@ class ModelRunner:
             pending.batch_result,
             pending.forward_batch,
             pending.schedule_batch,
-            pending.model_worker_batch,
             pending.scheduler_output,
             set_output_ids=False,
             skip_rids=skip_rids,
@@ -256,8 +252,8 @@ class ModelRunner:
 
     def _build_forward_batch(self, scheduler_output: Any):
         """Build the ForwardBatch + capture-hidden mode. Returns
-        ``(forward_batch, schedule_batch, model_worker_batch, is_prefill)``, or
-        None when there is no batch to run."""
+        ``(forward_batch, schedule_batch, is_prefill)``, or None when there is
+        no batch to run."""
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardBatch,
@@ -270,7 +266,6 @@ class ModelRunner:
         if schedule_batch is None:
             return None
 
-        model_worker_batch = schedule_batch.get_model_worker_batch()
         is_prefill = bool(schedule_batch.forward_mode.is_extend())
 
         capture_hidden_mode = (
@@ -283,14 +278,14 @@ class ModelRunner:
             )
         )
         if capture_hidden_mode is not None:
-            model_worker_batch.capture_hidden_mode = capture_hidden_mode
+            schedule_batch.capture_hidden_mode = capture_hidden_mode
         elif self.output_processor._capture_hidden:
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+            schedule_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.tp_worker.model_runner
+            schedule_batch, self.tp_worker.model_runner
         )
-        return forward_batch, schedule_batch, model_worker_batch, is_prefill
+        return forward_batch, schedule_batch, is_prefill
 
     def _prepare_and_forward(
         self,
@@ -370,7 +365,6 @@ class ModelRunner:
         batch_result,
         forward_batch,
         schedule_batch,
-        model_worker_batch,
         scheduler_output,
         set_output_ids: bool = True,
         skip_rids: set[str] | None = None,
@@ -391,9 +385,9 @@ class ModelRunner:
         if schedule_batch.is_prefill_only:
             if batch_result.next_token_ids is None:
                 batch_result.next_token_ids = torch.zeros(
-                    len(model_worker_batch.seq_lens),
+                    len(forward_batch.seq_lens),
                     dtype=torch.long,
-                    device=model_worker_batch.input_ids.device,
+                    device=forward_batch.input_ids.device,
                 )
         elif batch_result.next_token_ids is None:
             batch_result.next_token_ids = self._sample_next_token_ids(

@@ -444,8 +444,15 @@ def test_ming_bootstrap_aligns_server_args_tp_size_before_infra(
         captured["nccl_port"] = nccl_port
         captured["model_arch_override"] = model_arch_override
         model = object()
+
+        def init_cuda_graphs() -> None:
+            captured["cuda_graph_inits"] = int(captured.get("cuda_graph_inits", 0)) + 1
+
         model_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(model=model),
+            model_runner=SimpleNamespace(
+                model=model,
+                init_cuda_graphs=init_cuda_graphs,
+            ),
         )
         return (
             model_worker,
@@ -510,6 +517,7 @@ def test_ming_bootstrap_aligns_server_args_tp_size_before_infra(
     assert captured["tp_rank"] == 1
     assert captured["nccl_port"] == 29500
     assert captured["model_arch_override"] == "BailingMoeV2ForCausalLM"
+    assert captured["cuda_graph_inits"] == 1
     assert scheduler.kwargs["server_args"] is server_args
 
 

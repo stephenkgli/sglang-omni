@@ -482,15 +482,32 @@ def _install_fake_moss_ar_factory(
     infrastructure_calls = []
     process_memory_queries = []
 
+    class FakeCudaGraphConfig:
+        def __init__(self, *, is_disabled: bool) -> None:
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            backend = Backend.DISABLED if is_disabled else "enabled"
+            self.prefill = types.SimpleNamespace(backend=backend)
+            self.decode = types.SimpleNamespace(backend=backend)
+
+        def __getitem__(self, phase):
+            return getattr(self, phase)
+
     def fake_build_sglang_server_args(model_path, context_length, **kwargs):
         return types.SimpleNamespace(
             model_path=model_path,
             context_length=context_length,
+            cuda_graph_config=FakeCudaGraphConfig(
+                is_disabled=bool(kwargs.get("disable_cuda_graph"))
+            ),
             **kwargs,
         )
 
     class FakeModelRunner:
         model = object()
+
+        def init_cuda_graphs(self) -> None:
+            return None
 
     model_worker = types.SimpleNamespace(
         model_runner=FakeModelRunner(),
@@ -1940,7 +1957,6 @@ def test_chunked_prefill_generation_steps_matches_single_shot():
             ),
             types.SimpleNamespace(),
             types.SimpleNamespace(is_prefill_only=False, output_ids=None),
-            types.SimpleNamespace(),
             types.SimpleNamespace(requests=[sched_req]),
         )
 

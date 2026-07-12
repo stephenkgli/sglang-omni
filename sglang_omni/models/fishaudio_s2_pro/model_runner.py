@@ -172,7 +172,8 @@ class FishS2ProModelRunner(ModelRunner):
         for sched_req in requests:
             data = sched_req.data
             req = data.req
-            req_len = int(req.extend_input_len)
+            assert req.extend_range is not None
+            req_len = int(req.extend_range.length)
 
             if (
                 data.vq_mask_tokens is None

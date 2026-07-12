@@ -82,6 +82,11 @@ sgl-omni-router = "sglang_omni_router.serve:main"
 [tool.uv]
 override-dependencies = [
     "protobuf>=6.31.1,<7.0.0",
+    # note (kaige): grpcio 1.82 requires protobuf 7, which conflicts with this
+    # repository's protobuf<7 compatibility override.
+    "grpcio>=1.81.1,<1.82",
+    "grpcio-health-checking>=1.81.1,<1.82",
+    "grpcio-reflection>=1.81.1,<1.82",
 ]
 
 [tool.pytest.ini_options]

@@ -113,9 +113,9 @@ class QwenTalkerScheduler(OmniScheduler):
         # wrote at (req_pool_indices, pre-increment seq_lens).
         if not batch.forward_mode.is_decode():
             return
-        if not isinstance(batch.seq_lens_sum, int):
+        if batch.seq_lens_sum is not None:
             raise TypeError(
-                f"seq_lens_sum is {type(batch.seq_lens_sum).__name__}, expected int; "
+                f"seq_lens_sum is {type(batch.seq_lens_sum).__name__}, expected None; "
                 "sglang upstream prepare_for_decode changed; update rollback."
             )
         if batch.out_cache_loc is not None:
@@ -130,7 +130,6 @@ class QwenTalkerScheduler(OmniScheduler):
         batch.seq_lens.sub_(1)
         batch.seq_lens_cpu.sub_(1)
         batch.orig_seq_lens.sub_(1)
-        batch.seq_lens_sum -= len(batch.reqs)
         batch.req_to_token_pool.req_to_token[batch.req_pool_indices, batch.seq_lens] = 0
 
     def self_check_during_idle(self) -> None:

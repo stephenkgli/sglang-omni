@@ -18,8 +18,10 @@ from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import DynamicGradMode
 
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.sglang_compat import normalize_req_token_storage
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,7 @@ class DllmScheduler:
         self._waiting_queue: list[Req] = []
         self._staging_queue: list[Req] = []
 
+    @DynamicGradMode()
     def start(self) -> None:
         self._running = True
         self._event_loop()
@@ -91,10 +94,7 @@ class DllmScheduler:
                 time.sleep(0.001)
                 continue
 
-            model_worker_batch = batch.get_model_worker_batch()
-            forward_batch = ForwardBatch.init_new(
-                model_worker_batch, self.tp_worker.model_runner
-            )
+            forward_batch = ForwardBatch.init_new(batch, self.tp_worker.model_runner)
             batch_result = self.tp_worker.forward_batch_generation(forward_batch)
 
             batch.output_ids = batch_result.next_token_ids
@@ -118,6 +118,7 @@ class DllmScheduler:
             if msg.type == "new_request":
                 req_data = self._request_builder(msg.data)
                 req = req_data.req
+                normalize_req_token_storage(req)
                 self._rid_to_req_data[req.rid] = req_data
                 self._waiting_queue.append(req)
             else:
@@ -227,7 +228,7 @@ class DllmScheduler:
         for req, req_token_ids in zip(batch.reqs, token_ids_per_req):
             for token_id in req_token_ids:
                 req.output_ids.append(int(token_id))
-                req.check_finished()
+                req.update_finish_state()
                 if req.finished():
                     break
 

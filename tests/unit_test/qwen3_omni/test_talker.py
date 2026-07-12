@@ -1217,6 +1217,7 @@ def test_process_input_requests_partial_build_state_machine() -> None:
                 rid=payload.request_id,
                 _omni_data=None,
                 origin_input_ids=[],
+                origin_input_ids_unpadded=[],
                 sampling_params=SimpleNamespace(max_new_tokens=0),
             ),
             thinker_chunks_done=captured_done,
@@ -1402,7 +1403,7 @@ def test_rollback_decode_prep_after_skip_is_idempotent_across_repeated_stalls() 
     pre_seq_lens = torch.tensor([12, 12])
     pre_seq_lens_cpu = torch.tensor([12, 12])
     pre_orig_seq_lens = torch.tensor([10, 11])
-    pre_seq_lens_sum = 24
+    pre_seq_lens_sum = None
 
     reqs = [
         SimpleNamespace(decode_batch_idx=5, kv_committed_len=12, kv_allocated_len=13),
@@ -1422,7 +1423,7 @@ def test_rollback_decode_prep_after_skip_is_idempotent_across_repeated_stalls() 
         seq_lens=pre_seq_lens.clone() + 1,
         seq_lens_cpu=pre_seq_lens_cpu.clone() + 1,
         orig_seq_lens=pre_orig_seq_lens.clone() + 1,
-        seq_lens_sum=pre_seq_lens_sum + len(reqs),
+        seq_lens_sum=pre_seq_lens_sum,
         req_pool_indices=req_pool_indices,
         req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
     )
@@ -1461,7 +1462,7 @@ def test_rollback_decode_prep_after_skip_is_idempotent_across_repeated_stalls() 
     batch.seq_lens.add_(1)
     batch.seq_lens_cpu.add_(1)
     batch.orig_seq_lens.add_(1)
-    batch.seq_lens_sum += len(reqs)
+    batch.seq_lens_sum = None
     req_to_token[req_pool_indices, pre_seq_lens] = torch.tensor(
         [333, 444], dtype=torch.int32
     )
@@ -1506,10 +1507,10 @@ def test_rollback_decode_prep_after_skip_rejects_seq_lens_sum_type_change() -> N
         def is_decode() -> bool:
             return True
 
-    batch = SimpleNamespace(forward_mode=FakeForwardMode(), seq_lens_sum=None)
+    batch = SimpleNamespace(forward_mode=FakeForwardMode(), seq_lens_sum=1)
     scheduler = object.__new__(QwenTalkerScheduler)
 
-    with pytest.raises(TypeError, match="seq_lens_sum is NoneType"):
+    with pytest.raises(TypeError, match="seq_lens_sum is int, expected None"):
         scheduler._rollback_decode_prep_after_skip(batch)
 
 
@@ -1564,7 +1565,7 @@ def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) ->
     )
 
     ScheduleBatch.prepare_for_decode(batch)
-    assert isinstance(batch.seq_lens_sum, int)
+    assert batch.seq_lens_sum is None
     assert int(req_to_token[2, 10]) == 123
 
     allocated = batch.out_cache_loc
@@ -1573,7 +1574,7 @@ def test_prepare_for_decode_rollback_type_contract_with_upstream(monkeypatch) ->
     scheduler.token_to_kv_pool_allocator = SimpleNamespace(free=freed.append)
     scheduler._rollback_decode_prep_after_skip(batch)
 
-    assert batch.seq_lens_sum == 10
+    assert batch.seq_lens_sum is None
     assert torch.equal(batch.seq_lens, torch.tensor([10], dtype=torch.long))
     assert batch.out_cache_loc is None
     assert len(freed) == 1
@@ -1763,7 +1764,11 @@ def test_projected_prefill_reads_tensor_from_data() -> None:
     sched_req = _sched_req(
         input_embeds_are_projected=True,
         prefill_input_embeds=embeds,
-        req=SimpleNamespace(input_embeds=None, prefix_indices=[], extend_input_len=10),
+        req=SimpleNamespace(
+            input_embeds=None,
+            prefix_indices=[],
+            extend_range=SimpleNamespace(length=10),
+        ),
     )
     forward_batch = SimpleNamespace(
         input_embeds=None,
@@ -1794,7 +1799,7 @@ def test_projected_prefill_slices_tensor_by_prefix_indices() -> None:
         req=SimpleNamespace(
             input_embeds=None,
             prefix_indices=list(range(prefix_len)),
-            extend_input_len=7,
+            extend_range=SimpleNamespace(length=7),
         ),
     )
     forward_batch = SimpleNamespace(
@@ -1829,7 +1834,7 @@ def test_projected_prefill_slices_tensor_by_extend_input_len() -> None:
         req=SimpleNamespace(
             input_embeds=None,
             prefix_indices=list(range(prefix_len)),
-            extend_input_len=extend_len,
+            extend_range=SimpleNamespace(length=extend_len),
         ),
     )
     forward_batch = SimpleNamespace(
@@ -1864,7 +1869,7 @@ def test_projected_prefill_list_fallback_slices_by_extend_input_len() -> None:
         req=SimpleNamespace(
             input_embeds=full_embeds.tolist(),
             prefix_indices=list(range(prefix_len)),
-            extend_input_len=extend_len,
+            extend_range=SimpleNamespace(length=extend_len),
         ),
     )
     forward_batch = SimpleNamespace(
@@ -1895,7 +1900,11 @@ def test_projected_prefill_prefers_request_data_over_forward_embeds() -> None:
     sched_req = _sched_req(
         input_embeds_are_projected=True,
         prefill_input_embeds=embeds,
-        req=SimpleNamespace(input_embeds=None, prefix_indices=[], extend_input_len=4),
+        req=SimpleNamespace(
+            input_embeds=None,
+            prefix_indices=[],
+            extend_range=SimpleNamespace(length=4),
+        ),
     )
     forward_batch = SimpleNamespace(
         input_embeds=stale_forward_embeds,
@@ -1921,7 +1930,11 @@ def test_projected_prefill_rejects_mixed_projected_and_list_batch() -> None:
     projected_req = _sched_req(
         input_embeds_are_projected=True,
         prefill_input_embeds=torch.randn(2, 8),
-        req=SimpleNamespace(input_embeds=None, prefix_indices=[], extend_input_len=2),
+        req=SimpleNamespace(
+            input_embeds=None,
+            prefix_indices=[],
+            extend_range=SimpleNamespace(length=2),
+        ),
     )
     list_req = _sched_req(
         input_embeds_are_projected=False,
@@ -1929,7 +1942,7 @@ def test_projected_prefill_rejects_mixed_projected_and_list_batch() -> None:
         req=SimpleNamespace(
             input_embeds=torch.randn(2, 8).tolist(),
             prefix_indices=[],
-            extend_input_len=2,
+            extend_range=SimpleNamespace(length=2),
         ),
     )
     forward_batch = SimpleNamespace(
@@ -1952,7 +1965,9 @@ def test_projected_prefill_full_prefix_hit_returns_none() -> None:
         input_embeds_are_projected=True,
         prefill_input_embeds=embeds,
         req=SimpleNamespace(
-            input_embeds=None, prefix_indices=list(range(5)), extend_input_len=0
+            input_embeds=None,
+            prefix_indices=list(range(5)),
+            extend_range=SimpleNamespace(length=0),
         ),
     )
     forward_batch = SimpleNamespace(
@@ -2001,7 +2016,7 @@ def test_projected_prefill_survives_decode_retract() -> None:
         req=SimpleNamespace(
             input_embeds=None,
             prefix_indices=[],
-            extend_input_len=10,
+            extend_range=SimpleNamespace(length=10),
         ),
         pending_feedback_queue=deque(),
         pending_text_queue=deque(),
@@ -2034,7 +2049,7 @@ def test_projected_prefill_survives_decode_retract() -> None:
     )
 
     sched_req.data.req.prefix_indices = []
-    sched_req.data.req.extend_input_len = 10
+    sched_req.data.req.extend_range.length = 10
 
     second = runner._run_projected_prefill_forward(
         forward_batch, schedule_batch=None, requests=[sched_req]
@@ -2086,7 +2101,7 @@ def test_projected_prefill_retract_replays_generated_decode_inputs() -> None:
         req=SimpleNamespace(
             input_embeds=None,
             prefix_indices=list(range(8)),
-            extend_input_len=5,
+            extend_range=SimpleNamespace(length=5),
             output_ids=[11, 12, 13],
         ),
     )

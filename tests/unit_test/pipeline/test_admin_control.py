@@ -228,12 +228,23 @@ def test_omni_scheduler_flush_cache_has_upstream_idle_compat_fields() -> None:
     reset_calls: list[str] = []
     scheduler = object.__new__(OmniScheduler)
     scheduler.device = "cuda"
+    scheduler.gpu_id = 0
+    scheduler.tp_rank = 0
+    scheduler.tp_size = 1
+    scheduler.pp_rank = 0
+    scheduler.pp_size = 1
+    scheduler.dp_rank = None
+    scheduler.dp_size = 1
+    scheduler.moe_ep_rank = 0
+    scheduler.moe_ep_size = 1
     OmniScheduler._init_upstream_compat_flags(
         scheduler,
         SimpleNamespace(
             enable_hisparse=False,
             enable_priority_scheduling=False,
             disable_priority_preemption=False,
+            enable_dp_attention=False,
+            attn_cp_size=1,
         ),
     )
     scheduler.running_batch = EmptyBatch()
@@ -255,10 +266,14 @@ def test_omni_scheduler_flush_cache_has_upstream_idle_compat_fields() -> None:
     scheduler.token_to_kv_pool_allocator = SimpleNamespace(
         clear=lambda: reset_calls.append("kv_pool")
     )
-    scheduler.reset_metrics = lambda: reset_calls.append("metrics")
+    scheduler.metrics_reporter = SimpleNamespace(
+        reset_metrics=lambda: reset_calls.append("metrics"),
+        is_stats_logging_rank=False,
+    )
     scheduler.draft_worker = None
 
     assert OmniScheduler._flush_cache_after_update(scheduler) is True
+    assert scheduler.ps.pp_size == 1
     assert scheduler.device_module is not None
     assert reset_calls == [
         "tree",

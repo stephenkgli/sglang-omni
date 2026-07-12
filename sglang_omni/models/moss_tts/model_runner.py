@@ -82,7 +82,8 @@ class MossTTSModelRunner(ModelRunner):
             rows = data.prompt_rows
             if rows is None:
                 raise RuntimeError("MOSS-TTS prefill requires prompt_rows")
-            req_len = int(req.extend_input_len)
+            assert req.extend_range is not None
+            req_len = int(req.extend_range.length)
             prefix_len = len(req.prefix_indices)
             current_rows = rows[prefix_len : prefix_len + req_len]
             embeds = self.model._prepare_multi_modal_inputs(

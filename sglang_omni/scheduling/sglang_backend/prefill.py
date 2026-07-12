@@ -125,7 +125,7 @@ class PrefillManager:
                 "Chunked prefill scheduled: rid=%s projected=%s extend_input_len=%s",
                 self.chunked_req.rid,
                 bool(self.chunked_req._input_embeds_are_projected),
-                self.chunked_req.extend_input_len,
+                self.chunked_req.extend_range.length,
             )
 
         if self.chunked_req is not None:
