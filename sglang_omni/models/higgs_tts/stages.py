@@ -65,8 +65,7 @@ from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleSched
 logger = logging.getLogger(__name__)
 
 
-# Codec runs at 75 Hz; chunked prefill of the multi-codebook prompt is unsafe
-# (sampler state machine has no rollback) so reject inputs past chunked_prefill_size.
+# Codec runs at 75 Hz; bound reference-audio prompt and embedding memory.
 _MAX_REF_AUDIO_SEC = 100
 _REF_CODE_CACHE_MAX_ITEMS = 256
 _REF_CODE_CACHE_MAX_BYTES = 256 * 1024 * 1024

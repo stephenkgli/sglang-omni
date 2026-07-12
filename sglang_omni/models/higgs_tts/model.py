@@ -9,6 +9,10 @@ from typing import Any, Iterable, Tuple
 
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from torch import nn
 
@@ -24,6 +28,7 @@ from sglang_omni.models.higgs_tts.sampler import (
     batched_step,
     batched_step_direct,
 )
+from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
 from sglang_omni.models.higgs_tts.weight_loader import DiscreteWeightMapper
 from sglang_omni.sampling.seed import resolve_row_seed
 
@@ -47,12 +52,13 @@ class HiggsGenParams:
     top_k: int | None = None
 
 
-@dataclass
-class _HiggsPrefillContext:
-    input_embeds: torch.Tensor
-    req_ids: list[str]
-    gen_params: list[HiggsGenParams]
-    sample_row_indices: tuple[int, ...]
+class HiggsPrefillEmbeddingInputs(MultimodalInputs):
+    """One request's reference-audio embeddings in flattened batch positions."""
+
+    def __init__(self, positions: torch.Tensor, embeddings: torch.Tensor) -> None:
+        super().__init__(mm_items=[])
+        self.positions = positions
+        self.embeddings = embeddings
 
 
 def _resolve_max_running_requests() -> int:
@@ -108,9 +114,9 @@ class HiggsTTSModel(nn.Module):
     - :meth:`load_weights` that remaps Higgs checkpoint names and splits
       the stream between the backbone and the multimodal modules.
 
-    Multi-codebook input embedding overlay (the ``-100`` placeholder paste
-    from the reference audio) is performed by the engine model_runner; this
-    model just consumes the prepared ``input_embeds`` in its forward.
+    The engine model runner prepares sparse reference-audio embedding
+    overrides. This wrapper applies them to the text embeddings and copies the
+    result into an address-stable buffer before piecewise CUDA-graph replay.
     """
 
     def __init__(
@@ -218,76 +224,22 @@ class HiggsTTSModel(nn.Module):
         self._cg_active_step_count = torch.zeros(
             pool_size, dtype=torch.long, device=cg_device
         )
-        self._pending_prefill: _HiggsPrefillContext | None = None
 
     @property
     def model(self) -> nn.Module:
-        return self.backbone
-
-    @property
-    def language_model(self) -> nn.Module:
-        return self.backbone
+        """Expose the Qwen3 layer model expected by SGLang prefill PCG."""
+        return self.backbone.model
 
     def __setattr__(self, name: str, value: Any) -> None:
-        # note (kaige): SGLang assigns its resolved language-model alias during
-        # graph setup; keep both compatibility aliases out of _modules.
-        if name in {"model", "language_model"}:
+        # note (kaige): Keep the PCG compatibility alias out of nn.Module._modules.
+        if name == "model":
             backbone = self.__dict__.get("_modules", {}).get("backbone")
+            language_model = None if backbone is None else backbone.model
             assert (
-                backbone is not None and value is backbone
-            ), f"{name} may only alias the existing Higgs backbone"
+                language_model is not None and value is language_model
+            ), "model may only alias the existing Higgs language model"
             return
         super().__setattr__(name, value)
-
-    def stage_prefill(
-        self,
-        *,
-        input_embeds: torch.Tensor,
-        req_ids: list[str],
-        gen_params: list[HiggsGenParams],
-        sample_row_indices: tuple[int, ...],
-    ) -> None:
-        assert self._pending_prefill is None, "Higgs prefill context was not consumed"
-        assert len(req_ids) == len(gen_params)
-        assert tuple(sorted(set(sample_row_indices))) == sample_row_indices
-        assert all(0 <= row < len(req_ids) for row in sample_row_indices)
-        self._pending_prefill = _HiggsPrefillContext(
-            input_embeds=input_embeds,
-            req_ids=req_ids,
-            gen_params=gen_params,
-            sample_row_indices=sample_row_indices,
-        )
-
-    def _take_prefill_context(self) -> _HiggsPrefillContext | None:
-        context = self._pending_prefill
-        self._pending_prefill = None
-        return context
-
-    def _prepare_prefill_input_embeds(
-        self,
-        forward_batch,
-        input_embeds: torch.Tensor | None,
-    ) -> tuple[torch.Tensor | None, _HiggsPrefillContext | None, bool]:
-        context = self._take_prefill_context()
-        static_input_embeds = (
-            input_embeds
-            if input_embeds is not None
-            else getattr(forward_batch, "input_embeds", None)
-        )
-        if context is None:
-            is_capture_warmup = getattr(forward_batch, "req_ids", None) is None
-            return static_input_embeds, None, is_capture_warmup
-        if static_input_embeds is None:
-            return context.input_embeds, context, False
-
-        num_tokens = context.input_embeds.shape[0]
-        if num_tokens > static_input_embeds.shape[0]:
-            raise ValueError(
-                "Higgs staged prefill embeddings exceed the SGLang "
-                f"graph buffer ({num_tokens} > {static_input_embeds.shape[0]})"
-            )
-        static_input_embeds[:num_tokens].copy_(context.input_embeds)
-        return static_input_embeds, context, False
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.backbone.get_input_embeddings()
@@ -297,43 +249,6 @@ class HiggsTTSModel(nn.Module):
 
     def get_modality_head(self) -> HiggsFusedMultiTextHead:
         return self.modality_head
-
-    def _decode_prefill_codebooks(
-        self,
-        hidden_states_BD: torch.Tensor,
-        req_ids: list[str],
-        gen_params: list[HiggsGenParams],
-        sample_row_indices: tuple[int, ...],
-    ) -> torch.Tensor:
-        batch_size = hidden_states_BD.shape[0]
-        if len(req_ids) != batch_size or len(gen_params) != batch_size:
-            raise ValueError(
-                f"batch size mismatch: hidden={batch_size}, "
-                f"req_ids={len(req_ids)}, gen_params={len(gen_params)}"
-            )
-
-        if len(sample_row_indices) == batch_size:
-            return self.decode_codebooks_batch(hidden_states_BD, req_ids, gen_params)
-
-        text_logits_BV = torch.zeros(
-            (batch_size, self.backbone.config.vocab_size),
-            dtype=torch.float32,
-            device=hidden_states_BD.device,
-        )
-        if not sample_row_indices:
-            return text_logits_BV
-
-        rows = torch.tensor(
-            sample_row_indices,
-            dtype=torch.long,
-            device=hidden_states_BD.device,
-        )
-        self.decode_codebooks_batch(
-            hidden_states_BD.index_select(0, rows),
-            [req_ids[row] for row in sample_row_indices],
-            [gen_params[row] for row in sample_row_indices],
-        )
-        return text_logits_BV
 
     @property
     def num_codebooks(self) -> int:
@@ -536,10 +451,13 @@ class HiggsTTSModel(nn.Module):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ):
-        """Run the backbone then sample multi-codebook codes per request.
+        """Run Qwen3 and return the per-request hidden states used by Higgs.
 
-        Prefill copies staged ref-audio embeddings into SGLang's static graph
-        buffer; decode reads embeddings and sampling state from ``_cg_active_*``.
+        Prefill builds text embeddings plus runner-supplied sparse reference
+        overrides outside the Qwen3 piecewise graph; the runner samples from
+        the returned hidden states after replay. Decode reads embeddings and
+        sampling state from ``_cg_active_*`` shadow buffers populated by the
+        runner and samples inside the decode graph.
         """
         is_decode = self._is_decode_step(forward_batch)
 
@@ -547,19 +465,11 @@ class HiggsTTSModel(nn.Module):
             input_embeds = self._decode_step_embeds_cg(
                 input_ids, batch_size=input_ids.shape[0]
             )
-            prefill_context = None
-            is_capture_warmup = False
-        else:
-            input_embeds, prefill_context, is_capture_warmup = (
-                self._prepare_prefill_input_embeds(forward_batch, input_embeds)
+        elif input_embeds is None:
+            input_embeds = self._build_prefill_input_embeds(
+                input_ids,
+                forward_batch,
             )
-            if prefill_context is not None:
-                req_ids = prefill_context.req_ids
-                gen_params = prefill_context.gen_params
-                sample_row_indices = prefill_context.sample_row_indices
-            elif not is_capture_warmup:
-                req_ids, gen_params = self._extract_batch_metadata(forward_batch)
-                sample_row_indices = tuple(range(len(req_ids)))
 
         hidden_states = self.backbone.model(
             input_ids,
@@ -583,24 +493,72 @@ class HiggsTTSModel(nn.Module):
 
         if is_decode:
             text_logits_BV = self.decode_codebooks_batch_cg(hidden_states_last)
-        elif is_capture_warmup:
+        else:
             text_logits_BV = torch.zeros(
                 (hidden_states_last.shape[0], self.backbone.config.vocab_size),
-                dtype=torch.float32,
                 device=hidden_states_last.device,
-            )
-        else:
-            text_logits_BV = self._decode_prefill_codebooks(
-                hidden_states_last,
-                req_ids,
-                gen_params,
-                sample_row_indices,
+                dtype=torch.float32,
             )
 
         return LogitsProcessorOutput(
             next_token_logits=text_logits_BV,
             hidden_states=hidden_states_last,
         )
+
+    def _build_prefill_input_embeds(
+        self,
+        input_ids: torch.Tensor,
+        forward_batch: Any,
+    ) -> torch.Tensor:
+        placeholder_mask = input_ids == AUDIO_PLACEHOLDER_ID
+        if is_in_tc_piecewise_cuda_graph():
+            # note (kaige): Prefill PCG and decode CUDA Graph share SGLang's
+            # input_ids buffer. Clear audio sentinels so decode padding cannot
+            # inherit -100 from the preceding prefill.
+            input_ids.masked_fill_(placeholder_mask, 0)
+            safe_input_ids = input_ids
+        else:
+            safe_input_ids = torch.where(
+                placeholder_mask,
+                torch.zeros_like(input_ids),
+                input_ids,
+            )
+        input_embeds = self.backbone.model.embed_tokens(safe_input_ids)
+
+        for overrides in forward_batch.mm_inputs or ():
+            if overrides is None:
+                continue
+            if not isinstance(overrides, HiggsPrefillEmbeddingInputs):
+                raise TypeError(
+                    "Higgs prefill mm_inputs entries must be "
+                    "HiggsPrefillEmbeddingInputs or None"
+                )
+            # note (kaige): Reuse the full prompt allocation instead of creating
+            # a second [tokens, hidden] tensor for the sparse audio replacement.
+            input_embeds.index_copy_(
+                0,
+                overrides.positions,
+                overrides.embeddings.to(input_embeds.dtype),
+            )
+
+        if not is_in_tc_piecewise_cuda_graph():
+            return input_embeds
+
+        stable_input_embeds = forward_batch.input_embeds
+        if stable_input_embeds is None:
+            raise RuntimeError(
+                "SGLang piecewise CUDA graph did not provide a stable "
+                "ForwardBatch.input_embeds buffer for Higgs"
+            )
+        if stable_input_embeds.shape != input_embeds.shape:
+            raise ValueError(
+                "Higgs prefill embedding shape does not match SGLang's stable "
+                f"piecewise buffer: {tuple(input_embeds.shape)} vs "
+                f"{tuple(stable_input_embeds.shape)}"
+            )
+        # note (kaige): SGLang owns this stable multimodal PCG input buffer.
+        stable_input_embeds.copy_(input_embeds)
+        return stable_input_embeds
 
     def _decode_step_embeds_cg(
         self, input_ids: torch.Tensor, batch_size: int
@@ -628,20 +586,6 @@ class HiggsTTSModel(nn.Module):
         is_decode = getattr(mode, "is_decode", None)
         return bool(is_decode()) if callable(is_decode) else False
 
-    def _extract_batch_metadata(
-        self, forward_batch
-    ) -> tuple[list[str], list[HiggsGenParams]]:
-        req_ids_raw = getattr(forward_batch, "req_ids", None)
-        batch_size = self._infer_batch_size(forward_batch)
-        if req_ids_raw is None:
-            req_ids = [f"req-{i}" for i in range(batch_size)]
-        else:
-            req_ids = [str(r) for r in req_ids_raw]
-
-        sampling_info = getattr(forward_batch, "sampling_info", None)
-        gen_params = self._gen_params_for_batch(sampling_info, batch_size)
-        return req_ids, gen_params
-
     @staticmethod
     def _gen_params_for_batch(sampling_info, batch_size: int) -> list[HiggsGenParams]:
         """Pull per-row sampling params off ``sampling_info``."""
@@ -665,13 +609,6 @@ class HiggsTTSModel(nn.Module):
                 )
             )
         return params
-
-    @staticmethod
-    def _infer_batch_size(forward_batch) -> int:
-        seq_lens = getattr(forward_batch, "seq_lens", None)
-        if seq_lens is not None and hasattr(seq_lens, "shape"):
-            return int(seq_lens.shape[0])
-        return int(getattr(forward_batch, "batch_size", 1))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
         """Remap Higgs ckpt names then split between backbone and own modules.

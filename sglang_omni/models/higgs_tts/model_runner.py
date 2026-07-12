@@ -17,7 +17,10 @@ import torch
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 
 from sglang_omni.model_runner.base import ModelRunner
-from sglang_omni.models.higgs_tts.model import _flat_sampling_attr
+from sglang_omni.models.higgs_tts.model import (
+    HiggsPrefillEmbeddingInputs,
+    _flat_sampling_attr,
+)
 from sglang_omni.models.higgs_tts.sampler import K_MAX, selected_token_logprobs
 from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
 from sglang_omni.models.higgs_tts.utils import EOC_ID
@@ -55,58 +58,49 @@ class HiggsTTSModelRunner(ModelRunner):
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
 
-    @staticmethod
-    def _prefill_sample_row_indices(schedule_batch, requests) -> tuple[int, ...]:
-        middle_chunk_req = schedule_batch.chunked_req
-        if middle_chunk_req is None:
-            return tuple(range(len(requests)))
-
-        sample_row_indices = tuple(
-            row
-            for row, sched_req in enumerate(requests)
-            if sched_req.data.req is not middle_chunk_req
-        )
-        assert len(sample_row_indices) < len(
-            requests
-        ), "schedule_batch.chunked_req is missing from scheduler requests"
-        return sample_row_indices
-
     def before_prefill(self, forward_batch, schedule_batch, requests):
-        req_ids = [req.request_id for req in requests]
-        sample_row_indices = self._prefill_sample_row_indices(schedule_batch, requests)
-        forward_batch.req_ids = req_ids
-        for row in sample_row_indices:
-            req = requests[row]
+        del schedule_batch
+        assert forward_batch.batch_size == len(requests), (
+            f"Higgs prefill batch_size={forward_batch.batch_size} does not match "
+            f"{len(requests)} scheduled requests"
+        )
+        assert forward_batch.input_embeds is None, (
+            "Higgs prefill must keep ForwardBatch.input_embeds unset so SGLang "
+            "piecewise CUDA graph can run"
+        )
+        existing_mm_inputs = forward_batch.mm_inputs
+        assert existing_mm_inputs is None or (
+            len(existing_mm_inputs) == len(requests)
+            and all(item is None for item in existing_mm_inputs)
+        ), "Higgs prefill received unexpected SGLang multimodal inputs"
+
+        for req in requests:
             self.model.set_request_seed(
                 req.request_id, req.data.req.sampling_params.sampling_seed
             )
-        input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
-        gen_params = self.model._gen_params_for_batch(
-            getattr(forward_batch, "sampling_info", None), len(requests)
+        embedding_overrides = self._build_prefill_embedding_overrides(
+            forward_batch, requests
         )
-        self.model.stage_prefill(
-            input_embeds=input_embeds,
-            req_ids=req_ids,
-            gen_params=gen_params,
-            sample_row_indices=sample_row_indices,
-        )
-        # note (kaige): The native prefill runner rejects live input_embeds; the
-        # model copies this staged tensor into its static buffer during forward.
-        forward_batch.input_embeds = None
+        if self._has_branched_radix_prefill(forward_batch):
+            forward_batch.input_embeds = self._materialize_prefill_input_embeds(
+                forward_batch.input_ids,
+                embedding_overrides,
+            )
+            forward_batch.mm_inputs = None
+        else:
+            forward_batch.mm_inputs = embedding_overrides
 
     def post_prefill(self, result, forward_batch, schedule_batch, requests):
-        middle_chunk_req = schedule_batch.chunked_req
-        skip_request_id = None if middle_chunk_req is None else middle_chunk_req.rid
-        self._collect_step_outputs(
-            result,
-            requests,
-            forward_batch,
-            skip_request_id=skip_request_id,
-        )
+        del schedule_batch
+        self._sample_prefill_codebooks(result, forward_batch, requests)
+        self._collect_step_outputs(result, requests, forward_batch)
 
     def finalize_skip_rids(self, scheduler_output) -> set[str]:
-        middle_chunk_req = scheduler_output.batch_data.chunked_req
-        return set() if middle_chunk_req is None else {middle_chunk_req.rid}
+        return {
+            request.request_id
+            for request in scheduler_output.requests
+            if request.data.req.inflight_middle_chunks > 0
+        }
 
     def before_decode(
         self,
@@ -394,53 +388,179 @@ class HiggsTTSModelRunner(ModelRunner):
                 device=next_token_device,
             )
 
-    def _build_prefill_input_embeds(
+    def _build_prefill_embedding_overrides(
         self,
         forward_batch: Any,
         requests: list,
-    ) -> torch.Tensor:
+    ) -> list[HiggsPrefillEmbeddingInputs | None]:
         input_ids = forward_batch.input_ids
-        device = input_ids.device
-        embed_tokens = self.model.backbone.model.embed_tokens
-        fused_embed = self.model.multimodal_embedding.modality_embedding_0
-
         placeholder_mask = input_ids == AUDIO_PLACEHOLDER_ID
-        safe_ids = torch.where(placeholder_mask, torch.zeros_like(input_ids), input_ids)
-        text_embeds = embed_tokens(safe_ids)
+        extend_seq_lens = forward_batch.extend_seq_lens_cpu
+        extend_prefix_lens = forward_batch.extend_prefix_lens_cpu
+        assert len(extend_seq_lens) == len(requests)
+        assert len(extend_prefix_lens) == len(requests)
 
+        overrides: list[HiggsPrefillEmbeddingInputs | None] = []
         offset = 0
-        for sched_req in requests:
-            data = sched_req.data
-            end = offset + int(data.req.extend_input_len)
-            codes_rows = data.reference_codes_delayed
-            if not codes_rows:
-                offset = end
-                continue
-
-            full_mask = placeholder_mask[offset:end]
-            n_placeholders = int(full_mask.sum().item())
-            if n_placeholders == 0:
-                offset = end
-                continue
-
-            codes = torch.tensor(codes_rows, dtype=torch.long, device=device)
-            consumed = data.num_ref_codes_consumed
-            with torch.no_grad():
-                embed = fused_embed(codes[consumed : consumed + n_placeholders])
-            mask_idx = full_mask.nonzero(as_tuple=True)[0] + offset
-            text_embeds[mask_idx] = embed.to(text_embeds.dtype)
-            data.num_ref_codes_consumed = consumed + n_placeholders
+        for sched_req, extend_len_raw, prefix_len_raw in zip(
+            requests, extend_seq_lens, extend_prefix_lens
+        ):
+            extend_len = int(extend_len_raw)
+            req = sched_req.data.req
+            assert req.extend_range is not None
+            assert extend_len == int(req.extend_range.length)
+            end = offset + extend_len
+            overrides.append(
+                self._build_request_prefill_embedding_override(
+                    sched_req,
+                    placeholder_mask[offset:end],
+                    flattened_offset=offset,
+                    prefix_len=int(prefix_len_raw),
+                    device=input_ids.device,
+                )
+            )
             offset = end
 
-        return text_embeds
+        assert offset == input_ids.shape[0], (
+            f"Higgs flattened prefill has {input_ids.shape[0]} tokens but request "
+            f"extend lengths sum to {offset}"
+        )
+        return overrides
+
+    @staticmethod
+    def _has_branched_radix_prefill(forward_batch: Any) -> bool:
+        """Return whether this batch extends a cached prefix with a new branch.
+
+        SGLang deliberately replays one token for an exact prompt cache hit.
+        More than one extend token after a non-empty prefix means the request
+        branched from another prompt. Higgs keeps this case eager because the
+        tc_piecewise Qwen3 path can move the seeded first codec draw across a
+        probability boundary and make the decoder echo the reference prompt.
+        """
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        assert len(prefix_lens) == len(extend_lens)
+        return any(
+            int(prefix_len) > 0 and int(extend_len) > 1
+            for prefix_len, extend_len in zip(prefix_lens, extend_lens)
+        )
+
+    def _materialize_prefill_input_embeds(
+        self,
+        input_ids: torch.Tensor,
+        embedding_overrides: list[HiggsPrefillEmbeddingInputs | None],
+    ) -> torch.Tensor:
+        placeholder_mask = input_ids == AUDIO_PLACEHOLDER_ID
+        safe_input_ids = torch.where(
+            placeholder_mask,
+            torch.zeros_like(input_ids),
+            input_ids,
+        )
+        input_embeds = self.model.backbone.model.embed_tokens(safe_input_ids)
+        for overrides in embedding_overrides:
+            if overrides is None:
+                continue
+            input_embeds.index_copy_(
+                0,
+                overrides.positions,
+                overrides.embeddings.to(input_embeds.dtype),
+            )
+        return input_embeds
+
+    def _build_request_prefill_embedding_override(
+        self,
+        sched_req: Any,
+        placeholder_mask: torch.Tensor,
+        *,
+        flattened_offset: int,
+        prefix_len: int,
+        device: torch.device,
+    ) -> HiggsPrefillEmbeddingInputs | None:
+        local_positions = placeholder_mask.nonzero(as_tuple=True)[0]
+        num_placeholders = local_positions.numel()
+        if num_placeholders == 0:
+            return None
+
+        data = sched_req.data
+        codes_rows = data.reference_codes_delayed
+        if not codes_rows:
+            raise ValueError(
+                f"Higgs request {sched_req.request_id!r} contains audio "
+                "placeholders without reference codes"
+            )
+        code_start = self._reference_code_offset(sched_req, prefix_len)
+        code_end = code_start + num_placeholders
+        if code_end > len(codes_rows):
+            raise ValueError(
+                f"Higgs request {sched_req.request_id!r} needs {code_end} "
+                f"reference-code rows but only {len(codes_rows)} are available"
+            )
+        codes = torch.tensor(
+            codes_rows[code_start:code_end],
+            dtype=torch.long,
+            device=device,
+        )
+        with torch.no_grad():
+            embeddings = self.model.multimodal_embedding.modality_embedding_0(codes)
+        return HiggsPrefillEmbeddingInputs(
+            positions=local_positions + flattened_offset,
+            embeddings=embeddings,
+        )
+
+    @staticmethod
+    def _reference_code_offset(sched_req: Any, prefix_len: int) -> int:
+        origin_input_ids = sched_req.data.req.origin_input_ids
+        if prefix_len < 0 or prefix_len > len(origin_input_ids):
+            raise ValueError(
+                f"Higgs request {sched_req.request_id!r} has invalid prefill "
+                f"prefix length {prefix_len} for {len(origin_input_ids)} input tokens"
+            )
+        return sum(
+            token_id == AUDIO_PLACEHOLDER_ID
+            for token_id in origin_input_ids[:prefix_len]
+        )
+
+    def _sample_prefill_codebooks(
+        self,
+        result: Any,
+        forward_batch: Any,
+        requests: list,
+    ) -> None:
+        final_indices = [
+            index
+            for index, request in enumerate(requests)
+            if request.data.req.inflight_middle_chunks == 0
+            and not request.data.req.finished()
+        ]
+        if not final_indices:
+            return
+
+        hidden_states = result.logits_output.hidden_states
+        if hidden_states is None:
+            raise RuntimeError("Higgs prefill requires last hidden states")
+        if hidden_states.ndim == 3:
+            hidden_states = hidden_states[:, -1, :]
+        if hidden_states.shape[0] != len(requests):
+            raise ValueError(
+                f"Higgs prefill returned {hidden_states.shape[0]} hidden-state rows "
+                f"for {len(requests)} requests"
+            )
+
+        all_gen_params = self.model._gen_params_for_batch(
+            forward_batch.sampling_info,
+            len(requests),
+        )
+        self.model.decode_codebooks_batch(
+            hidden_states[final_indices],
+            [requests[index].request_id for index in final_indices],
+            [all_gen_params[index] for index in final_indices],
+        )
 
     def _collect_step_outputs(
         self,
         result: Any,
         requests: list,
         forward_batch: Any | None = None,
-        *,
-        skip_request_id: str | None = None,
     ) -> None:
         """Pull per-request newly emitted codes from the model into
         ``data.output_codes`` and overwrite ``result.next_token_ids``
@@ -461,7 +581,12 @@ class HiggsTTSModelRunner(ModelRunner):
             rid = sched_req.request_id
             row = model._rid_to_row.get(rid)
             codes_log = model._output_codes.get(rid)
-            if rid == skip_request_id or row is None or not codes_log or req.finished():
+            if (
+                req.inflight_middle_chunks > 0
+                or row is None
+                or not codes_log
+                or req.finished()
+            ):
                 cb0_per_row.append(0)
                 continue
             codes_N = codes_log[-1]

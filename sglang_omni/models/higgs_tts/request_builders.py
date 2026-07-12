@@ -24,7 +24,6 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     """Per-request state for the Higgs TTS scheduler."""
 
     reference_codes_delayed: list[list[int]] | None = None
-    num_ref_codes_consumed: int = 0
     num_codebooks: int = 8
     codebook_size: int = 1026
     output_codes: list[torch.Tensor] = field(default_factory=list)
