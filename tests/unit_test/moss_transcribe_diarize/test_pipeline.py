@@ -56,6 +56,8 @@ def test_moss_transcribe_diarize_stage_reserves_encoder_headroom() -> None:
     assert signature.parameters["request_build_max_workers"].default == 2
     assert signature.parameters["request_build_max_pending"].default == 16
     assert signature.parameters["mm_embedding_cache_size_bytes"].default == 0
+    assert signature.parameters["enable_prefill_cuda_graph"].default is True
+    assert signature.parameters["prefill_graph_token_buckets"].default is None
 
 
 def _repo_not_found(url: str) -> RepositoryNotFoundError:

@@ -36,6 +36,8 @@ from sglang_omni.scheduling.sglang_backend import (
 # no cross-request batching yet.
 # Cap tuned to p99 audio duration ([1,8] covers up to ~4min)
 _DEFAULT_ENCODER_GRAPH_CHUNK_BUCKETS = list(range(1, 9))
+_DEFAULT_PREFILL_TOKEN_BUDGET = 4096
+_MODEL_ARCHITECTURE = "MossTranscribeDiarizeForConditionalGeneration"
 
 
 @contextmanager
@@ -102,6 +104,8 @@ def create_sglang_moss_transcribe_diarize_executor(
     enable_async_decode: bool = True,
     async_decode_min_batch_size: int = 2,
     encoder_graph_chunk_buckets: list[int] | None = None,
+    enable_prefill_cuda_graph: bool = True,
+    prefill_graph_token_buckets: list[int] | None = None,
     request_build_max_workers: int = 2,
     request_build_max_pending: int | None = 16,
     stream_emit_interval_s: float = 0.05,
@@ -126,13 +130,15 @@ def create_sglang_moss_transcribe_diarize_executor(
 
     overrides = build_generation_batch_overrides(
         max_running_requests=max_running_requests,
+        enable_prefill_cuda_graph=enable_prefill_cuda_graph,
+        prefill_graph_token_buckets=prefill_graph_token_buckets,
         server_args_overrides=server_args_overrides,
         disable_cuda_graph=False,
         disable_overlap_schedule=True,
         enable_torch_compile=enable_torch_compile,
         mem_fraction_static=mem_fraction_static,
-        max_prefill_tokens=4096,
-        chunked_prefill_size=4096,
+        max_prefill_tokens=_DEFAULT_PREFILL_TOKEN_BUDGET,
+        chunked_prefill_size=_DEFAULT_PREFILL_TOKEN_BUDGET,
         sampling_backend="pytorch",
         dtype=dtype,
     )
@@ -140,6 +146,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     server_args = build_sglang_server_args(
         model_path,
         context_length=resolved_context_length,
+        model_architecture=_MODEL_ARCHITECTURE,
         **overrides,
     )
     validate_generation_batch_policy(
@@ -158,7 +165,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     ) = create_sglang_infrastructure_defer_cuda_graph(
         server_args,
         gpu_id,
-        model_arch_override="MossTranscribeDiarizeForConditionalGeneration",
+        model_arch_override=_MODEL_ARCHITECTURE,
     )
 
     model_worker.model_runner.init_cuda_graphs()

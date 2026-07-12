@@ -73,7 +73,15 @@ At c=1 with longer audio, AR Decode takes 94%+ of total time — the leverage is
 
 The optimization stack mirrors [what we built for TTS](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/sglang/sglang-omni/tts-optimization.md), sharing the same core infrastructure with ASR-specific adaptations.
 
-**CUDA Graph.** The LLM decode step pads batch size to predefined buckets (1, 2, 4, 8, …) and replays a captured CUDA graph, eliminating kernel launch overhead on every token. This is the single biggest optimization for AR Decode. Encoder CUDA Graph is also implemented — the Whisper encoder is a stateless function where only the chunk count varies across requests, so we bucket over chunk count and pad to the nearest captured bucket on replay — but this is not yet merged to main.
+**CUDA Graph.** Three graph paths cover different runtime boundaries. Decode
+pads request batch size to predefined buckets (1, 2, 4, 8, …). The Whisper
+encoder buckets the number of 30-second audio chunks. LLM prefill uses SGLang
+0.5.15's `PrefillCudaGraphRunner` with the `tc_piecewise` backend: audio feature
+extraction and embedding composition remain eager, while the Qwen3 transformer
+body is compiled and replayed at token-count buckets. Prefill capture is enabled
+by default; set the ASR stage factory argument
+`enable_prefill_cuda_graph: false` to opt out, or set
+`prefill_graph_token_buckets` to an explicit non-empty token-bucket list.
 
 **Async Decode.** Same one-step lookahead as TTS: launch the current decode step's GPU work, then resolve the previous step's host-side work (D2H copy, finish detection, result dispatch) in parallel. Falls back to synchronous mode at batch size 1, where the host work is too small to overlap. Two alternating pinned host buffers prevent read/write races between the GPU's async D2H write and the CPU's read. For the full mechanism and code pointers, see [Asynchronous Decode + Lookahead](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/sglang/sglang-omni/tts-optimization.md#asynchronous-decode--lookahead) in the TTS optimization guide.
 

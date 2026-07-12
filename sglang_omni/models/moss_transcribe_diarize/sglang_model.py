@@ -92,6 +92,21 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         self._encoder_cache: Optional[StageOutputCache] = None
         self._encoder_graph_runner = None
 
+    @property
+    def model(self) -> nn.Module:
+        return self.language_model
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # note (kaige): SGLang assigns its resolved language-model alias during
+        # prefill graph setup; do not register the same module a second time.
+        if name == "model":
+            language_model = self.__dict__.get("_modules", {}).get("language_model")
+            assert (
+                language_model is not None and value is language_model
+            ), "model may only alias the existing MOSS-TD language model"
+            return
+        super().__setattr__(name, value)
+
     def init_encoder_cache(self, max_bytes: int) -> None:
         self._encoder_cache = (
             StageOutputCache(
