@@ -61,6 +61,14 @@ sgl-omni serve \
 The voice-cloning examples below use local reference clips from
 `docs/_static/audio`.
 
+Higgs enables both decode and prefill CUDA graphs by default. Prefill uses
+SGLang 0.5.15's `PrefillCudaGraphRunner` with the `tc_piecewise` backend. The
+Higgs reference-audio embedding is prepared eagerly, staged outside the live
+`ForwardBatch`, and copied into SGLang's static input buffer immediately before
+the compiled Qwen3 transformer runs. Set the `tts_engine` factory argument
+`enable_prefill_cuda_graph: false` to opt out, or set
+`prefill_graph_token_buckets` to an explicit non-empty token-bucket list.
+
 ## Synthesizing Speech
 
 ### Zero-shot

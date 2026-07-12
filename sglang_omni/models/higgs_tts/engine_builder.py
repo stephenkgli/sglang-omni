@@ -15,6 +15,7 @@ from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 class HiggsTtsEngineBuilder(TtsEngineBuilder):
     model_name = "Higgs TTS"
     context_length = 4096
+    model_arch_override = "HiggsMultimodalQwen3ForConditionalGeneration"
 
     def __init__(
         self,
@@ -22,12 +23,16 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         max_new_tokens: int | None,
         max_running_requests: int,
         cuda_graph_max_bs: int,
+        enable_prefill_cuda_graph: bool,
+        prefill_graph_token_buckets: list[int] | None,
         enable_async_decode: bool,
         async_decode_min_batch_size: int,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.max_running_requests = max_running_requests
         self.cuda_graph_max_bs = cuda_graph_max_bs
+        self.enable_prefill_cuda_graph = enable_prefill_cuda_graph
+        self.prefill_graph_token_buckets = prefill_graph_token_buckets
         self.enable_async_decode = enable_async_decode
         self.async_decode_min_batch_size = async_decode_min_batch_size
         self.model: Any | None = None
@@ -48,6 +53,8 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         return {
             "max_running_requests": self.max_running_requests,
             "cuda_graph_max_bs": self.cuda_graph_max_bs,
+            "enable_prefill_cuda_graph": self.enable_prefill_cuda_graph,
+            "prefill_graph_token_buckets": self.prefill_graph_token_buckets,
             "disable_cuda_graph": False,
             "mem_fraction_static": 0.85,
             "chunked_prefill_size": 8192,

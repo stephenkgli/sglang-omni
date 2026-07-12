@@ -58,7 +58,9 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
                 bs=overrides["cuda_graph_bs_decode"],
             ),
             prefill=PhaseConfig(
-                backend=Backend.DISABLED,
+                backend=Backend.TC_PIECEWISE,
+                max_bs=4096,
+                bs=[4096],
             ),
         )
         server_args = SimpleNamespace(
@@ -157,7 +159,10 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
         64,
     ]
     assert captured["overrides"]["cuda_graph_max_bs_decode"] == 64
-    assert captured["overrides"]["disable_prefill_cuda_graph"] is True
+    assert captured["overrides"]["model_architecture"] == (
+        "HiggsMultimodalQwen3ForConditionalGeneration"
+    )
+    assert "disable_prefill_cuda_graph" not in captured["overrides"]
     assert captured["overrides"]["max_running_requests"] == 64
     assert captured["server_args"].disable_overlap_schedule is True
     assert captured["server_args"].enable_torch_compile is False
@@ -178,6 +183,8 @@ def test_higgs_tts_engine_abort_callback_requires_model() -> None:
         max_new_tokens=2048,
         max_running_requests=64,
         cuda_graph_max_bs=64,
+        enable_prefill_cuda_graph=True,
+        prefill_graph_token_buckets=None,
         enable_async_decode=False,
         async_decode_min_batch_size=2,
     )
@@ -666,7 +673,9 @@ def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
         ),
     )
     req = SimpleNamespace(
-        inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+        inflight_middle_chunks=0,
+        finished_reason=None,
+        finished=lambda: False,
     )
     data = SimpleNamespace(
         req=req,
@@ -723,16 +732,24 @@ def test_higgs_model_runner_collect_cg_mixed_batch() -> None:
     # row0 chunked, row1 was-done, row2 active (not done), row3 active (EOC done).
     reqs = [
         SimpleNamespace(
-            inflight_middle_chunks=1, finished_reason=None, finished=lambda: False
+            inflight_middle_chunks=1,
+            finished_reason=None,
+            finished=lambda: False,
         ),
         SimpleNamespace(
-            inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+            inflight_middle_chunks=0,
+            finished_reason=None,
+            finished=lambda: False,
         ),
         SimpleNamespace(
-            inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+            inflight_middle_chunks=0,
+            finished_reason=None,
+            finished=lambda: False,
         ),
         SimpleNamespace(
-            inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+            inflight_middle_chunks=0,
+            finished_reason=None,
+            finished=lambda: False,
         ),
     ]
     datas = [
@@ -800,7 +817,9 @@ def test_higgs_model_runner_collects_rollout_logprobs_only_when_requested() -> N
         ),
     )
     req = SimpleNamespace(
-        inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+        inflight_middle_chunks=0,
+        finished_reason=None,
+        finished=lambda: False,
     )
     data = SimpleNamespace(
         req=req,

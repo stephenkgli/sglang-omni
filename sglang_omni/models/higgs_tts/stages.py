@@ -390,6 +390,8 @@ def create_sglang_tts_engine_executor(
     max_new_tokens: int | None = 2048,
     max_running_requests: int = 64,
     cuda_graph_max_bs: int = 64,
+    enable_prefill_cuda_graph: bool = True,
+    prefill_graph_token_buckets: list[int] | None = None,
     server_args_overrides: dict[str, Any] | None = None,
     enable_async_decode: bool = False,
     async_decode_min_batch_size: int = 2,
@@ -401,6 +403,8 @@ def create_sglang_tts_engine_executor(
         max_new_tokens=max_new_tokens,
         max_running_requests=max_running_requests,
         cuda_graph_max_bs=cuda_graph_max_bs,
+        enable_prefill_cuda_graph=enable_prefill_cuda_graph,
+        prefill_graph_token_buckets=prefill_graph_token_buckets,
         enable_async_decode=enable_async_decode,
         async_decode_min_batch_size=async_decode_min_batch_size,
     ).build(

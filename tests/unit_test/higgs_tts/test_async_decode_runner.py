@@ -319,7 +319,9 @@ def test_async_real_pinned_path_matches_sync():
         )
         reqs = [
             SimpleNamespace(
-                inflight_middle_chunks=c, finished_reason=None, finished=lambda: False
+                inflight_middle_chunks=c,
+                finished_reason=None,
+                finished=lambda: False,
             )
             for c in (1, 0, 0, 0)
         ]

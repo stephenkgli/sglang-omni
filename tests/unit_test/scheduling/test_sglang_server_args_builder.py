@@ -32,7 +32,7 @@ def test_omni_architecture_is_constructor_only_state() -> None:
 def test_prefill_capability_lookup_is_explicit_per_architecture() -> None:
     supports_prefill = server_args_builder._supports_sglang_tc_piecewise_prefill
 
-    assert supports_prefill("HiggsMultimodalQwen3ForConditionalGeneration") is False
+    assert supports_prefill("HiggsMultimodalQwen3ForConditionalGeneration") is True
     assert supports_prefill("MossTranscribeDiarizeForConditionalGeneration") is True
     assert supports_prefill("Qwen3TTSForConditionalGeneration") is False
     assert supports_prefill(None) is False

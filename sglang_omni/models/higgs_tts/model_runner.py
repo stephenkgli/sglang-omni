@@ -55,20 +55,58 @@ class HiggsTTSModelRunner(ModelRunner):
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
 
+    @staticmethod
+    def _prefill_sample_row_indices(schedule_batch, requests) -> tuple[int, ...]:
+        middle_chunk_req = schedule_batch.chunked_req
+        if middle_chunk_req is None:
+            return tuple(range(len(requests)))
+
+        sample_row_indices = tuple(
+            row
+            for row, sched_req in enumerate(requests)
+            if sched_req.data.req is not middle_chunk_req
+        )
+        assert len(sample_row_indices) < len(
+            requests
+        ), "schedule_batch.chunked_req is missing from scheduler requests"
+        return sample_row_indices
+
     def before_prefill(self, forward_batch, schedule_batch, requests):
-        del schedule_batch
-        forward_batch.req_ids = [req.request_id for req in requests]
-        for req in requests:
+        req_ids = [req.request_id for req in requests]
+        sample_row_indices = self._prefill_sample_row_indices(schedule_batch, requests)
+        forward_batch.req_ids = req_ids
+        for row in sample_row_indices:
+            req = requests[row]
             self.model.set_request_seed(
                 req.request_id, req.data.req.sampling_params.sampling_seed
             )
-        forward_batch.input_embeds = self._build_prefill_input_embeds(
-            forward_batch, requests
+        input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
+        gen_params = self.model._gen_params_for_batch(
+            getattr(forward_batch, "sampling_info", None), len(requests)
         )
+        self.model.stage_prefill(
+            input_embeds=input_embeds,
+            req_ids=req_ids,
+            gen_params=gen_params,
+            sample_row_indices=sample_row_indices,
+        )
+        # note (kaige): The native prefill runner rejects live input_embeds; the
+        # model copies this staged tensor into its static buffer during forward.
+        forward_batch.input_embeds = None
 
     def post_prefill(self, result, forward_batch, schedule_batch, requests):
-        del schedule_batch
-        self._collect_step_outputs(result, requests, forward_batch)
+        middle_chunk_req = schedule_batch.chunked_req
+        skip_request_id = None if middle_chunk_req is None else middle_chunk_req.rid
+        self._collect_step_outputs(
+            result,
+            requests,
+            forward_batch,
+            skip_request_id=skip_request_id,
+        )
+
+    def finalize_skip_rids(self, scheduler_output) -> set[str]:
+        middle_chunk_req = scheduler_output.batch_data.chunked_req
+        return set() if middle_chunk_req is None else {middle_chunk_req.rid}
 
     def before_decode(
         self,
@@ -397,7 +435,12 @@ class HiggsTTSModelRunner(ModelRunner):
         return text_embeds
 
     def _collect_step_outputs(
-        self, result: Any, requests: list, forward_batch: Any | None = None
+        self,
+        result: Any,
+        requests: list,
+        forward_batch: Any | None = None,
+        *,
+        skip_request_id: str | None = None,
     ) -> None:
         """Pull per-request newly emitted codes from the model into
         ``data.output_codes`` and overwrite ``result.next_token_ids``
@@ -418,12 +461,7 @@ class HiggsTTSModelRunner(ModelRunner):
             rid = sched_req.request_id
             row = model._rid_to_row.get(rid)
             codes_log = model._output_codes.get(rid)
-            if (
-                req.inflight_middle_chunks > 0
-                or row is None
-                or not codes_log
-                or req.finished()
-            ):
+            if rid == skip_request_id or row is None or not codes_log or req.finished():
                 cb0_per_row.append(0)
                 continue
             codes_N = codes_log[-1]
