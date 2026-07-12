@@ -483,7 +483,7 @@ def test_collect_frame_reads_generation_steps_from_pool():
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
     data = SimpleNamespace(
-        req=SimpleNamespace(is_chunked=0),
+        req=SimpleNamespace(inflight_middle_chunks=0),
         text_temperature=1.0,
         text_top_p=1.0,
         text_top_k=50,
@@ -542,7 +542,7 @@ def test_pool_sampling_position_leads_unresolved_lookahead_launches():
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
     data = SimpleNamespace(
-        req=SimpleNamespace(is_chunked=0),
+        req=SimpleNamespace(inflight_middle_chunks=0),
         text_temperature=1.0,
         text_top_p=1.0,
         text_top_k=50,
@@ -631,7 +631,7 @@ def test_collect_frame_uses_eager_path_when_audio_repetition_penalty_active(
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
     data = SimpleNamespace(
-        req=SimpleNamespace(is_chunked=0),
+        req=SimpleNamespace(inflight_middle_chunks=0),
         text_temperature=1.0,
         text_top_p=1.0,
         text_top_k=50,
@@ -692,7 +692,7 @@ def test_cached_pool_rows_drive_collect_and_batched_step_commit():
 
     def data(step, seed):
         return SimpleNamespace(
-            req=SimpleNamespace(is_chunked=0),
+            req=SimpleNamespace(inflight_middle_chunks=0),
             text_temperature=1.0,
             text_top_p=1.0,
             text_top_k=50,
@@ -791,7 +791,7 @@ def test_finalize_commits_generation_steps_to_pool():
         }
     )
     data = SimpleNamespace(
-        req=SimpleNamespace(is_chunked=0),
+        req=SimpleNamespace(inflight_middle_chunks=0),
         generation_steps=0,
         extra_model_outputs={},
         output_rows=[],
@@ -910,9 +910,9 @@ def test_collect_frame_skips_chunked_feedback_and_journal():
     runner = object.__new__(MossTTSLocalModelRunner)
     runner.model = model
 
-    def data(is_chunked):
+    def data(inflight_middle_chunks):
         return SimpleNamespace(
-            req=SimpleNamespace(is_chunked=is_chunked),
+            req=SimpleNamespace(inflight_middle_chunks=inflight_middle_chunks),
             text_temperature=1.0,
             text_top_p=1.0,
             text_top_k=50,
@@ -926,8 +926,8 @@ def test_collect_frame_skips_chunked_feedback_and_journal():
         )
 
     requests = [
-        SimpleNamespace(request_id="chunked", data=data(is_chunked=1)),
-        SimpleNamespace(request_id="normal", data=data(is_chunked=0)),
+        SimpleNamespace(request_id="chunked", data=data(inflight_middle_chunks=1)),
+        SimpleNamespace(request_id="normal", data=data(inflight_middle_chunks=0)),
     ]
     result = SimpleNamespace(
         logits_output=SimpleNamespace(hidden_states=torch.zeros(2, hidden_size))

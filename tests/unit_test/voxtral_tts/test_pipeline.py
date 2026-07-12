@@ -9,6 +9,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.models.voxtral_tts.config import VoxtralTTSPipelineConfig
@@ -465,7 +470,7 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
             self.server_args = server_args
             self.model = FakeModel()
 
-        def init_device_graphs(self) -> None:
+        def init_cuda_graphs(self) -> None:
             assert self.server_args.enable_torch_compile is True
             assert self.server_args.torch_compile_max_bs == 16
             init_graph_calls.append(True)
@@ -495,8 +500,14 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
         del model_path, context_length
         build_kwargs.update(kwargs)
         return SimpleNamespace(
-            cuda_graph_bs=kwargs["cuda_graph_bs"],
-            cuda_graph_max_bs=kwargs["cuda_graph_max_bs"],
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.FULL,
+                    bs=kwargs["cuda_graph_bs_decode"],
+                    max_bs=kwargs["cuda_graph_max_bs_decode"],
+                ),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
             disable_cuda_graph=kwargs["disable_cuda_graph"],
             disable_overlap_schedule=kwargs["disable_overlap_schedule"],
             enable_torch_compile=kwargs["enable_torch_compile"],
@@ -549,15 +560,15 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     scheduler = stages.create_generation_executor("model", device="cuda:0")
 
     assert build_kwargs["disable_cuda_graph"] is False
-    assert build_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16]
-    assert build_kwargs["cuda_graph_max_bs"] == 16
+    assert build_kwargs["cuda_graph_bs_decode"] == [1, 2, 4, 8, 12, 16]
+    assert build_kwargs["cuda_graph_max_bs_decode"] == 16
     assert build_kwargs["enable_torch_compile"] is True
     assert build_kwargs["sampling_backend"] == "pytorch"
     assert build_kwargs["torch_compile_max_bs"] == 16
-    assert infrastructure_saw_graph_disabled == [True]
+    assert infrastructure_saw_graph_disabled == [False]
     assert init_graph_calls == [True]
-    assert scheduler.server_args.cuda_graph_bs == [1, 2, 4, 8, 12, 16]
-    assert scheduler.server_args.cuda_graph_max_bs == 16
+    assert scheduler.server_args.cuda_graph_config.decode.bs == [1, 2, 4, 8, 12, 16]
+    assert scheduler.server_args.cuda_graph_config.decode.max_bs == 16
     assert scheduler.server_args.disable_cuda_graph is False
     assert scheduler.server_args.enable_torch_compile is True
     assert scheduler.server_args.torch_compile_max_bs == 16

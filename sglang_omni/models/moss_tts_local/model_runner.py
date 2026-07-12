@@ -286,7 +286,7 @@ class MossTTSLocalModelRunner(ModelRunner):
         emit_set = {
             i
             for i, sched_req in enumerate(requests)
-            if not self._is_chunked_request(sched_req)
+            if not self._has_inflight_middle_chunk(sched_req)
         }
         gen_steps = torch.maximum(
             pool.sampling_steps[row_t].to(device=device),
@@ -512,18 +512,14 @@ class MossTTSLocalModelRunner(ModelRunner):
         logits.copy_(torch.where(active, penalized, logits))
 
     @staticmethod
-    def _is_chunked_request(sched_req: Any) -> bool:
+    def _has_inflight_middle_chunk(sched_req: Any) -> bool:
         try:
             req = sched_req.data.req
         except AttributeError:
             return False
         if req is None:
             return False
-        try:
-            is_chunked = req.is_chunked
-        except AttributeError:
-            return False
-        return int(is_chunked) > 0
+        return req.inflight_middle_chunks > 0
 
     def finalize_skip_rids(self, scheduler_output) -> set[str]:
         """Non-final chunked-prefill rows must not advance ``generation_steps``.
@@ -537,7 +533,7 @@ class MossTTSLocalModelRunner(ModelRunner):
         return {
             sched_req.request_id
             for sched_req in scheduler_output.requests
-            if self._is_chunked_request(sched_req)
+            if self._has_inflight_middle_chunk(sched_req)
         }
 
     def on_generation_step_advanced(
@@ -604,7 +600,7 @@ class MossTTSLocalModelRunner(ModelRunner):
         expected_reqs = [
             sched_req
             for sched_req in scheduler_output.requests
-            if not self._is_chunked_request(sched_req)
+            if not self._has_inflight_middle_chunk(sched_req)
         ]
         expected_rids = [sched_req.request_id for sched_req in expected_reqs]
         rows_len = int(journal.rows.shape[0])

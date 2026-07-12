@@ -1849,15 +1849,17 @@ def test_post_process_outputs_skips_chunked_rows():
     )
 
     # Build minimal sched_req stubs.
-    def _req(is_chunked):
-        return types.SimpleNamespace(is_chunked=is_chunked)
+    def _req(inflight_middle_chunks):
+        return types.SimpleNamespace(inflight_middle_chunks=inflight_middle_chunks)
 
-    def _sched_req(rid, is_chunked):
-        data = types.SimpleNamespace(req=_req(is_chunked), output_rows=[])
+    def _sched_req(rid, inflight_middle_chunks):
+        data = types.SimpleNamespace(req=_req(inflight_middle_chunks), output_rows=[])
         return types.SimpleNamespace(request_id=rid, data=data)
 
-    req_a = _sched_req("r0", is_chunked=1)  # mid-prefill chunk, must be skipped
-    req_b = _sched_req("r1", is_chunked=0)  # normal decode row
+    req_a = _sched_req(
+        "r0", inflight_middle_chunks=1
+    )  # mid-prefill chunk, must be skipped
+    req_b = _sched_req("r1", inflight_middle_chunks=0)  # normal decode row
 
     sched_output = types.SimpleNamespace(requests=[req_a, req_b])
     outputs = {
@@ -1886,22 +1888,24 @@ def test_finalize_skip_rids_selects_chunked_rows():
 
     runner = MossTTSLocalModelRunner.__new__(MossTTSLocalModelRunner)
 
-    def _sched_req(rid, is_chunked):
-        data = types.SimpleNamespace(req=types.SimpleNamespace(is_chunked=is_chunked))
+    def _sched_req(rid, inflight_middle_chunks):
+        data = types.SimpleNamespace(
+            req=types.SimpleNamespace(inflight_middle_chunks=inflight_middle_chunks)
+        )
         return types.SimpleNamespace(request_id=rid, data=data)
 
     sched_output = types.SimpleNamespace(
         requests=[
-            _sched_req("c0", is_chunked=1),
-            _sched_req("c1", is_chunked=2),
-            _sched_req("final", is_chunked=0),
+            _sched_req("c0", inflight_middle_chunks=1),
+            _sched_req("c1", inflight_middle_chunks=2),
+            _sched_req("final", inflight_middle_chunks=0),
         ]
     )
     assert runner.finalize_skip_rids(sched_output) == {"c0", "c1"}
 
 
 def test_chunked_prefill_generation_steps_matches_single_shot():
-    # A K-chunk prefill (mid chunks is_chunked>0, final is_chunked==0) must leave
+    # A K-chunk prefill (mid chunks inflight_middle_chunks>0, final inflight_middle_chunks==0) must leave
     # generation_steps identical to a single-shot prefill, so the first decode
     # frame samples at the same position (position = generation_steps *
     # num_channels + channel) — bit-identical to the no-chunk path.
@@ -1943,24 +1947,24 @@ def test_chunked_prefill_generation_steps_matches_single_shot():
     # Single-shot prefill: the only chunk is final → exactly one advance.
     runner = _make_runner()
     data = types.SimpleNamespace(
-        req=types.SimpleNamespace(is_chunked=0),
+        req=types.SimpleNamespace(inflight_middle_chunks=0),
         generation_steps=0,
         extra_model_outputs={},
     )
     _finalize_once(runner, types.SimpleNamespace(request_id="r", data=data))
     assert data.generation_steps == 1
 
-    # 3-chunk prefill on the same request: mid chunks (is_chunked>0) suppressed,
+    # 3-chunk prefill on the same request: mid chunks (inflight_middle_chunks>0) suppressed,
     # final chunk advances → same end state as single-shot.
     runner = _make_runner()
     data = types.SimpleNamespace(
-        req=types.SimpleNamespace(is_chunked=2),
+        req=types.SimpleNamespace(inflight_middle_chunks=2),
         generation_steps=0,
         extra_model_outputs={},
     )
     sched_req = types.SimpleNamespace(request_id="r", data=data)
-    for is_chunked in (2, 1, 0):
-        data.req.is_chunked = is_chunked
+    for inflight_middle_chunks in (2, 1, 0):
+        data.req.inflight_middle_chunks = inflight_middle_chunks
         _finalize_once(runner, sched_req)
     assert data.generation_steps == 1
 
@@ -2209,9 +2213,9 @@ def test_chunked_rows_do_not_advance_sampling_steps():
             )
         )
 
-    def _data(is_chunked):
+    def _data(inflight_middle_chunks):
         return types.SimpleNamespace(
-            req=types.SimpleNamespace(is_chunked=is_chunked),
+            req=types.SimpleNamespace(inflight_middle_chunks=inflight_middle_chunks),
             text_temperature=1.0,
             text_top_p=1.0,
             text_top_k=50,
@@ -2233,17 +2237,17 @@ def test_chunked_rows_do_not_advance_sampling_steps():
 
     # Single-shot prefill: the only chunk is final, advances sampling_steps to 1.
     r = _make_runner()
-    single = types.SimpleNamespace(request_id="r", data=_data(is_chunked=0))
+    single = types.SimpleNamespace(request_id="r", data=_data(inflight_middle_chunks=0))
     r._run_frame_decode(_result(), types.SimpleNamespace(), [single])
     assert _pool_sampling_steps(r, "r") == 1
 
     # Three-chunk prefill on the same request: the mid chunks do not advance, the
     # final chunk does, so the end state matches the single-shot path.
     r = _make_runner()
-    data = _data(is_chunked=2)
+    data = _data(inflight_middle_chunks=2)
     sched = types.SimpleNamespace(request_id="r", data=data)
-    for is_chunked, expected_steps in ((2, 0), (1, 0), (0, 1)):
-        data.req.is_chunked = is_chunked
+    for inflight_middle_chunks, expected_steps in ((2, 0), (1, 0), (0, 1)):
+        data.req.inflight_middle_chunks = inflight_middle_chunks
         r._run_frame_decode(_result(), types.SimpleNamespace(), [sched])
         assert _pool_sampling_steps(r, "r") == expected_steps
 

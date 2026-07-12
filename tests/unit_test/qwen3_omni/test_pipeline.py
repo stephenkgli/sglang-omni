@@ -620,8 +620,8 @@ def test_qwen_cli_mem_fraction_static_survives_runtime_overrides_overlay() -> No
         "expected_init_graph_calls",
     ),
     [
-        (False, False, None, 0),
-        (True, True, [0, 24], 1),
+        (False, False, None, 1),
+        (True, False, [0, 24], 1),
     ],
 )
 def test_qwen_thinker_cuda_graph_capture_lifecycle(
@@ -648,7 +648,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     class FakeModelRunner:
         model = object()
 
-        def init_device_graphs(self) -> None:
+        def init_cuda_graphs(self) -> None:
             nonlocal init_graph_calls
             init_graph_calls += 1
             assert server_args.disable_cuda_graph is False

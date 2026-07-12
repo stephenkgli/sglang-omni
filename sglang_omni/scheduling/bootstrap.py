@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+
 
 def create_sglang_infrastructure(
     server_args: Any,
@@ -45,6 +47,11 @@ def create_sglang_infrastructure(
         model = model_worker.model_runner.model
         install_hidden_capture_hooks(model, capture_hidden_layers)
 
+    # note (kaige): SGLang 0.5.15 separates model loading, pool/backend init,
+    # and graph capture. Stages finish model-specific setup before the latter.
+    model_worker.model_runner.alloc_memory_pool()
+    model_worker.model_runner.init_attention_backends()
+
     req_to_token_pool, token_to_kv_pool_allocator = model_worker.get_memory_pool()
 
     tree_cache = create_tree_cache(
@@ -84,40 +91,23 @@ def create_sglang_infrastructure(
     )
 
 
-# note (luojiaxuan): Some Omni generation stages cannot let the generic SGLang
-# worker capture CUDA graphs immediately during infrastructure construction. At
-# that point the shared request pools exist, but stage-owned decode state may not:
-# speech tokenizers may still need to be attached, sampler or feedback buffers
-# may not be allocated, stage-local decode helpers may not be compiled, and the
-# model-specific buffer capacity may not yet have been checked against the
-# serving batch policy. Capturing before that work would freeze replay around an
-# incomplete decode path and can make later steady-state requests either miss the
-# intended graph buckets or overrun model-side per-request buffers. The capture
-# priority should be the hot path users repeatedly pay for under concurrency:
-# decode batches admitted by max_running_requests, capped by cuda_graph_max_bs
-# and request-token slots, with all per-request model buffers already allocated.
-# One-time bootstrap work such as processor loading, cache construction, audio
-# decoder/vocoder setup, and other host-side staging should stay outside CUDA
-# graph coverage because graph replay will not amortize it. This helper therefore
-# disables worker-time capture only long enough to build the shared SGLang
-# infrastructure, restores the user's CUDA-graph setting, and tells the caller
-# whether it should call init_device_graphs() after its stage-specific setup.
+def is_cuda_graph_enabled(server_args: Any, phase: str) -> bool:
+    """Return whether one SGLang forward phase uses a CUDA graph backend."""
+    if phase not in Phase.ALL:
+        raise ValueError(f"unknown CUDA graph phase: {phase}")
+    return server_args.cuda_graph_config[phase].backend != Backend.DISABLED
+
+
+def has_enabled_cuda_graph(server_args: Any) -> bool:
+    """Return whether either SGLang forward phase uses a CUDA graph backend."""
+    return any(is_cuda_graph_enabled(server_args, phase) for phase in Phase.ALL)
+
+
 def create_sglang_infrastructure_defer_cuda_graph(
     server_args: Any,
     gpu_id: int,
     **kwargs: Any,
 ):
-    """Build shared SGLang infrastructure while deferring CUDA graph capture.
-
-    The caller finishes stage-specific decode setup, then runs
-    init_device_graphs() only when this returns that CUDA graphs were requested.
-    """
-    want_cuda_graph = not bool(server_args.disable_cuda_graph)
-    if want_cuda_graph:
-        server_args.disable_cuda_graph = True
-    try:
-        infrastructure = create_sglang_infrastructure(server_args, gpu_id, **kwargs)
-    finally:
-        if want_cuda_graph:
-            server_args.disable_cuda_graph = False
-    return want_cuda_graph, infrastructure
+    """Build pools/backends while leaving graph capture to the stage caller."""
+    infrastructure = create_sglang_infrastructure(server_args, gpu_id, **kwargs)
+    return has_enabled_cuda_graph(server_args), infrastructure

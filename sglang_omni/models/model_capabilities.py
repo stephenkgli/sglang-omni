@@ -28,6 +28,9 @@ class ModelCapabilities:
     - supports_torch_compile: the architecture has an owned ``torch.compile``
       path, including codec, codebook, or frame-sampler compiles. This is not
       limited to the generic SGLang ``enable_torch_compile`` server arg.
+    - supports_sglang_tc_piecewise_prefill: the architecture satisfies
+      SGLang's multimodal ``PrefillCudaGraphRunner`` contract with the
+      ``tc_piecewise`` backend.
     """
 
     supports_reference_audio: bool
@@ -35,6 +38,7 @@ class ModelCapabilities:
     supports_streaming_vocoder: bool
     supports_cuda_graph: bool
     supports_torch_compile: bool
+    supports_sglang_tc_piecewise_prefill: bool
 
 
 def get_model_capabilities(architecture: str) -> ModelCapabilities | None:

@@ -189,9 +189,6 @@ class DllmScheduler:
             r for r in self._waiting_queue if r.rid not in staging_rids
         ]
 
-        for req in self._staging_queue:
-            req.is_chunked += 1
-
         new_batch = ScheduleBatch.init_new(
             reqs=adder.can_run_list,
             req_to_token_pool=self.req_to_token_pool,

@@ -1384,7 +1384,8 @@ class Qwen3OmniTalker(nn.Module):
         *,
         max_batch_size: int,
     ) -> tuple[int, ...]:
-        raw_batch_sizes = getattr(server_args, "cuda_graph_bs", None)
+        graph_config = getattr(server_args, "cuda_graph_config", None)
+        raw_batch_sizes = graph_config.decode.bs if graph_config is not None else None
         if raw_batch_sizes is None:
             raw_batch_sizes = (max_batch_size,)
 

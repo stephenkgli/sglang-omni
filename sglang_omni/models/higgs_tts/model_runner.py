@@ -321,7 +321,7 @@ class HiggsTTSModelRunner(ModelRunner):
         for b, sched_req in enumerate(requests):
             data = sched_req.data
             req = data.req
-            if req.is_chunked > 0:
+            if req.inflight_middle_chunks > 0:
                 cb0_per_row.append(0)
                 continue
             # Already finished in an earlier step? Skip its append. Under async
@@ -418,7 +418,12 @@ class HiggsTTSModelRunner(ModelRunner):
             rid = sched_req.request_id
             row = model._rid_to_row.get(rid)
             codes_log = model._output_codes.get(rid)
-            if req.is_chunked > 0 or row is None or not codes_log or req.finished():
+            if (
+                req.inflight_middle_chunks > 0
+                or row is None
+                or not codes_log
+                or req.finished()
+            ):
                 cb0_per_row.append(0)
                 continue
             codes_N = codes_log[-1]

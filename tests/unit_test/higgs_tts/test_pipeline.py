@@ -9,6 +9,11 @@ import numpy as np
 import pytest
 import torch
 import typer
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 
 from sglang_omni.cli.serve import apply_mem_fraction_cli_overrides
 from sglang_omni.models.higgs_tts import stages
@@ -46,13 +51,22 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     init_graph_calls: list[bool] = []
 
     def fake_build_sglang_server_args(checkpoint_dir, context_length, **overrides):
+        cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(
+                backend=Backend.FULL,
+                max_bs=overrides["cuda_graph_max_bs_decode"],
+                bs=overrides["cuda_graph_bs_decode"],
+            ),
+            prefill=PhaseConfig(
+                backend=Backend.DISABLED,
+            ),
+        )
         server_args = SimpleNamespace(
             disable_cuda_graph=overrides["disable_cuda_graph"],
             disable_overlap_schedule=False,
             enable_torch_compile=False,
             max_running_requests=overrides["max_running_requests"],
-            cuda_graph_max_bs=overrides["cuda_graph_max_bs"],
-            cuda_graph_bs=overrides["cuda_graph_bs"],
+            cuda_graph_config=cuda_graph_config,
             torch_compile_max_bs=32,
         )
         captured["checkpoint_dir"] = checkpoint_dir
@@ -71,10 +85,10 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
         )
         model_runner = SimpleNamespace(model=model)
 
-        def init_device_graphs() -> None:
+        def init_cuda_graphs() -> None:
             init_graph_calls.append(True)
 
-        model_runner.init_device_graphs = init_device_graphs
+        model_runner.init_cuda_graphs = init_cuda_graphs
         return (
             SimpleNamespace(model_runner=model_runner),
             object(),
@@ -128,7 +142,7 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     assert captured["context_length"] == 4096
     assert captured["gpu_id"] == 0
     assert captured["overrides"]["disable_cuda_graph"] is False
-    assert captured["overrides"]["cuda_graph_bs"] == [
+    assert captured["overrides"]["cuda_graph_bs_decode"] == [
         1,
         2,
         4,
@@ -142,12 +156,13 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
         56,
         64,
     ]
-    assert captured["overrides"]["cuda_graph_max_bs"] == 64
+    assert captured["overrides"]["cuda_graph_max_bs_decode"] == 64
+    assert captured["overrides"]["disable_prefill_cuda_graph"] is True
     assert captured["overrides"]["max_running_requests"] == 64
     assert captured["server_args"].disable_overlap_schedule is True
     assert captured["server_args"].enable_torch_compile is False
     assert captured["server_args"].torch_compile_max_bs == 32
-    assert infrastructure_saw_graph_disabled == [True]
+    assert infrastructure_saw_graph_disabled == [False]
     assert init_graph_calls == [True]
     assert captured["adapter_kwargs"] == {"max_new_tokens_cap": 2048}
     assert (
@@ -529,7 +544,7 @@ def test_higgs_model_runner_marks_sampler_finish() -> None:
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
     )
     req = SimpleNamespace(
-        is_chunked=0,
+        inflight_middle_chunks=0,
         finished_reason=None,
         finished=lambda: False,
     )
@@ -565,7 +580,7 @@ def test_higgs_model_runner_emits_latched_stream_metadata() -> None:
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
     )
     req = SimpleNamespace(
-        is_chunked=0,
+        inflight_middle_chunks=0,
         finished_reason=None,
         finished=lambda: False,
     )
@@ -650,7 +665,9 @@ def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
             step_count=torch.zeros(1, dtype=torch.long),
         ),
     )
-    req = SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False)
+    req = SimpleNamespace(
+        inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+    )
     data = SimpleNamespace(
         req=req,
         output_codes=[],
@@ -705,10 +722,18 @@ def test_higgs_model_runner_collect_cg_mixed_batch() -> None:
     )
     # row0 chunked, row1 was-done, row2 active (not done), row3 active (EOC done).
     reqs = [
-        SimpleNamespace(is_chunked=1, finished_reason=None, finished=lambda: False),
-        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
-        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
-        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
+        SimpleNamespace(
+            inflight_middle_chunks=1, finished_reason=None, finished=lambda: False
+        ),
+        SimpleNamespace(
+            inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+        ),
+        SimpleNamespace(
+            inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+        ),
+        SimpleNamespace(
+            inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+        ),
     ]
     datas = [
         SimpleNamespace(
@@ -774,7 +799,9 @@ def test_higgs_model_runner_collects_rollout_logprobs_only_when_requested() -> N
             last_codes=torch.zeros((n, k), dtype=torch.long),
         ),
     )
-    req = SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False)
+    req = SimpleNamespace(
+        inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+    )
     data = SimpleNamespace(
         req=req,
         output_codes=[],
@@ -813,7 +840,7 @@ def test_higgs_model_runner_skips_already_finished_eager_request() -> None:
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
     )
     req = SimpleNamespace(
-        is_chunked=0,
+        inflight_middle_chunks=0,
         finished_reason=object(),
         finished=lambda: True,
     )

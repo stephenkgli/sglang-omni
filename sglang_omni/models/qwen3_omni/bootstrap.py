@@ -32,11 +32,8 @@ def create_thinker_scheduler(
 
     capture_hidden_layers = [0, 24] if speech_enabled else None
     capture_hidden = speech_enabled
-    want_cuda_graph = not bool(server_args.disable_cuda_graph)
-    defer_cuda_graph_capture = want_cuda_graph and capture_hidden
-    if defer_cuda_graph_capture:
+    if capture_hidden:
         server_args.enable_return_hidden_states = True
-        server_args.disable_cuda_graph = True
 
     (
         model_worker,
@@ -55,10 +52,7 @@ def create_thinker_scheduler(
         capture_hidden_layers=capture_hidden_layers,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
     )
-
-    if defer_cuda_graph_capture:
-        server_args.disable_cuda_graph = False
-        model_worker.model_runner.init_device_graphs()
+    model_worker.model_runner.init_cuda_graphs()
 
     def _should_generate_qwen_audio_output(request: Any) -> bool:
         return should_generate_audio_output(request.data.stage_payload)
@@ -134,7 +128,7 @@ def create_talker_scheduler(
     from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
     from sglang_omni.scheduling.sglang_backend import SGLangOutputProcessor
 
-    want_cuda_graph = configure_talker_server_args(
+    configure_talker_server_args(
         server_args,
         feedback_enabled=feedback_enabled,
     )
@@ -166,9 +160,7 @@ def create_talker_scheduler(
         _runner_cfg.vocab_size = _codec_vocab_size
     if hasattr(model_worker.model_runner, "sampler"):
         model_worker.model_runner.model._sampler = model_worker.model_runner.sampler
-    if want_cuda_graph:
-        server_args.disable_cuda_graph = False
-        model_worker.model_runner.init_device_graphs()
+    model_worker.model_runner.init_cuda_graphs()
 
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,

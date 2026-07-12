@@ -541,7 +541,7 @@ def _is_h20_device() -> bool:
 
 
 def _is_fp8_cutlass_moe_supported() -> bool:
-    """Mirror pinned SGLang 0.5.12.post1 FP8 CUTLASS MoE assertions."""
+    """Mirror pinned SGLang FP8 CUTLASS MoE assertions."""
     try:
         from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
         from sglang.srt.utils import is_sm90_supported, is_sm100_supported

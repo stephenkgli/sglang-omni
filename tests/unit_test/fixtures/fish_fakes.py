@@ -104,12 +104,12 @@ class FakeFishReq:
         self,
         *,
         rid: str = "req-fish",
-        is_chunked: int = 0,
+        inflight_middle_chunks: int = 0,
         extend_input_len: int = 0,
         prefix_indices: list[int] | None = None,
     ) -> None:
         self.rid = rid
-        self.is_chunked = is_chunked
+        self.inflight_middle_chunks = inflight_middle_chunks
         self.extend_input_len = extend_input_len
         self.prefix_indices = prefix_indices or []
 

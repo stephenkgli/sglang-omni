@@ -6,6 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from sglang.srt.model_executor.cuda_graph_config import Backend
 
 from sglang_omni.scheduling.generation_batch_policy import (
     build_default_cuda_graph_bs,
@@ -17,14 +18,22 @@ from sglang_omni.scheduling.generation_batch_policy import (
 def _server_args(**overrides: object) -> SimpleNamespace:
     values: dict[str, object] = {
         "max_running_requests": 16,
-        "disable_cuda_graph": False,
         "cuda_graph_max_bs": 16,
         "cuda_graph_bs": [1, 2, 4, 8, 12, 16],
+        "decode_backend": Backend.FULL,
         "enable_torch_compile": True,
         "torch_compile_max_bs": 16,
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    decode_config = SimpleNamespace(
+        backend=values.pop("decode_backend"),
+        max_bs=values.pop("cuda_graph_max_bs"),
+        bs=values.pop("cuda_graph_bs"),
+    )
+    return SimpleNamespace(
+        **values,
+        cuda_graph_config=SimpleNamespace(decode=decode_config),
+    )
 
 
 def test_default_cuda_graph_bs_matches_sglang_normal_buckets() -> None:
@@ -49,10 +58,11 @@ def test_default_cuda_graph_bs_matches_sglang_normal_buckets() -> None:
 
 def test_build_generation_batch_overrides_tie_batch_knobs() -> None:
     assert build_generation_batch_overrides(max_running_requests=16) == {
+        "disable_prefill_cuda_graph": True,
         "max_running_requests": 16,
-        "cuda_graph_max_bs": 16,
+        "cuda_graph_max_bs_decode": 16,
         "torch_compile_max_bs": 16,
-        "cuda_graph_bs": [1, 2, 4, 8, 12, 16],
+        "cuda_graph_bs_decode": [1, 2, 4, 8, 12, 16],
     }
 
 
@@ -62,10 +72,11 @@ def test_build_generation_batch_overrides_allow_explicit_caps() -> None:
         cuda_graph_max_bs=32,
         torch_compile_max_bs=8,
     ) == {
+        "disable_prefill_cuda_graph": True,
         "max_running_requests": 16,
-        "cuda_graph_max_bs": 32,
+        "cuda_graph_max_bs_decode": 32,
         "torch_compile_max_bs": 8,
-        "cuda_graph_bs": [1, 2, 4, 8, 12, 16, 24, 32],
+        "cuda_graph_bs_decode": [1, 2, 4, 8, 12, 16, 24, 32],
     }
 
 
@@ -144,7 +155,7 @@ def test_build_generation_batch_overrides_preserves_explicit_list() -> None:
         max_running_requests=16,
         server_args_overrides=server_args_overrides,
     )
-    assert overrides["cuda_graph_bs"] == [1, 4, 32]
+    assert overrides["cuda_graph_bs_decode"] == [1, 4, 32]
 
 
 def test_build_generation_batch_overrides_fills_default_list() -> None:
@@ -152,7 +163,7 @@ def test_build_generation_batch_overrides_fills_default_list() -> None:
         max_running_requests=16,
         cuda_graph_max_bs=32,
     )
-    assert overrides["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16, 24, 32]
+    assert overrides["cuda_graph_bs_decode"] == [1, 2, 4, 8, 12, 16, 24, 32]
 
 
 def test_build_generation_batch_overrides_recomputes_list_when_max_changes() -> None:
@@ -160,7 +171,7 @@ def test_build_generation_batch_overrides_recomputes_list_when_max_changes() -> 
         max_running_requests=16,
         server_args_overrides={"cuda_graph_max_bs": 32},
     )
-    assert overrides["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16, 24, 32]
+    assert overrides["cuda_graph_bs_decode"] == [1, 2, 4, 8, 12, 16, 24, 32]
 
 
 def test_build_generation_batch_overrides_rebinds_default_caps_when_max_changes() -> (
@@ -171,6 +182,59 @@ def test_build_generation_batch_overrides_rebinds_default_caps_when_max_changes(
         server_args_overrides={"max_running_requests": 32},
     )
     assert overrides["max_running_requests"] == 32
-    assert overrides["cuda_graph_max_bs"] == 32
+    assert overrides["cuda_graph_max_bs_decode"] == 32
     assert overrides["torch_compile_max_bs"] == 32
-    assert overrides["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16, 24, 32]
+    assert overrides["cuda_graph_bs_decode"] == [1, 2, 4, 8, 12, 16, 24, 32]
+
+
+def test_build_generation_batch_overrides_enables_prefill_graph() -> None:
+    overrides = build_generation_batch_overrides(
+        max_running_requests=4,
+        enable_prefill_cuda_graph=True,
+        prefill_graph_token_buckets=[64, 16, 64],
+    )
+
+    assert "disable_prefill_cuda_graph" not in overrides
+    assert overrides["cuda_graph_bs_prefill"] == [16, 64]
+    assert overrides["cuda_graph_max_bs_prefill"] == 64
+
+
+def test_build_generation_batch_overrides_rejects_ambiguous_graph_aliases() -> None:
+    with pytest.raises(ValueError, match="Specify only one"):
+        build_generation_batch_overrides(
+            max_running_requests=4,
+            server_args_overrides={
+                "cuda_graph_bs": [1, 4],
+                "cuda_graph_bs_decode": [1, 4],
+            },
+        )
+
+
+def test_build_generation_batch_overrides_rejects_ambiguous_prefill_buckets() -> None:
+    with pytest.raises(ValueError, match="cannot be combined"):
+        build_generation_batch_overrides(
+            max_running_requests=4,
+            enable_prefill_cuda_graph=True,
+            prefill_graph_token_buckets=[16, 64],
+            server_args_overrides={"cuda_graph_bs_prefill": [32]},
+        )
+
+
+def test_build_generation_batch_overrides_validates_prefill_options() -> None:
+    with pytest.raises(TypeError, match="must be a bool"):
+        build_generation_batch_overrides(
+            max_running_requests=4,
+            enable_prefill_cuda_graph=1,
+        )
+    with pytest.raises(ValueError, match="must be None"):
+        build_generation_batch_overrides(
+            max_running_requests=4,
+            enable_prefill_cuda_graph=False,
+            prefill_graph_token_buckets=[16],
+        )
+    with pytest.raises(ValueError, match="positive integers"):
+        build_generation_batch_overrides(
+            max_running_requests=4,
+            enable_prefill_cuda_graph=True,
+            prefill_graph_token_buckets=[True],
+        )

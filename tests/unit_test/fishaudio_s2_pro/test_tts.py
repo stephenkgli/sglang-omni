@@ -57,7 +57,7 @@ def test_fish_model_runner_vq_injection_and_code_collection_contracts() -> None:
     active = SchedulerRequest(
         request_id="active",
         data=SimpleNamespace(
-            req=FakeFishReq(is_chunked=0),
+            req=FakeFishReq(inflight_middle_chunks=0),
             output_codes=[],
             previous_semantic_tokens=[],
             semantic_history_tokens=None,
@@ -81,8 +81,10 @@ def test_fish_model_runner_vq_injection_and_code_collection_contracts() -> None:
     )
 
 
-def _make_s2pro_request(request_id: str, *, is_chunked: int = 0) -> SchedulerRequest:
-    req = FakeFishReq(is_chunked=is_chunked)
+def _make_s2pro_request(
+    request_id: str, *, inflight_middle_chunks: int = 0
+) -> SchedulerRequest:
+    req = FakeFishReq(inflight_middle_chunks=inflight_middle_chunks)
     return SchedulerRequest(
         request_id=request_id,
         data=SimpleNamespace(
@@ -546,7 +548,7 @@ def test_fish_s2pro_mixed_batch_keeps_terminal_and_audio_state_separate() -> Non
 
 
 def test_fish_s2pro_chunked_step_does_not_mutate_decode_state() -> None:
-    request = _make_s2pro_request("req-chunked", is_chunked=1)
+    request = _make_s2pro_request("req-chunked", inflight_middle_chunks=1)
 
     _collect_s2pro_step([request], [[SEMANTIC_TOKEN_ID, 11, 22]])
 

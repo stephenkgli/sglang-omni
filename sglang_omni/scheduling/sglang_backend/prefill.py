@@ -129,7 +129,7 @@ class PrefillManager:
             )
 
         if self.chunked_req is not None:
-            self.chunked_req.is_chunked += 1
+            self.chunked_req.inflight_middle_chunks += 1
 
         # Batch dataclass of req for return
         new_batch = ScheduleBatch.init_new(

@@ -30,7 +30,7 @@ def collect_s2pro_step_outputs(
 
     for row_idx, sched_req in enumerate(requests):
         data = sched_req.data
-        if data.req.is_chunked > 0:
+        if data.req.inflight_middle_chunks > 0:
             continue
 
         semantic_token = semantic_tokens[row_idx]

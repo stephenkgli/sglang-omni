@@ -84,7 +84,7 @@ def create_sglang_qwen3_asr_executor(
         server_args=server_args,
     )
 
-    want_cuda_graph, (
+    _, (
         model_worker,
         tree_cache,
         req_to_token_pool,
@@ -98,8 +98,7 @@ def create_sglang_qwen3_asr_executor(
         model_arch_override="Qwen3ASRForConditionalGeneration",
     )
 
-    if want_cuda_graph:
-        model_worker.model_runner.init_device_graphs()
+    model_worker.model_runner.init_cuda_graphs()
 
     init_mm_embedding_cache(mm_embedding_cache_size_bytes)
 

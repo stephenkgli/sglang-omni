@@ -19,21 +19,12 @@ def configure_talker_server_args(
     server_args: Any,
     *,
     feedback_enabled: bool = True,
-) -> bool:
-    """Apply talker-specific scheduler/runtime defaults.
-
-    Returns whether CUDA graphs were originally requested so the caller can
-    re-enable graph capture after the model worker is constructed.
-    """
-
-    want_cuda_graph = not bool(server_args.disable_cuda_graph)
+) -> None:
+    """Apply talker-specific scheduler/runtime defaults."""
     if feedback_enabled:
         server_args.disable_overlap_schedule = True
-        if want_cuda_graph:
-            server_args.disable_cuda_graph = True
     server_args.disable_radix_cache = True
     server_args.chunked_prefill_size = 0
-    return want_cuda_graph
 
 
 class QwenTalkerScheduler(OmniScheduler):

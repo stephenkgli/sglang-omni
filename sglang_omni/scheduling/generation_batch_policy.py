@@ -6,6 +6,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from sglang.srt.model_executor.cuda_graph_config import Backend
+
 _MISSING = object()
 
 
@@ -29,9 +31,12 @@ def build_generation_batch_overrides(
     max_running_requests: int,
     cuda_graph_max_bs: int | None = None,
     torch_compile_max_bs: int | None = None,
+    enable_prefill_cuda_graph: bool = False,
+    prefill_graph_token_buckets: list[int] | None = None,
     server_args_overrides: Mapping[str, Any] | None = None,
     **stage_defaults: Any,
 ) -> dict[str, Any]:
+    """Resolve Omni serving limits into SGLang's phase-aware graph fields."""
     incoming = dict(server_args_overrides or {})
     max_running_requests = _normalize_positive_int(
         "max_running_requests",
@@ -42,7 +47,12 @@ def build_generation_batch_overrides(
     )
     cuda_graph_max_bs = _normalize_positive_int(
         "cuda_graph_max_bs",
-        incoming.pop("cuda_graph_max_bs", cuda_graph_max_bs),
+        _pop_graph_alias(
+            incoming,
+            new_name="cuda_graph_max_bs_decode",
+            legacy_name="cuda_graph_max_bs",
+            default=cuda_graph_max_bs,
+        ),
     )
     torch_compile_max_bs = (
         max_running_requests if torch_compile_max_bs is None else torch_compile_max_bs
@@ -51,21 +61,99 @@ def build_generation_batch_overrides(
         "torch_compile_max_bs",
         incoming.pop("torch_compile_max_bs", torch_compile_max_bs),
     )
-    cuda_graph_bs = incoming.pop("cuda_graph_bs", _MISSING)
+    cuda_graph_bs = _pop_graph_alias(
+        incoming,
+        new_name="cuda_graph_bs_decode",
+        legacy_name="cuda_graph_bs",
+        default=_MISSING,
+    )
+
+    if prefill_graph_token_buckets is not None:
+        conflicting_prefill_fields = sorted(
+            field
+            for field in ("cuda_graph_bs_prefill", "cuda_graph_max_bs_prefill")
+            if field in incoming or field in stage_defaults
+        )
+        if conflicting_prefill_fields:
+            raise ValueError(
+                "prefill_graph_token_buckets cannot be combined with "
+                + ", ".join(conflicting_prefill_fields)
+            )
+
+    prefill_overrides = _build_prefill_cuda_graph_overrides(
+        enabled=enable_prefill_cuda_graph,
+        token_buckets=prefill_graph_token_buckets,
+    )
 
     overrides = {
+        **prefill_overrides,
         **stage_defaults,
         **incoming,
         "max_running_requests": max_running_requests,
-        "cuda_graph_max_bs": cuda_graph_max_bs,
+        "cuda_graph_max_bs_decode": cuda_graph_max_bs,
         "torch_compile_max_bs": torch_compile_max_bs,
     }
     if cuda_graph_bs is _MISSING:
-        overrides["cuda_graph_bs"] = build_default_cuda_graph_bs(cuda_graph_max_bs)
+        overrides["cuda_graph_bs_decode"] = build_default_cuda_graph_bs(
+            cuda_graph_max_bs
+        )
     else:
-        overrides["cuda_graph_bs"] = cuda_graph_bs
+        overrides["cuda_graph_bs_decode"] = cuda_graph_bs
 
     return overrides
+
+
+def _pop_graph_alias(
+    values: dict[str, Any],
+    *,
+    new_name: str,
+    legacy_name: str,
+    default: Any,
+) -> Any:
+    if new_name in values and legacy_name in values:
+        raise ValueError(f"Specify only one of {new_name} and {legacy_name}")
+    if new_name in values:
+        return values.pop(new_name)
+    return values.pop(legacy_name, default)
+
+
+def _build_prefill_cuda_graph_overrides(
+    *,
+    enabled: bool,
+    token_buckets: list[int] | None,
+) -> dict[str, Any]:
+    if not isinstance(enabled, bool):
+        raise TypeError("enable_prefill_cuda_graph must be a bool")
+    if not enabled:
+        if token_buckets is not None:
+            raise ValueError(
+                "prefill_graph_token_buckets must be None when "
+                "enable_prefill_cuda_graph is False"
+            )
+        return {"disable_prefill_cuda_graph": True}
+
+    if token_buckets is None:
+        return {}
+    normalized = _normalize_prefill_graph_token_buckets(token_buckets)
+    return {
+        "cuda_graph_bs_prefill": normalized,
+        "cuda_graph_max_bs_prefill": max(normalized),
+    }
+
+
+def _normalize_prefill_graph_token_buckets(token_buckets: list[int]) -> list[int]:
+    if (
+        not isinstance(token_buckets, list)
+        or not token_buckets
+        or any(
+            isinstance(bucket, bool) or not isinstance(bucket, int) or bucket < 1
+            for bucket in token_buckets
+        )
+    ):
+        raise ValueError(
+            "prefill_graph_token_buckets must be a non-empty list of positive integers"
+        )
+    return sorted(set(token_buckets))
 
 
 def validate_generation_batch_policy(
@@ -81,18 +169,20 @@ def validate_generation_batch_policy(
         server_args.max_running_requests,
         errors,
     )
-    cuda_graph_enabled = not bool(server_args.disable_cuda_graph)
+    cuda_graph_config = server_args.cuda_graph_config
+    decode_graph_config = cuda_graph_config.decode
+    cuda_graph_enabled = decode_graph_config.backend != Backend.DISABLED
 
     cuda_graph_max_bs: int | None = None
     cuda_graph_bs: tuple[int, ...] | None = None
     if cuda_graph_enabled:
         cuda_graph_max_bs = _validate_positive_int(
             "cuda_graph_max_bs",
-            server_args.cuda_graph_max_bs,
+            decode_graph_config.max_bs,
             errors,
             required=True,
         )
-        cuda_graph_bs_value = server_args.cuda_graph_bs
+        cuda_graph_bs_value = decode_graph_config.bs
         if cuda_graph_bs_value is None:
             errors.append("cuda_graph_bs must be explicit when CUDA graph is enabled")
         else:

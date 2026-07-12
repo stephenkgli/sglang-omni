@@ -6,6 +6,12 @@ import inspect
 from types import SimpleNamespace
 from typing import Any
 
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
+
 TEST_MAX_TOTAL_TOKENS = 82000
 
 
@@ -50,7 +56,7 @@ def test_tts_engine_builder_phase_order_and_override_contract(monkeypatch) -> No
             self.server_args = server_args
             self.model = FakeModel()
 
-        def init_device_graphs(self) -> None:
+        def init_cuda_graphs(self) -> None:
             events.append("init_graphs")
             init_graph_calls.append(True)
 
@@ -66,11 +72,18 @@ def test_tts_engine_builder_phase_order_and_override_contract(monkeypatch) -> No
     ) -> Any:
         events.append("build_server_args")
         build_kwargs.update(kwargs)
+        cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(
+                backend=Backend.FULL,
+                bs=kwargs["cuda_graph_bs_decode"],
+                max_bs=kwargs["cuda_graph_max_bs_decode"],
+            ),
+            prefill=PhaseConfig(backend=Backend.DISABLED),
+        )
         return SimpleNamespace(
             checkpoint_dir=checkpoint_dir,
             context_length=context_length,
-            cuda_graph_bs=kwargs["cuda_graph_bs"],
-            cuda_graph_max_bs=kwargs["cuda_graph_max_bs"],
+            cuda_graph_config=cuda_graph_config,
             disable_cuda_graph=kwargs["disable_cuda_graph"],
             enable_torch_compile=kwargs["enable_torch_compile"],
             max_running_requests=kwargs["max_running_requests"],
@@ -86,7 +99,9 @@ def test_tts_engine_builder_phase_order_and_override_contract(monkeypatch) -> No
         events.append("infrastructure")
         assert gpu_id == 2
         assert kwargs == {"model_arch_override": "TestArch"}
-        infrastructure_saw_graph_disabled.append(bool(server_args.disable_cuda_graph))
+        infrastructure_saw_graph_disabled.append(
+            server_args.cuda_graph_config.decode.backend == Backend.DISABLED
+        )
         return (
             FakeWorker(server_args),
             "tree_cache",
@@ -237,11 +252,12 @@ def test_tts_engine_builder_phase_order_and_override_contract(monkeypatch) -> No
         "post_scheduler_setup",
     ]
     assert build_kwargs["max_running_requests"] == 2
-    assert build_kwargs["cuda_graph_max_bs"] == 8
+    assert build_kwargs["model_architecture"] == "TestArch"
+    assert build_kwargs["cuda_graph_max_bs_decode"] == 8
     assert build_kwargs["torch_compile_max_bs"] == 8
     assert build_kwargs["mem_fraction_static"] == 0.7
     assert build_kwargs["max_total_tokens"] == TEST_MAX_TOTAL_TOKENS
-    assert infrastructure_saw_graph_disabled == [True]
+    assert infrastructure_saw_graph_disabled == [False]
     assert init_graph_calls == [True]
     assert scheduler.kwargs["server_args"].disable_cuda_graph is False
     assert scheduler.kwargs["model_runner"].outbox == "outbox"

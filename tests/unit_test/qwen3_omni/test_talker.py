@@ -1605,11 +1605,11 @@ def test_qwen_model_runner_and_code_predictor_tensor_contracts() -> None:
             "pad_values": {"audio": 999},
         },
         _omni_consumed=None,
-        is_chunked=0,
+        inflight_middle_chunks=0,
     )
     input_embeds, _, _ = runner._inject_multimodal_embeds(
         SimpleNamespace(input_ids=torch.tensor([1, 999, 2]), extend_seq_lens_cpu=[3]),
-        SimpleNamespace(reqs=[req]),
+        SimpleNamespace(reqs=[req], chunked_req=None),
     )
 
     assert (

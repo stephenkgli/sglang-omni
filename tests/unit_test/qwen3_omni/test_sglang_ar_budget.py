@@ -5,6 +5,11 @@ import logging
 from types import SimpleNamespace
 
 import pytest
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
@@ -255,8 +260,14 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
             mem_fraction_static=0.55,
             sampling_backend=overrides["sampling_backend"],
             max_running_requests=overrides["max_running_requests"],
-            cuda_graph_max_bs=overrides["cuda_graph_max_bs"],
-            cuda_graph_bs=overrides["cuda_graph_bs"],
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.FULL,
+                    max_bs=overrides["cuda_graph_max_bs_decode"],
+                    bs=overrides["cuda_graph_bs_decode"],
+                ),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
             disable_cuda_graph=overrides["disable_cuda_graph"],
             enable_torch_compile=overrides.get("enable_torch_compile", False),
             torch_compile_max_bs=overrides["torch_compile_max_bs"],
@@ -268,8 +279,8 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
                 "gpu_id": gpu_id,
                 "sampling_backend": server_args.sampling_backend,
                 "max_running_requests": server_args.max_running_requests,
-                "cuda_graph_max_bs": server_args.cuda_graph_max_bs,
-                "cuda_graph_bs": server_args.cuda_graph_bs,
+                "cuda_graph_max_bs": server_args.cuda_graph_config.decode.max_bs,
+                "cuda_graph_bs": server_args.cuda_graph_config.decode.bs,
                 "torch_compile_max_bs": server_args.torch_compile_max_bs,
                 "weight_prefix": kwargs["weight_prefix"],
             }
@@ -297,8 +308,9 @@ def test_qwen_talker_ar_threads_explicit_generation_batch_policy(monkeypatch) ->
 
     assert build_calls == [
         {
-            "cuda_graph_bs": [1, 2, 4, 8, 12, 16, 24, 32],
-            "cuda_graph_max_bs": 32,
+            "cuda_graph_bs_decode": [1, 2, 4, 8, 12, 16, 24, 32],
+            "cuda_graph_max_bs_decode": 32,
+            "disable_prefill_cuda_graph": True,
             "disable_cuda_graph": False,
             "max_running_requests": 32,
             "sampling_backend": "pytorch",
@@ -328,8 +340,14 @@ def test_talker_ar_default_running_batch_width_is_32(monkeypatch) -> None:
         return SimpleNamespace(
             mem_fraction_static=overrides.get("mem_fraction_static"),
             max_running_requests=overrides["max_running_requests"],
-            cuda_graph_max_bs=overrides["cuda_graph_max_bs"],
-            cuda_graph_bs=overrides["cuda_graph_bs"],
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.FULL,
+                    max_bs=overrides["cuda_graph_max_bs_decode"],
+                    bs=overrides["cuda_graph_bs_decode"],
+                ),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
             disable_cuda_graph=overrides["disable_cuda_graph"],
             enable_torch_compile=overrides.get("enable_torch_compile", False),
             torch_compile_max_bs=overrides["torch_compile_max_bs"],

@@ -11,6 +11,11 @@ import numpy as np
 import pytest
 import torch
 import typer
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 
 from sglang_omni.cli.serve import apply_torch_compile_cli_overrides
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
@@ -310,7 +315,7 @@ def _run_s2pro_engine_with_fake_buffers(
             self.server_args = server_args
             self.model = SimpleNamespace()
 
-        def init_device_graphs(self) -> None:
+        def init_cuda_graphs(self) -> None:
             assert self.server_args.enable_torch_compile is False
             assert self.server_args.torch_compile_max_bs == 64
             init_graph_calls.append(True)
@@ -354,8 +359,14 @@ def _run_s2pro_engine_with_fake_buffers(
         build_kwargs.update(kwargs)
         return SimpleNamespace(
             context_length=context_length,
-            cuda_graph_bs=kwargs["cuda_graph_bs"],
-            cuda_graph_max_bs=kwargs["cuda_graph_max_bs"],
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.FULL,
+                    bs=kwargs["cuda_graph_bs_decode"],
+                    max_bs=kwargs["cuda_graph_max_bs_decode"],
+                ),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
             disable_cuda_graph=kwargs["disable_cuda_graph"],
             enable_torch_compile=kwargs["enable_torch_compile"],
             torch_compile_max_bs=kwargs["torch_compile_max_bs"],
@@ -392,13 +403,8 @@ def _run_s2pro_engine_with_fake_buffers(
         server_args: SimpleNamespace,
         gpu_id: int,
     ) -> tuple[bool, tuple[object, object, object, object, object, object, object]]:
-        want_cuda_graph = not bool(server_args.disable_cuda_graph)
-        if want_cuda_graph:
-            server_args.disable_cuda_graph = True
         infrastructure = fake_create_sglang_infrastructure(server_args, gpu_id)
-        if want_cuda_graph:
-            server_args.disable_cuda_graph = False
-        return want_cuda_graph, infrastructure
+        return True, infrastructure
 
     monkeypatch.setattr(
         scheduler_bootstrap,
@@ -463,8 +469,8 @@ def test_s2pro_engine_disables_generic_compile_after_local_compile(
     assert callable(scheduler.stream_output_builder)
     assert build_kwargs["enable_torch_compile"] is True
     assert build_kwargs["max_running_requests"] == 64
-    assert build_kwargs["cuda_graph_max_bs"] == 64
-    assert build_kwargs["cuda_graph_bs"] == [
+    assert build_kwargs["cuda_graph_max_bs_decode"] == 64
+    assert build_kwargs["cuda_graph_bs_decode"] == [
         1,
         2,
         4,
@@ -479,15 +485,15 @@ def test_s2pro_engine_disables_generic_compile_after_local_compile(
         64,
     ]
     assert build_kwargs["torch_compile_max_bs"] == 64
-    assert result.infrastructure_saw_graph_disabled == [True]
+    assert result.infrastructure_saw_graph_disabled == [False]
     assert result.compile_calls == [
         (scheduler.model_runner.args[0].model_runner.model, 64)
     ]
     assert result.init_graph_calls == [True]
     assert scheduler.server_args.disable_cuda_graph is False
     assert scheduler.server_args.enable_torch_compile is False
-    assert scheduler.server_args.cuda_graph_max_bs == 64
-    assert scheduler.server_args.cuda_graph_bs == [
+    assert scheduler.server_args.cuda_graph_config.decode.max_bs == 64
+    assert scheduler.server_args.cuda_graph_config.decode.bs == [
         1,
         2,
         4,

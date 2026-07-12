@@ -48,6 +48,7 @@ def create_dllm_thinker_scheduler(
         nccl_port=nccl_port,
         model_arch_override="LLaDA2MoeModelLM",
     )
+    model_worker.model_runner.init_cuda_graphs()
 
     tokenizer = get_tokenizer(model_config.model_path, trust_remote_code=True)
 

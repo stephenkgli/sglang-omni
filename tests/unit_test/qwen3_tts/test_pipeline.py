@@ -13,6 +13,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 
 from sglang_omni.models.qwen3_omni.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_builders
@@ -2134,7 +2139,7 @@ def test_qwen3_tts_engine_applies_compat_overrides_and_reenables_cuda_graph(
             self.server_args = server_args
             self.model = FakeModel()
 
-        def init_device_graphs(self) -> None:
+        def init_cuda_graphs(self) -> None:
             assert self.server_args.enable_torch_compile is False
             assert self.server_args.torch_compile_max_bs == 32
             init_graph_calls.append(True)
@@ -2178,8 +2183,14 @@ def test_qwen3_tts_engine_applies_compat_overrides_and_reenables_cuda_graph(
         del model_path, context_length
         build_kwargs.update(kwargs)
         return SimpleNamespace(
-            cuda_graph_bs=kwargs["cuda_graph_bs"],
-            cuda_graph_max_bs=kwargs["cuda_graph_max_bs"],
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.FULL,
+                    bs=kwargs["cuda_graph_bs_decode"],
+                    max_bs=kwargs["cuda_graph_max_bs_decode"],
+                ),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
             disable_cuda_graph=kwargs["disable_cuda_graph"],
             disable_overlap_schedule=kwargs["disable_overlap_schedule"],
             enable_torch_compile=kwargs["enable_torch_compile"],
@@ -2240,8 +2251,8 @@ def test_qwen3_tts_engine_applies_compat_overrides_and_reenables_cuda_graph(
     )
 
     assert build_kwargs["disable_cuda_graph"] is False
-    assert build_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16, 24, 32]
-    assert build_kwargs["cuda_graph_max_bs"] == 32
+    assert build_kwargs["cuda_graph_bs_decode"] == [1, 2, 4, 8, 12, 16, 24, 32]
+    assert build_kwargs["cuda_graph_max_bs_decode"] == 32
     assert build_kwargs["enable_torch_compile"] is True
     assert build_kwargs["sampling_backend"] == "pytorch"
     assert build_kwargs["mem_fraction_static"] == 0.7
@@ -2270,11 +2281,20 @@ def test_qwen3_tts_engine_applies_compat_overrides_and_reenables_cuda_graph(
         torch.tensor([1.0, 0.01], dtype=torch.float32),
     )
 
-    assert infrastructure_saw_graph_disabled == [True]
+    assert infrastructure_saw_graph_disabled == [False]
     assert len(compile_calls) == 1
     assert init_graph_calls == [True]
-    assert scheduler.server_args.cuda_graph_bs == [1, 2, 4, 8, 12, 16, 24, 32]
-    assert scheduler.server_args.cuda_graph_max_bs == 32
+    assert scheduler.server_args.cuda_graph_config.decode.bs == [
+        1,
+        2,
+        4,
+        8,
+        12,
+        16,
+        24,
+        32,
+    ]
+    assert scheduler.server_args.cuda_graph_config.decode.max_bs == 32
     assert scheduler.server_args.disable_cuda_graph is False
     assert scheduler.server_args.enable_torch_compile is False
     assert scheduler.server_args.torch_compile_max_bs == 32

@@ -6,6 +6,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+from sglang.srt.model_executor.cuda_graph_config import Phase
+
 from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
     validate_generation_batch_policy,
@@ -48,9 +50,15 @@ class TtsEngineBuilder(ABC):
         )
         self.adjust_overrides(overrides)
 
+        server_args_kwargs: dict[str, Any] = {}
+        if self.model_arch_override is not None:
+            if "model_architecture" in overrides:
+                raise ValueError("model_architecture is owned by model_arch_override")
+            server_args_kwargs["model_architecture"] = self.model_arch_override
         server_args = sglang_backend.build_sglang_server_args(
             checkpoint_dir,
             context_length=self.context_length,
+            **server_args_kwargs,
             **overrides,
         )
         self.customize_server_args(server_args)
@@ -58,7 +66,7 @@ class TtsEngineBuilder(ABC):
         infra_kwargs = dict(self.infra_kwargs())
         if self.model_arch_override is not None:
             infra_kwargs.setdefault("model_arch_override", self.model_arch_override)
-        want_cuda_graph, (
+        _, (
             model_worker,
             tree_cache,
             req_to_token_pool,
@@ -89,8 +97,8 @@ class TtsEngineBuilder(ABC):
 
         self.compile_model(model, server_args)
 
-        if want_cuda_graph:
-            model_worker.model_runner.init_device_graphs()
+        model_worker.model_runner.init_cuda_graphs()
+        if scheduling_bootstrap.is_cuda_graph_enabled(server_args, Phase.DECODE):
             self.post_cuda_graph_setup(model, server_args)
 
         output_proc = sglang_backend.SGLangOutputProcessor(

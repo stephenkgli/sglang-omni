@@ -161,8 +161,8 @@ def create_sglang_moss_transcribe_diarize_executor(
         model_arch_override="MossTranscribeDiarizeForConditionalGeneration",
     )
 
+    model_worker.model_runner.init_cuda_graphs()
     if want_cuda_graph:
-        model_worker.model_runner.init_device_graphs()
         buckets = (
             encoder_graph_chunk_buckets
             if encoder_graph_chunk_buckets is not None

@@ -8,6 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from sglang.srt.model_executor.cuda_graph_config import Backend
+
 logger = logging.getLogger(__name__)
 
 
@@ -199,11 +201,11 @@ def evaluate_cuda_graph_batch_sizing(
 def read_captured_bs(model_runner: object) -> list[int] | None:
     """Read the actually-captured CUDA graph batch sizes, or None if absent."""
     try:
-        captured = model_runner.graph_runner.capture_bs
+        captured = model_runner.decode_cuda_graph_runner.capture_bs
     except AttributeError:
         logger.debug(
-            "cuda_graph_batch_validator: model_runner.graph_runner.capture_bs "
-            "missing (CUDA graphs disabled)."
+            "cuda_graph_batch_validator: decode runner capture_bs missing "
+            "(decode CUDA graph disabled)."
         )
         return None
     try:
@@ -272,9 +274,11 @@ def validate_stage(
     try:
         server_args = model_runner.server_args
         max_running_requests = server_args.max_running_requests
-        cuda_graph_max_bs = server_args.cuda_graph_max_bs
+        decode_graph_config = server_args.cuda_graph_config.decode
+        cuda_graph_max_bs = decode_graph_config.max_bs
     except AttributeError:
         server_args = None
+        decode_graph_config = None
         max_running_requests = None
         cuda_graph_max_bs = None
 
@@ -284,7 +288,10 @@ def validate_stage(
         model = None
     model_cls = type(model).__name__ if model is not None else "unknown-model"
 
-    if bool(server_args.disable_cuda_graph):
+    if (
+        decode_graph_config is not None
+        and decode_graph_config.backend == Backend.DISABLED
+    ):
         return CudaGraphBatchReport(
             stage=f"{stage_name} ({model_cls})",
             max_running_requests=max_running_requests,

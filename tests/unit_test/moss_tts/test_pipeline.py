@@ -10,6 +10,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 
 from benchmarks.benchmarker.data import RequestResult
 from benchmarks.dataset.seedtts import SampleInput
@@ -154,8 +159,14 @@ def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
             disable_cuda_graph=kwargs["disable_cuda_graph"],
             disable_overlap_schedule=False,
             max_running_requests=kwargs["max_running_requests"],
-            cuda_graph_max_bs=kwargs["cuda_graph_max_bs"],
-            cuda_graph_bs=kwargs["cuda_graph_bs"],
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.FULL,
+                    max_bs=kwargs["cuda_graph_max_bs_decode"],
+                    bs=kwargs["cuda_graph_bs_decode"],
+                ),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
             enable_torch_compile=kwargs["enable_torch_compile"],
             torch_compile_max_bs=kwargs.get("torch_compile_max_bs"),
         )
@@ -171,7 +182,7 @@ def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
         model = object()
         model_runner = SimpleNamespace(
             model=model,
-            init_device_graphs=lambda: captured.setdefault("graph_inits", 0) or None,
+            init_cuda_graphs=lambda: captured.setdefault("graph_inits", 0) or None,
         )
         model_worker = SimpleNamespace(model_runner=model_runner)
         return (
@@ -237,12 +248,12 @@ def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
     )
 
     default_kwargs, explicit_kwargs = captured["build_kwargs"]
-    assert default_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16]
-    assert default_kwargs["cuda_graph_max_bs"] == 16
+    assert default_kwargs["cuda_graph_bs_decode"] == [1, 2, 4, 8, 12, 16]
+    assert default_kwargs["cuda_graph_max_bs_decode"] == 16
     assert default_kwargs["enable_torch_compile"] is False
     assert "mem_fraction_static" not in default_kwargs
-    assert explicit_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16]
-    assert explicit_kwargs["cuda_graph_max_bs"] == 16
+    assert explicit_kwargs["cuda_graph_bs_decode"] == [1, 2, 4, 8, 12, 16]
+    assert explicit_kwargs["cuda_graph_max_bs_decode"] == 16
     assert explicit_kwargs["enable_torch_compile"] is True
     assert explicit_kwargs["mem_fraction_static"] == 0.61
     assert captured["context_length"] == 8192

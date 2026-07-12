@@ -5,6 +5,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
+
 import sglang_omni.utils.cuda_graph_batch_validator as cgv
 from sglang_omni.utils.cuda_graph_batch_validator import (
     evaluate_cuda_graph_batch_sizing,
@@ -32,14 +38,21 @@ def _fake_runner(
     has_graph_runner=True,
 ):
     graph_runner = SimpleNamespace(capture_bs=capture_bs) if has_graph_runner else None
+    decode_backend = Backend.DISABLED if disable_cuda_graph else Backend.FULL
     return SimpleNamespace(
         server_args=SimpleNamespace(
             max_running_requests=max_running_requests,
-            cuda_graph_max_bs=cuda_graph_max_bs,
-            disable_cuda_graph=disable_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=decode_backend,
+                    max_bs=cuda_graph_max_bs,
+                    bs=capture_bs,
+                ),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
         ),
         req_to_token_pool=SimpleNamespace(size=request_slots),
-        graph_runner=graph_runner,
+        decode_cuda_graph_runner=graph_runner,
         model=model,
     )
 

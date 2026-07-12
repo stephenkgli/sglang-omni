@@ -5,6 +5,12 @@ from __future__ import annotations
 import inspect
 from types import SimpleNamespace
 
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
+
 import sglang_omni.models.qwen3_asr.stages as qwen3_asr_stages
 from sglang_omni.models.qwen3_asr.config import Qwen3ASRPipelineConfig
 from sglang_omni.models.qwen3_asr.stages import create_sglang_qwen3_asr_executor
@@ -99,10 +105,22 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
 
     def _fake_server_args_builder(model_path, context_length, **overrides):
         build_kwargs.update(overrides)
-        return SimpleNamespace(**overrides)
+        return SimpleNamespace(
+            **overrides,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.FULL,
+                    max_bs=overrides["cuda_graph_max_bs_decode"],
+                    bs=overrides["cuda_graph_bs_decode"],
+                ),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
+        )
 
     def _fake_create_infrastructure(server_args, gpu_id, **kwargs):
-        model_worker = SimpleNamespace(model_runner=SimpleNamespace(model=object()))
+        model_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(model=object(), init_cuda_graphs=lambda: None)
+        )
         return False, (
             model_worker,
             object(),
@@ -126,5 +144,5 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
 
     qwen3_asr_stages.create_sglang_qwen3_asr_executor("dummy")
 
-    assert build_kwargs["cuda_graph_max_bs"] == 32
-    assert build_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16, 24, 32]
+    assert build_kwargs["cuda_graph_max_bs_decode"] == 32
+    assert build_kwargs["cuda_graph_bs_decode"] == [1, 2, 4, 8, 12, 16, 24, 32]

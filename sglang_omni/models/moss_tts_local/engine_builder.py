@@ -116,7 +116,7 @@ class MossTtsLocalEngineBuilder(TtsEngineBuilder):
         # (1 + n_vq micro-steps and 13 seeded sampling passes per frame):
         # eager it is kernel-launch-bound at ~22 ms/frame independent of batch
         # size.
-        model.init_frame_decode_graphs(list(server_args.cuda_graph_bs))
+        model.init_frame_decode_graphs(list(server_args.cuda_graph_config.decode.bs))
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         model_runner_mod = importlib.import_module(

@@ -242,7 +242,7 @@ class ThinkerModelRunner(ModelRunner):
                     deepstack_visual_embeds_list.append(ds_embeds)
                     visual_pos_masks_list.append(global_mask)
 
-            if req.is_chunked == 0:
+            if schedule_batch.chunked_req is not req:
                 req.omni_model_inputs = None
                 req._omni_consumed = None
 

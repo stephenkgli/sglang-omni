@@ -2,15 +2,82 @@
 """Shared ServerArgs construction for SGLang AR engines."""
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.server_args import ServerArgs
+
+
+@dataclasses.dataclass
+class OmniServerArgs(ServerArgs):
+    """SGLang arguments with explicit Omni prefill-graph capability gating."""
+
+    omni_model_architecture: dataclasses.InitVar[str | None] = None
+
+    def __post_init__(self, omni_model_architecture: str | None) -> None:
+        self._omni_model_architecture = omni_model_architecture
+        super().__post_init__()
+
+    def _apply_cuda_graph_compatibility(self) -> None:
+        locked = self._cuda_graph_config_locked
+        if (Phase.PREFILL, "backend") in locked:
+            super()._apply_cuda_graph_compatibility()
+            return
+
+        architecture = self._omni_model_architecture
+        if not _supports_sglang_tc_piecewise_prefill(architecture):
+            # note (kaige): Preserve Omni's decode-only default until a model
+            # declares and tests the native prefill runner contract.
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            super()._apply_cuda_graph_compatibility()
+            return
+        assert architecture is not None
+
+        from sglang.srt.configs.model_config import (
+            is_piecewise_cuda_graph_disabled_model,
+        )
+
+        model_config = self.get_model_config()
+        if not model_config.is_multimodal:
+            raise ValueError(
+                f"{architecture} requires SGLang multimodal classification "
+                "for the prefill CUDA graph input buffer"
+            )
+        self.cuda_graph_config.prefill.backend = Backend.TC_PIECEWISE
+        original_support = model_config.is_multimodal_piecewise_cuda_graph_supported
+        original_disabled = model_config.is_piecewise_cuda_graph_disabled_model
+        is_architecture_disabled = is_piecewise_cuda_graph_disabled_model(
+            [architecture]
+        )
+        try:
+            # note (kaige): Keep every upstream tc_piecewise compatibility rule;
+            # only replace its architecture allowlist with Omni's capability.
+            model_config.is_multimodal_piecewise_cuda_graph_supported = True
+            if not is_architecture_disabled:
+                model_config.is_piecewise_cuda_graph_disabled_model = False
+            super()._apply_cuda_graph_compatibility()
+        finally:
+            model_config.is_multimodal_piecewise_cuda_graph_supported = original_support
+            model_config.is_piecewise_cuda_graph_disabled_model = original_disabled
+
+
+def _supports_sglang_tc_piecewise_prefill(architecture: str | None) -> bool:
+    from sglang_omni.models.model_capabilities import get_model_capabilities
+
+    if architecture is None:
+        return False
+    capabilities = get_model_capabilities(architecture)
+    return bool(
+        capabilities is not None and capabilities.supports_sglang_tc_piecewise_prefill
+    )
 
 
 def build_sglang_server_args(
     model_path: str,
     context_length: int,
     *,
+    model_architecture: str | None = None,
     chunked_prefill_size: int | None = None,
     max_prefill_tokens: int = 16384,
     max_running_requests: int = 16,
@@ -34,7 +101,10 @@ def build_sglang_server_args(
     kwargs.update(overrides)
     if kwargs.get("mem_fraction_static") is None:
         kwargs.pop("mem_fraction_static", None)
-    return ServerArgs(**kwargs)
+    return OmniServerArgs(
+        omni_model_architecture=model_architecture,
+        **kwargs,
+    )
 
 
 def apply_encoder_mem_reserve(
