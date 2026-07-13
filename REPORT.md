@@ -761,3 +761,36 @@ Final retained live checks:
 - Residual scope: validation covers one SM120 GPU and Movies800Time. H100/A100,
   TP>1, and workloads above 16 concurrent requests remain CI/future matrix
   items rather than claimed coverage.
+
+## Higgs FULL prefill-CUDA-graph follow-up (code-only)
+
+- Source base: `cebcccf8b35fae7207d7fbeeafd936b9eaaa2600`.
+- Scope: switch the Higgs default prefill backend from `tc_piecewise` to
+  SGLang 0.5.15's `Backend.FULL`; no GPU result is claimed in this section.
+- Backend contract: FULL captures only the inner Qwen3 transformer body. Higgs
+  still builds reference-audio embeddings eagerly, and the runner copies those
+  live embeddings into its stable graph buffer before replay.
+- Token-axis fix: during FULL replay, Higgs now builds text/reference embeddings
+  from the runner-owned static `input_ids` bucket rather than the raw token
+  vector. This supplies exactly `static_num_tokens` rows for both exact and
+  padded buckets while retaining the raw batch for multimodal metadata and the
+  eager output tail.
+- Request-axis fix: FULL request slots default to the resolved
+  `max_running_requests` when no explicit value is configured. The helper is
+  shared with MOSS-TD and preserves explicit values. Higgs rejects enabled
+  `tc_piecewise` and `breakable` configurations instead of carrying alternate
+  embedding-buffer paths.
+- Correctness guard: the existing partial Radix-cache branch remains eager when
+  `prefix_len > 0 && extend_len > 1`; cold prompts and exact one-token cache hits
+  remain graph eligible.
+- Added contracts: default backend selection, 64-slot coverage, exact/padded
+  static embedding rows, sparse reference replacement, rejection of non-FULL
+  backends, truthful FULL capability reporting, and the existing radix
+  eager fallback.
+- Local validation: syntax compilation, Ruff checks, Black 24.10.0 checks, and
+  `git diff --check` pass. The local macOS environment has no importable SGLang
+  or PyTorch test stack, so the new pytest contracts are not reported as run.
+- Required GPU follow-up: capture/startup, graph-eligibility counts, SeedTTS
+  WER and output consistency, latency/RTF/QPS, peak memory, exact cache hits,
+  partial Radix branches, mixed zero-shot/reference requests, and concurrency
+  above SGLang's old auto-derived 16 request slots.

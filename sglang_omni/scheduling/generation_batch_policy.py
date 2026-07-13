@@ -11,6 +11,16 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 _MISSING = object()
 
 
+def set_default_full_prefill_request_slots(server_args: Any) -> None:
+    """Cover configured concurrency for FULL prefill unless explicitly set."""
+    prefill_config = server_args.cuda_graph_config.prefill
+    if (
+        prefill_config.backend == Backend.FULL
+        and prefill_config.full_prefill_max_req is None
+    ):
+        prefill_config.full_prefill_max_req = server_args.max_running_requests
+
+
 def build_default_cuda_graph_bs(max_bs: int) -> list[int]:
     max_bs = int(max_bs)
     if max_bs < 1:

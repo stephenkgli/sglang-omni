@@ -168,9 +168,7 @@ def _model_capabilities_log_summary(
         "streaming_vocoder": capabilities.supports_streaming_vocoder,
         "cuda_graph": capabilities.supports_cuda_graph,
         "torch_compile": capabilities.supports_torch_compile,
-        "sglang_tc_piecewise_prefill": (
-            capabilities.supports_sglang_tc_piecewise_prefill
-        ),
+        "sglang_full_prefill": capabilities.supports_sglang_full_prefill,
     }
 
 

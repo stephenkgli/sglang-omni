@@ -62,14 +62,15 @@ The voice-cloning examples below use local reference clips from
 `docs/_static/audio`.
 
 Higgs enables both decode and prefill CUDA graphs by default. Prefill uses
-SGLang 0.5.15's `PrefillCudaGraphRunner` with the `tc_piecewise` backend. The
-Higgs reference-audio embedding is prepared eagerly as batch-aligned multimodal
-metadata and copied into SGLang's static input buffer immediately before the
-compiled Qwen3 transformer runs. A partial Radix-cache branch stays eager to
+SGLang 0.5.15's `PrefillCudaGraphRunner` with the `full` backend. Higgs prepares
+reference-audio embeddings eagerly from the runner's padded token bucket, then
+the runner copies them into its static input buffer before replaying the
+captured Qwen3 transformer body. A partial Radix-cache branch stays eager to
 preserve seeded codec-sampling accuracy; cold prompts and exact prompt-cache
 hits remain graph eligible. Set the `tts_engine` factory argument
 `enable_prefill_cuda_graph: false` to opt out, or set
-`prefill_graph_token_buckets` to an explicit non-empty token-bucket list.
+`prefill_graph_token_buckets` to an explicit non-empty token-bucket list. Higgs
+does not support the `tc_piecewise` or `breakable` prefill backends.
 
 ## Synthesizing Speech
 

@@ -41,6 +41,32 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
 
+def _make_higgs_engine_builder() -> Any:
+    from sglang_omni.models.higgs_tts.engine_builder import HiggsTtsEngineBuilder
+
+    return HiggsTtsEngineBuilder(
+        max_new_tokens=2048,
+        max_running_requests=64,
+        cuda_graph_max_bs=64,
+        enable_prefill_cuda_graph=True,
+        prefill_graph_token_buckets=None,
+        enable_async_decode=False,
+        async_decode_min_batch_size=2,
+    )
+
+
+def _higgs_prefill_server_args(backend: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(
+            prefill=SimpleNamespace(
+                backend=backend,
+                full_prefill_max_req=None,
+            )
+        ),
+        max_running_requests=64,
+    )
+
+
 def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     from sglang_omni.models.higgs_tts import model_runner as model_runner_mod
     from sglang_omni.models.higgs_tts import request_builders
@@ -58,9 +84,10 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
                 bs=overrides["cuda_graph_bs_decode"],
             ),
             prefill=PhaseConfig(
-                backend=Backend.TC_PIECEWISE,
+                backend=overrides["cuda_graph_backend_prefill"],
                 max_bs=4096,
                 bs=[4096],
+                full_prefill_max_req=None,
             ),
         )
         server_args = SimpleNamespace(
@@ -162,8 +189,10 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     assert captured["overrides"]["model_architecture"] == (
         "HiggsMultimodalQwen3ForConditionalGeneration"
     )
+    assert captured["overrides"]["cuda_graph_backend_prefill"] == Backend.FULL
     assert "disable_prefill_cuda_graph" not in captured["overrides"]
     assert captured["overrides"]["max_running_requests"] == 64
+    assert captured["server_args"].cuda_graph_config.prefill.full_prefill_max_req == 64
     assert captured["server_args"].disable_overlap_schedule is True
     assert captured["server_args"].enable_torch_compile is False
     assert captured["server_args"].torch_compile_max_bs == 32
@@ -177,17 +206,7 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
 
 
 def test_higgs_tts_engine_abort_callback_requires_model() -> None:
-    from sglang_omni.models.higgs_tts.engine_builder import HiggsTtsEngineBuilder
-
-    builder = HiggsTtsEngineBuilder(
-        max_new_tokens=2048,
-        max_running_requests=64,
-        cuda_graph_max_bs=64,
-        enable_prefill_cuda_graph=True,
-        prefill_graph_token_buckets=None,
-        enable_async_decode=False,
-        async_decode_min_batch_size=2,
-    )
+    builder = _make_higgs_engine_builder()
 
     with pytest.raises(AssertionError):
         builder.make_abort_callback()
@@ -198,6 +217,25 @@ def test_higgs_tts_engine_abort_callback_requires_model() -> None:
     abort_callback("req-1")
 
     assert reset_calls == ["req-1"]
+
+
+@pytest.mark.parametrize("backend", [Backend.TC_PIECEWISE, Backend.BREAKABLE])
+def test_higgs_tts_rejects_non_full_prefill_backends(backend: str) -> None:
+    builder = _make_higgs_engine_builder()
+    server_args = _higgs_prefill_server_args(backend)
+
+    with pytest.raises(ValueError, match="supports only the full backend"):
+        builder.customize_server_args(server_args)
+
+
+def test_higgs_tts_allows_disabled_prefill_graph() -> None:
+    builder = _make_higgs_engine_builder()
+    server_args = _higgs_prefill_server_args(Backend.DISABLED)
+
+    builder.customize_server_args(server_args)
+
+    assert server_args.cuda_graph_config.prefill.full_prefill_max_req is None
+    assert server_args.disable_overlap_schedule is True
 
 
 def test_higgs_reference_code_cache_key_round_trip() -> None:

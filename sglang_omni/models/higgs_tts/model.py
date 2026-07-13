@@ -11,7 +11,7 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    is_in_tc_piecewise_cuda_graph,
+    get_tc_piecewise_forward_context,
 )
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from torch import nn
@@ -59,6 +59,33 @@ class HiggsPrefillEmbeddingInputs(MultimodalInputs):
         super().__init__(mm_items=[])
         self.positions = positions
         self.embeddings = embeddings
+
+
+def _resolve_full_prefill_input_ids(
+    input_ids: torch.Tensor,
+    forward_batch: Any,
+    graph_context: Any,
+) -> torch.Tensor:
+    """Use FULL replay's static token buffer for eager embedding creation."""
+    if graph_context is None or graph_context.raw_num_tokens is None:
+        return input_ids
+
+    static_forward_batch = graph_context.forward_batch
+    static_num_tokens = graph_context.num_tokens
+    raw_num_tokens = graph_context.raw_num_tokens
+    assert static_forward_batch is not None, "FULL prefill requires a static batch"
+    assert (
+        static_forward_batch is not forward_batch
+    ), "Higgs TTS prefill CUDA graph supports only the full backend"
+    assert static_num_tokens is not None, "FULL prefill requires a static token count"
+    assert raw_num_tokens is not None, "FULL prefill requires a raw token count"
+    assert static_num_tokens >= raw_num_tokens, "FULL prefill cannot shrink tokens"
+    assert input_ids.shape[0] == raw_num_tokens, "FULL prefill raw token count mismatch"
+    static_input_ids = static_forward_batch.input_ids
+    assert (
+        static_input_ids.shape[0] == static_num_tokens
+    ), "FULL prefill static token count mismatch"
+    return static_input_ids
 
 
 def _resolve_max_running_requests() -> int:
@@ -115,8 +142,8 @@ class HiggsTTSModel(nn.Module):
       the stream between the backbone and the multimodal modules.
 
     The engine model runner prepares sparse reference-audio embedding
-    overrides. This wrapper applies them to the text embeddings and copies the
-    result into an address-stable buffer before piecewise CUDA-graph replay.
+    overrides. This wrapper applies them to the FULL runner's static-length
+    text embeddings before SGLang copies them into its graph input buffer.
     """
 
     def __init__(
@@ -454,10 +481,10 @@ class HiggsTTSModel(nn.Module):
         """Run Qwen3 and return the per-request hidden states used by Higgs.
 
         Prefill builds text embeddings plus runner-supplied sparse reference
-        overrides outside the Qwen3 piecewise graph; the runner samples from
-        the returned hidden states after replay. Decode reads embeddings and
-        sampling state from ``_cg_active_*`` shadow buffers populated by the
-        runner and samples inside the decode graph.
+        overrides outside the captured Qwen3 transformer body; the runner
+        samples from the returned hidden states after replay. Decode reads
+        embeddings and sampling state from ``_cg_active_*`` shadow buffers
+        populated by the runner and samples inside the decode graph.
         """
         is_decode = self._is_decode_step(forward_batch)
 
@@ -510,8 +537,17 @@ class HiggsTTSModel(nn.Module):
         input_ids: torch.Tensor,
         forward_batch: Any,
     ) -> torch.Tensor:
+        graph_context = get_tc_piecewise_forward_context()
+        is_full_replay = (
+            graph_context is not None and graph_context.raw_num_tokens is not None
+        )
+        input_ids = _resolve_full_prefill_input_ids(
+            input_ids,
+            forward_batch,
+            graph_context,
+        )
         placeholder_mask = input_ids == AUDIO_PLACEHOLDER_ID
-        if is_in_tc_piecewise_cuda_graph():
+        if is_full_replay:
             # note (kaige): Prefill PCG and decode CUDA Graph share SGLang's
             # input_ids buffer. Clear audio sentinels so decode padding cannot
             # inherit -100 from the preceding prefill.
@@ -541,24 +577,7 @@ class HiggsTTSModel(nn.Module):
                 overrides.embeddings.to(input_embeds.dtype),
             )
 
-        if not is_in_tc_piecewise_cuda_graph():
-            return input_embeds
-
-        stable_input_embeds = forward_batch.input_embeds
-        if stable_input_embeds is None:
-            raise RuntimeError(
-                "SGLang piecewise CUDA graph did not provide a stable "
-                "ForwardBatch.input_embeds buffer for Higgs"
-            )
-        if stable_input_embeds.shape != input_embeds.shape:
-            raise ValueError(
-                "Higgs prefill embedding shape does not match SGLang's stable "
-                f"piecewise buffer: {tuple(input_embeds.shape)} vs "
-                f"{tuple(stable_input_embeds.shape)}"
-            )
-        # note (kaige): SGLang owns this stable multimodal PCG input buffer.
-        stable_input_embeds.copy_(input_embeds)
-        return stable_input_embeds
+        return input_embeds
 
     def _decode_step_embeds_cg(
         self, input_ids: torch.Tensor, batch_size: int

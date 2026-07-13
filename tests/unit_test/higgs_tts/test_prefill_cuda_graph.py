@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Higgs TTS piecewise prefill CUDA-graph contract tests."""
+"""Higgs TTS prefill CUDA-graph contract tests."""
 
 from __future__ import annotations
 
@@ -84,7 +84,7 @@ def _request(
     return SimpleNamespace(request_id=request_id, data=data)
 
 
-def test_piecewise_cuda_graph_factory_defaults() -> None:
+def test_prefill_cuda_graph_factory_defaults() -> None:
     from sglang_omni.models.higgs_tts.stages import create_sglang_tts_engine_executor
 
     signature = inspect.signature(create_sglang_tts_engine_executor)
@@ -93,7 +93,7 @@ def test_piecewise_cuda_graph_factory_defaults() -> None:
     assert signature.parameters["prefill_graph_token_buckets"].default is None
 
 
-def test_piecewise_cuda_graph_model_alias_is_not_registered_twice() -> None:
+def test_prefill_cuda_graph_model_alias_is_not_registered_twice() -> None:
     model = _make_higgs_model()
     qwen_model = model.backbone.model
 
@@ -276,7 +276,7 @@ def test_reference_embeddings_use_absolute_prefix_offset_after_radix_hit() -> No
     )
 
 
-def test_prefill_embeddings_use_sglang_stable_address_during_piecewise_graph(
+def test_eager_prefill_embeddings_do_not_mutate_input_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _make_higgs_model()
@@ -285,38 +285,104 @@ def test_prefill_embeddings_use_sglang_stable_address_during_piecewise_graph(
         embeddings=torch.tensor([[100.0] * 4, [200.0] * 4]),
     )
     input_ids = torch.tensor([2, -100, 3, -100])
-    stable_input_embeds = torch.empty((4, 4))
     forward_batch = SimpleNamespace(
         batch_size=1,
-        input_embeds=stable_input_embeds,
+        input_embeds=None,
         mm_inputs=[overrides],
     )
 
     monkeypatch.setattr(
         higgs_model_module,
-        "is_in_tc_piecewise_cuda_graph",
-        lambda: False,
+        "get_tc_piecewise_forward_context",
+        lambda: None,
     )
-    eager = model._build_prefill_input_embeds(input_ids, forward_batch)
+
+    input_embeds = model._build_prefill_input_embeds(input_ids, forward_batch)
+
     expected = model.backbone.model.embed_tokens(torch.tensor([2, 0, 3, 0]))
     expected[1] = 100
     expected[3] = 200
-    assert torch.equal(eager, expected)
+    assert torch.equal(input_embeds, expected)
     assert input_ids.tolist() == [2, -100, 3, -100]
 
+
+def test_eager_prefill_context_does_not_require_a_static_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _make_higgs_model()
+    input_ids = torch.tensor([2, -100, 3])
+    forward_batch = SimpleNamespace(
+        batch_size=1,
+        input_embeds=None,
+        mm_inputs=None,
+    )
+    graph_context = SimpleNamespace(
+        forward_batch=forward_batch,
+        num_tokens=None,
+        raw_num_tokens=None,
+    )
     monkeypatch.setattr(
         higgs_model_module,
-        "is_in_tc_piecewise_cuda_graph",
-        lambda: True,
+        "get_tc_piecewise_forward_context",
+        lambda: graph_context,
     )
-    first = model._build_prefill_input_embeds(input_ids, forward_batch)
-    first_address = first.data_ptr()
-    second = model._build_prefill_input_embeds(input_ids, forward_batch)
 
-    assert input_ids.tolist() == [2, 0, 3, 0]
-    assert first_address == stable_input_embeds.data_ptr()
-    assert second.data_ptr() == first_address
-    assert torch.equal(second, expected)
+    input_embeds = model._build_prefill_input_embeds(input_ids, forward_batch)
+
+    expected = model.backbone.model.embed_tokens(torch.tensor([2, 0, 3]))
+    assert torch.equal(input_embeds, expected)
+    assert input_ids.tolist() == [2, -100, 3]
+
+
+@pytest.mark.parametrize(
+    "static_token_ids",
+    [
+        [2, -100, 3, -100],
+        [2, -100, 3, -100, 0, 0],
+    ],
+)
+def test_full_prefill_embeddings_cover_the_static_token_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+    static_token_ids: list[int],
+) -> None:
+    model = _make_higgs_model()
+    overrides = HiggsPrefillEmbeddingInputs(
+        positions=torch.tensor([1, 3]),
+        embeddings=torch.tensor([[100.0] * 4, [200.0] * 4]),
+    )
+    raw_input_ids = torch.tensor([2, -100, 3, -100])
+    static_input_ids = torch.tensor(static_token_ids)
+    raw_forward_batch = SimpleNamespace(
+        batch_size=1,
+        input_embeds=None,
+        mm_inputs=[overrides],
+    )
+    graph_context = SimpleNamespace(
+        forward_batch=SimpleNamespace(input_ids=static_input_ids),
+        num_tokens=len(static_token_ids),
+        raw_num_tokens=4,
+    )
+    monkeypatch.setattr(
+        higgs_model_module,
+        "get_tc_piecewise_forward_context",
+        lambda: graph_context,
+    )
+
+    input_embeds = model._build_prefill_input_embeds(
+        raw_input_ids,
+        raw_forward_batch,
+    )
+
+    expected_token_ids = [
+        0 if token_id == -100 else token_id for token_id in static_token_ids
+    ]
+    expected = model.backbone.model.embed_tokens(torch.tensor(expected_token_ids))
+    expected[1] = 100
+    expected[3] = 200
+    assert input_embeds.shape == (len(static_token_ids), 4)
+    assert torch.equal(input_embeds, expected)
+    assert raw_input_ids.tolist() == [2, -100, 3, -100]
+    assert static_input_ids.tolist() == expected_token_ids
 
 
 def test_prefill_forward_returns_hidden_states_without_sampling() -> None:

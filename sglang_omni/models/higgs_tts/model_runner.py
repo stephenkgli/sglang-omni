@@ -66,7 +66,7 @@ class HiggsTTSModelRunner(ModelRunner):
         )
         assert forward_batch.input_embeds is None, (
             "Higgs prefill must keep ForwardBatch.input_embeds unset so SGLang "
-            "piecewise CUDA graph can run"
+            "FULL prefill CUDA graph can run"
         )
         existing_mm_inputs = forward_batch.mm_inputs
         assert existing_mm_inputs is None or (
@@ -434,8 +434,8 @@ class HiggsTTSModelRunner(ModelRunner):
         SGLang deliberately replays one token for an exact prompt cache hit.
         More than one extend token after a non-empty prefix means the request
         branched from another prompt. Higgs keeps this case eager because the
-        tc_piecewise Qwen3 path can move the seeded first codec draw across a
-        probability boundary and make the decoder echo the reference prompt.
+        branch crossed a seeded sampling boundary under prior prefill-graph
+        validation, and FULL replay has not yet established accuracy parity.
         """
         prefix_lens = forward_batch.extend_prefix_lens_cpu
         extend_lens = forward_batch.extend_seq_lens_cpu

@@ -26,17 +26,13 @@ class OmniServerArgs(ServerArgs):
             return
 
         architecture = self._omni_model_architecture
-        if not _supports_sglang_tc_piecewise_prefill(architecture):
+        if not _supports_sglang_full_prefill(architecture):
             # note (kaige): Preserve Omni's decode-only default until a model
-            # declares and tests the native prefill runner contract.
+            # declares and tests the native FULL prefill runner contract.
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
             super()._apply_cuda_graph_compatibility()
             return
         assert architecture is not None
-
-        from sglang.srt.configs.model_config import (
-            is_piecewise_cuda_graph_disabled_model,
-        )
 
         model_config = self.get_model_config()
         if not model_config.is_multimodal:
@@ -44,33 +40,17 @@ class OmniServerArgs(ServerArgs):
                 f"{architecture} requires SGLang multimodal classification "
                 "for the prefill CUDA graph input buffer"
             )
-        self.cuda_graph_config.prefill.backend = Backend.TC_PIECEWISE
-        original_support = model_config.is_multimodal_piecewise_cuda_graph_supported
-        original_disabled = model_config.is_piecewise_cuda_graph_disabled_model
-        is_architecture_disabled = is_piecewise_cuda_graph_disabled_model(
-            [architecture]
-        )
-        try:
-            # note (kaige): Keep every upstream tc_piecewise compatibility rule;
-            # only replace its architecture allowlist with Omni's capability.
-            model_config.is_multimodal_piecewise_cuda_graph_supported = True
-            if not is_architecture_disabled:
-                model_config.is_piecewise_cuda_graph_disabled_model = False
-            super()._apply_cuda_graph_compatibility()
-        finally:
-            model_config.is_multimodal_piecewise_cuda_graph_supported = original_support
-            model_config.is_piecewise_cuda_graph_disabled_model = original_disabled
+        self.cuda_graph_config.prefill.backend = Backend.FULL
+        super()._apply_cuda_graph_compatibility()
 
 
-def _supports_sglang_tc_piecewise_prefill(architecture: str | None) -> bool:
+def _supports_sglang_full_prefill(architecture: str | None) -> bool:
     from sglang_omni.models.model_capabilities import get_model_capabilities
 
     if architecture is None:
         return False
     capabilities = get_model_capabilities(architecture)
-    return bool(
-        capabilities is not None and capabilities.supports_sglang_tc_piecewise_prefill
-    )
+    return bool(capabilities is not None and capabilities.supports_sglang_full_prefill)
 
 
 def build_sglang_server_args(

@@ -29,7 +29,7 @@ def test_moss_td_prefill_cuda_graph_is_enabled_by_default() -> None:
         "MossTranscribeDiarizeForConditionalGeneration"
     )
     assert capabilities is not None
-    assert capabilities.supports_sglang_tc_piecewise_prefill is True
+    assert capabilities.supports_sglang_full_prefill is True
 
 
 @pytest.mark.parametrize(
@@ -101,22 +101,6 @@ def test_moss_td_resolves_full_prefill_backend_when_enabled(
         None if enable_prefill_cuda_graph else True
     )
     assert captured["full_prefill_max_req"] == expected_request_slots
-
-
-def test_moss_td_preserves_explicit_full_prefill_request_slots() -> None:
-    server_args = SimpleNamespace(
-        max_running_requests=16,
-        cuda_graph_config=SimpleNamespace(
-            prefill=SimpleNamespace(
-                backend=Backend.FULL,
-                full_prefill_max_req=4,
-            )
-        ),
-    )
-
-    stages._default_full_prefill_request_slots(server_args)
-
-    assert server_args.cuda_graph_config.prefill.full_prefill_max_req == 4
 
 
 def test_moss_td_full_prefill_embeds_the_padded_token_bucket(

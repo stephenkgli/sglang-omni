@@ -11,6 +11,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang_omni.scheduling.generation_batch_policy import (
     build_default_cuda_graph_bs,
     build_generation_batch_overrides,
+    set_default_full_prefill_request_slots,
     validate_generation_batch_policy,
 )
 
@@ -199,6 +200,34 @@ def test_build_generation_batch_overrides_enables_prefill_graph() -> None:
     assert overrides["cuda_graph_backend_prefill"] == Backend.FULL
     assert overrides["cuda_graph_bs_prefill"] == [16, 64]
     assert overrides["cuda_graph_max_bs_prefill"] == 64
+
+
+@pytest.mark.parametrize(
+    ("backend", "configured_slots", "expected_slots"),
+    [
+        (Backend.FULL, None, 16),
+        (Backend.FULL, 4, 4),
+        (Backend.TC_PIECEWISE, None, None),
+    ],
+)
+def test_default_full_prefill_request_slots(
+    backend: str,
+    configured_slots: int | None,
+    expected_slots: int | None,
+) -> None:
+    server_args = SimpleNamespace(
+        max_running_requests=16,
+        cuda_graph_config=SimpleNamespace(
+            prefill=SimpleNamespace(
+                backend=backend,
+                full_prefill_max_req=configured_slots,
+            )
+        ),
+    )
+
+    set_default_full_prefill_request_slots(server_args)
+
+    assert server_args.cuda_graph_config.prefill.full_prefill_max_req == expected_slots
 
 
 def test_explicit_prefill_disable_overrides_default_backend() -> None:

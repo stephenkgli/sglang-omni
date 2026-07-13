@@ -30,7 +30,7 @@ def test_omni_architecture_is_constructor_only_state() -> None:
 
 
 def test_prefill_capability_lookup_is_explicit_per_architecture() -> None:
-    supports_prefill = server_args_builder._supports_sglang_tc_piecewise_prefill
+    supports_prefill = server_args_builder._supports_sglang_full_prefill
 
     assert supports_prefill("HiggsMultimodalQwen3ForConditionalGeneration") is True
     assert supports_prefill("MossTranscribeDiarizeForConditionalGeneration") is True
@@ -50,55 +50,37 @@ def _omni_args(model_config: object, *, locked: set[tuple[str, str]] | None = No
     return server_args
 
 
-def test_supported_omni_model_selects_tc_piecewise_and_keeps_upstream_checks(
+def test_supported_omni_model_selects_full_and_keeps_upstream_checks(
     monkeypatch,
 ) -> None:
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(architectures=["TestArchitecture"]),
-        is_multimodal=True,
-        is_multimodal_piecewise_cuda_graph_supported=False,
-        is_piecewise_cuda_graph_disabled_model=True,
-    )
+    model_config = SimpleNamespace(is_multimodal=True)
     server_args = _omni_args(model_config)
-    observed: list[tuple[str, bool, bool]] = []
+    observed: list[str] = []
 
     monkeypatch.setattr(
         server_args_builder,
-        "_supports_sglang_tc_piecewise_prefill",
+        "_supports_sglang_full_prefill",
         lambda _architecture: True,
     )
     monkeypatch.setattr(
         ServerArgs,
         "_apply_cuda_graph_compatibility",
-        lambda self: observed.append(
-            (
-                self.cuda_graph_config.prefill.backend,
-                self.get_model_config().is_multimodal_piecewise_cuda_graph_supported,
-                self.get_model_config().is_piecewise_cuda_graph_disabled_model,
-            )
-        ),
+        lambda self: observed.append(self.cuda_graph_config.prefill.backend),
     )
 
     server_args._apply_cuda_graph_compatibility()
 
-    assert observed == [(Backend.TC_PIECEWISE, True, False)]
-    assert server_args.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE
-    assert model_config.is_multimodal_piecewise_cuda_graph_supported is False
-    assert model_config.is_piecewise_cuda_graph_disabled_model is True
+    assert observed == [Backend.FULL]
+    assert server_args.cuda_graph_config.prefill.backend == Backend.FULL
 
 
 def test_unsupported_omni_model_keeps_prefill_graph_disabled(monkeypatch) -> None:
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(architectures=["TestArchitecture"]),
-        is_multimodal=True,
-        is_multimodal_piecewise_cuda_graph_supported=False,
-        is_piecewise_cuda_graph_disabled_model=False,
-    )
+    model_config = SimpleNamespace(is_multimodal=True)
     server_args = _omni_args(model_config)
     observed: list[str] = []
     monkeypatch.setattr(
         server_args_builder,
-        "_supports_sglang_tc_piecewise_prefill",
+        "_supports_sglang_full_prefill",
         lambda _architecture: False,
     )
     monkeypatch.setattr(
@@ -113,44 +95,8 @@ def test_unsupported_omni_model_keeps_prefill_graph_disabled(monkeypatch) -> Non
     assert observed == [Backend.DISABLED]
 
 
-def test_supported_capability_does_not_override_upstream_architecture_blacklist(
-    monkeypatch,
-) -> None:
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
-        is_multimodal=True,
-        is_multimodal_piecewise_cuda_graph_supported=False,
-        is_piecewise_cuda_graph_disabled_model=True,
-    )
-    server_args = _omni_args(model_config)
-    server_args._omni_model_architecture = "DeepseekV4ForCausalLM"
-    observed: list[bool] = []
-    monkeypatch.setattr(
-        server_args_builder,
-        "_supports_sglang_tc_piecewise_prefill",
-        lambda _architecture: True,
-    )
-    monkeypatch.setattr(
-        ServerArgs,
-        "_apply_cuda_graph_compatibility",
-        lambda self: observed.append(
-            self.get_model_config().is_piecewise_cuda_graph_disabled_model
-        ),
-    )
-
-    server_args._apply_cuda_graph_compatibility()
-
-    assert observed == [True]
-    assert model_config.is_piecewise_cuda_graph_disabled_model is True
-
-
 def test_explicit_prefill_backend_retains_sglang_precedence(monkeypatch) -> None:
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(architectures=["TestArchitecture"]),
-        is_multimodal=True,
-        is_multimodal_piecewise_cuda_graph_supported=False,
-        is_piecewise_cuda_graph_disabled_model=False,
-    )
+    model_config = SimpleNamespace(is_multimodal=True)
     server_args = _omni_args(
         model_config,
         locked={(Phase.PREFILL, "backend")},
@@ -169,16 +115,11 @@ def test_explicit_prefill_backend_retains_sglang_precedence(monkeypatch) -> None
 
 
 def test_supported_model_requires_multimodal_static_input_buffer(monkeypatch) -> None:
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(architectures=["TestArchitecture"]),
-        is_multimodal=False,
-        is_multimodal_piecewise_cuda_graph_supported=False,
-        is_piecewise_cuda_graph_disabled_model=False,
-    )
+    model_config = SimpleNamespace(is_multimodal=False)
     server_args = _omni_args(model_config)
     monkeypatch.setattr(
         server_args_builder,
-        "_supports_sglang_tc_piecewise_prefill",
+        "_supports_sglang_full_prefill",
         lambda _architecture: True,
     )
 

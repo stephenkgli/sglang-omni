@@ -6,10 +6,15 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
+from sglang.srt.model_executor.cuda_graph_config import Backend
+
 from sglang_omni.models.higgs_tts import request_builders
 from sglang_omni.models.higgs_tts import stages as higgs_stages
 from sglang_omni.models.higgs_tts import utils as higgs_utils
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+from sglang_omni.scheduling.generation_batch_policy import (
+    set_default_full_prefill_request_slots,
+)
 
 
 class HiggsTtsEngineBuilder(TtsEngineBuilder):
@@ -54,6 +59,9 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
             "max_running_requests": self.max_running_requests,
             "cuda_graph_max_bs": self.cuda_graph_max_bs,
             "enable_prefill_cuda_graph": self.enable_prefill_cuda_graph,
+            "prefill_cuda_graph_backend": (
+                Backend.FULL if self.enable_prefill_cuda_graph else None
+            ),
             "prefill_graph_token_buckets": self.prefill_graph_token_buckets,
             "disable_cuda_graph": False,
             "mem_fraction_static": 0.85,
@@ -62,6 +70,13 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         }
 
     def customize_server_args(self, server_args: Any) -> None:
+        prefill_backend = server_args.cuda_graph_config.prefill.backend
+        if prefill_backend not in (Backend.FULL, Backend.DISABLED):
+            raise ValueError(
+                "Higgs TTS prefill CUDA graph supports only the full backend; "
+                f"got {prefill_backend}"
+            )
+        set_default_full_prefill_request_slots(server_args)
         server_args.disable_overlap_schedule = True
 
     def setup_model(
