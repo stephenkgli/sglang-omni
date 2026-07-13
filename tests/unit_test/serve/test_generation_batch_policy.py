@@ -191,12 +191,26 @@ def test_build_generation_batch_overrides_enables_prefill_graph() -> None:
     overrides = build_generation_batch_overrides(
         max_running_requests=4,
         enable_prefill_cuda_graph=True,
+        prefill_cuda_graph_backend=Backend.FULL,
         prefill_graph_token_buckets=[64, 16, 64],
     )
 
     assert "disable_prefill_cuda_graph" not in overrides
+    assert overrides["cuda_graph_backend_prefill"] == Backend.FULL
     assert overrides["cuda_graph_bs_prefill"] == [16, 64]
     assert overrides["cuda_graph_max_bs_prefill"] == 64
+
+
+def test_explicit_prefill_disable_overrides_default_backend() -> None:
+    overrides = build_generation_batch_overrides(
+        max_running_requests=4,
+        enable_prefill_cuda_graph=True,
+        prefill_cuda_graph_backend=Backend.FULL,
+        server_args_overrides={"disable_prefill_cuda_graph": True},
+    )
+
+    assert overrides["disable_prefill_cuda_graph"] is True
+    assert "cuda_graph_backend_prefill" not in overrides
 
 
 def test_build_generation_batch_overrides_rejects_ambiguous_graph_aliases() -> None:
@@ -231,6 +245,18 @@ def test_build_generation_batch_overrides_validates_prefill_options() -> None:
             max_running_requests=4,
             enable_prefill_cuda_graph=False,
             prefill_graph_token_buckets=[16],
+        )
+    with pytest.raises(ValueError, match="must be None"):
+        build_generation_batch_overrides(
+            max_running_requests=4,
+            enable_prefill_cuda_graph=False,
+            prefill_cuda_graph_backend=Backend.FULL,
+        )
+    with pytest.raises(ValueError, match="must be one of"):
+        build_generation_batch_overrides(
+            max_running_requests=4,
+            enable_prefill_cuda_graph=True,
+            prefill_cuda_graph_backend=Backend.DISABLED,
         )
     with pytest.raises(ValueError, match="positive integers"):
         build_generation_batch_overrides(

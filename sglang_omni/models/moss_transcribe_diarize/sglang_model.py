@@ -19,6 +19,9 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.whisper import WhisperEncoder
@@ -35,6 +38,33 @@ from sglang_omni.scheduling.stage_cache import StageOutputCache
 logger = logging.getLogger(__name__)
 
 _ENCODER_CACHE_MAX_ENTRIES = 64
+
+
+def _resolve_full_prefill_input_ids(
+    input_ids: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> torch.Tensor:
+    """Use the FULL runner's padded token buffer for eager embedding creation."""
+    context = get_tc_piecewise_forward_context()
+    if context is None or context.forward_batch is forward_batch:
+        return input_ids
+
+    static_forward_batch = context.forward_batch
+    static_num_tokens = context.num_tokens
+    raw_num_tokens = context.raw_num_tokens
+    if (
+        static_forward_batch is None
+        or static_num_tokens is None
+        or raw_num_tokens is None
+        or static_num_tokens == raw_num_tokens
+    ):
+        return input_ids
+
+    assert static_num_tokens > raw_num_tokens
+    assert input_ids.shape[0] == raw_num_tokens
+    static_input_ids = static_forward_batch.input_ids
+    assert static_input_ids.shape[0] == static_num_tokens
+    return static_input_ids
 
 
 class VQAdaptor(nn.Module):
@@ -268,6 +298,7 @@ class MossTranscribeDiarizeForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> torch.Tensor:
+        input_ids = _resolve_full_prefill_input_ids(input_ids, forward_batch)
         return general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,

@@ -32,6 +32,7 @@ def build_generation_batch_overrides(
     cuda_graph_max_bs: int | None = None,
     torch_compile_max_bs: int | None = None,
     enable_prefill_cuda_graph: bool = False,
+    prefill_cuda_graph_backend: str | None = None,
     prefill_graph_token_buckets: list[int] | None = None,
     server_args_overrides: Mapping[str, Any] | None = None,
     **stage_defaults: Any,
@@ -82,8 +83,11 @@ def build_generation_batch_overrides(
 
     prefill_overrides = _build_prefill_cuda_graph_overrides(
         enabled=enable_prefill_cuda_graph,
+        backend=prefill_cuda_graph_backend,
         token_buckets=prefill_graph_token_buckets,
     )
+    if incoming.get("disable_prefill_cuda_graph") is True:
+        prefill_overrides.pop("cuda_graph_backend_prefill", None)
 
     overrides = {
         **prefill_overrides,
@@ -120,6 +124,7 @@ def _pop_graph_alias(
 def _build_prefill_cuda_graph_overrides(
     *,
     enabled: bool,
+    backend: str | None,
     token_buckets: list[int] | None,
 ) -> dict[str, Any]:
     if not isinstance(enabled, bool):
@@ -130,15 +135,33 @@ def _build_prefill_cuda_graph_overrides(
                 "prefill_graph_token_buckets must be None when "
                 "enable_prefill_cuda_graph is False"
             )
+        if backend is not None:
+            raise ValueError(
+                "prefill_cuda_graph_backend must be None when "
+                "enable_prefill_cuda_graph is False"
+            )
         return {"disable_prefill_cuda_graph": True}
 
+    if backend not in (
+        None,
+        Backend.FULL,
+        Backend.BREAKABLE,
+        Backend.TC_PIECEWISE,
+    ):
+        raise ValueError(
+            "prefill_cuda_graph_backend must be one of full, breakable, "
+            "or tc_piecewise"
+        )
+
+    overrides = {"cuda_graph_backend_prefill": backend} if backend is not None else {}
     if token_buckets is None:
-        return {}
+        return overrides
     normalized = _normalize_prefill_graph_token_buckets(token_buckets)
-    return {
-        "cuda_graph_bs_prefill": normalized,
-        "cuda_graph_max_bs_prefill": max(normalized),
-    }
+    overrides.update(
+        cuda_graph_bs_prefill=normalized,
+        cuda_graph_max_bs_prefill=max(normalized),
+    )
+    return overrides
 
 
 def _normalize_prefill_graph_token_buckets(token_buckets: list[int]) -> list[int]:

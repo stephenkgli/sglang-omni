@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from transformers import AutoConfig, AutoProcessor, GenerationConfig
 
 from sglang_omni.model_runner.base import ModelRunner
@@ -37,7 +38,18 @@ from sglang_omni.scheduling.sglang_backend import (
 # Cap tuned to p99 audio duration ([1,8] covers up to ~4min)
 _DEFAULT_ENCODER_GRAPH_CHUNK_BUCKETS = list(range(1, 9))
 _DEFAULT_PREFILL_TOKEN_BUDGET = 4096
+_DEFAULT_PREFILL_CUDA_GRAPH_BACKEND = Backend.FULL
 _MODEL_ARCHITECTURE = "MossTranscribeDiarizeForConditionalGeneration"
+
+
+def _default_full_prefill_request_slots(server_args: Any) -> None:
+    """Cover the configured MOSS request concurrency unless the user overrides it."""
+    prefill_config = server_args.cuda_graph_config.prefill
+    if (
+        prefill_config.backend == Backend.FULL
+        and prefill_config.full_prefill_max_req is None
+    ):
+        prefill_config.full_prefill_max_req = server_args.max_running_requests
 
 
 @contextmanager
@@ -131,6 +143,9 @@ def create_sglang_moss_transcribe_diarize_executor(
     overrides = build_generation_batch_overrides(
         max_running_requests=max_running_requests,
         enable_prefill_cuda_graph=enable_prefill_cuda_graph,
+        prefill_cuda_graph_backend=(
+            _DEFAULT_PREFILL_CUDA_GRAPH_BACKEND if enable_prefill_cuda_graph else None
+        ),
         prefill_graph_token_buckets=prefill_graph_token_buckets,
         server_args_overrides=server_args_overrides,
         disable_cuda_graph=False,
@@ -149,6 +164,7 @@ def create_sglang_moss_transcribe_diarize_executor(
         model_architecture=_MODEL_ARCHITECTURE,
         **overrides,
     )
+    _default_full_prefill_request_slots(server_args)
     validate_generation_batch_policy(
         model_name="MOSS-Transcribe-Diarize",
         server_args=server_args,

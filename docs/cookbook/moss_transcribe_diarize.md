@@ -76,9 +76,12 @@ The optimization stack mirrors [what we built for TTS](https://github.com/zhaoch
 **CUDA Graph.** Three graph paths cover different runtime boundaries. Decode
 pads request batch size to predefined buckets (1, 2, 4, 8, …). The Whisper
 encoder buckets the number of 30-second audio chunks. LLM prefill uses SGLang
-0.5.15's `PrefillCudaGraphRunner` with the `tc_piecewise` backend: audio feature
+0.5.15's `PrefillCudaGraphRunner` with the `full` backend: audio feature
 extraction and embedding composition remain eager, while the Qwen3 transformer
-body is compiled and replayed at token-count buckets. Prefill capture is enabled
+body is captured and replayed at token-count buckets. FULL request slots default
+to `max_running_requests`, so MOSS's short-prompt multi-request batches do not
+fall back to eager merely because SGLang's generic auto-sized slot count is too
+small. Prefill capture is enabled
 by default; set the ASR stage factory argument
 `enable_prefill_cuda_graph: false` to opt out, or set
 `prefill_graph_token_buckets` to an explicit non-empty token-bucket list.

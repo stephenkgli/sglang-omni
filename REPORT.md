@@ -528,3 +528,236 @@ and require real dataset A/B evidence before enabling by default.
 - P2 maintainability: SGLang-version adaptation is centralized in phase-aware graph policy, scheduler construction, and request-storage normalization. Higgs' `model` alias now fails fast unless SGLang assigns the existing Qwen backbone.
 - P3 style: final pre-commit passed.
 - P4 process: unit coverage and copy-pasteable regression commands are recorded above. GPU validation is limited to one RTX PRO 6000 Blackwell; H100/A100 coverage remains for CI rather than being claimed here.
+
+## MOSS FULL prefill-CUDA-graph follow-up (authoritative for the latest worktree)
+
+This section records the later switch of MOSS-TD from the `tc_piecewise`
+prefill backend to SGLang 0.5.15's `full` backend. The earlier rows named
+`moss-full-pcg-on-*` used `backend=tc_piecewise`; the directory name did not
+mean SGLang's `Backend.FULL`. The latest implementation and measurements below
+remove that ambiguity.
+
+- Source base: `5e4430ddaa454f1198d5adb0aaf03499de0554b8` plus the MOSS FULL follow-up diff.
+- AutoDL instance: `vucplt44gz-066faf92`.
+- GPU: NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB.
+- SGLang: 0.5.15; Transformers: 5.12.1; PyTorch: 2.11.0+cu130.
+- Environment: `/root/autodl-tmp/sglang-eval-lab/envs/omni-cu13-py312-sglang-0.5.15-20260713`.
+- Source: `/root/autodl-tmp/sglang-eval-lab/src/sglang-omni/moss-full-backend-20260713`.
+- Run root: `/root/autodl-tmp/sglang-eval-lab/runs/moss-full-backend-20260713-v1`.
+
+### F-001: offline dataset lookup failed when a Hub repository ID was used
+
+- Symptom: the first smoke run failed before requests because `HF_HUB_OFFLINE=1`
+  still required Hub metadata for the repository ID.
+- Root cause: the immutable Movies800Time snapshot already existed locally, but
+  the driver was still asked to resolve a remote-style repository ID.
+- Fix: pass the exact local snapshot path to `--repo-id`.
+- Validation: `load_dataset(local_snapshot, split="validation")` returned all
+  800 validation rows; every retained smoke and benchmark uses that same path.
+
+### F-002: the current driver default exceeded the model's KV capacity
+
+- Symptom: the next 16-request smoke run was rejected by the KV-capacity guard:
+  default `max_new_tokens=65536`, available capacity 40959 tokens.
+- Root cause: the current benchmark-driver default differs from the retained
+  historical workload. This was a workload mismatch, not a model regression.
+- Fix: recover the exact historical setting from the old raw result/config
+  artifacts and pass `--max-new-tokens 5120` explicitly.
+- Disposition: no result from the mismatched run is included in performance or
+  accuracy comparisons.
+
+### F-003: FULL replay received raw-length eager embeddings for a padded graph bucket
+
+- Severity: P0 correctness.
+- Symptom: with the correct workload, all 16 smoke requests failed in
+  `PrefillCudaGraphRunner.replay_layer_forward()` while copying live embeddings
+  into the stable graph slot. Observed destination/source shapes included
+  512/499 (3 requests), 2048/1969 (8), 1792/1691 (4), and 480/469 (1).
+- Root cause: FULL replay pads the transformer body to a captured token bucket,
+  but intentionally runs MOSS's audio feature extraction and multimodal
+  embedding composition eagerly. The outer model received the raw user-facing
+  `ForwardBatch`, so `general_mm_embed_routine()` produced only
+  `raw_num_tokens` embedding rows. The captured body requires
+  `static_num_tokens` rows at the stable `input_embeds` address.
+- Fix: while the FULL runner's forward context exposes a distinct padded
+  `static_forward_batch`, compose eager text/audio embeddings from that
+  runner-owned padded `input_ids` buffer. Keep the real `ForwardBatch` for
+  multimodal metadata and the eager logits tail. Capture, tc-piecewise, and
+  unpadded paths remain unchanged.
+- Validation: the focused model contract test checks this exact raw/static
+  boundary. The fixed smoke completed 16/16, and the retained three-round run
+  completed 2400/2400 with no request error.
+- Preserved failure evidence:
+  `$RUN/logs/server-before-padding-fix.log` and
+  `$RUN/results/moss-full-smoke16-before-padding-fix/`.
+
+### F-004: SGLang's generic FULL request-slot auto-size caused eager fallback
+
+- Severity: P1 performance.
+- Symptom: after F-003, the smoke was correct, but its 15-request/4096-token
+  prefill batch logged `cuda graph: False`.
+- Root cause: SGLang auto-derived only
+  `chunked_prefill_size // 512 = 8` FULL request slots. MOSS uses short prompts
+  and can pack up to its configured 16 concurrent requests into one prefill
+  batch; token-bucket coverage alone therefore did not guarantee graph use.
+- Fix: when the MOSS backend is FULL and the user has not set
+  `full_prefill_max_req`, default it to the resolved `max_running_requests`.
+  Explicit user values and non-FULL backends are preserved.
+- Validation: startup logged `max bucket 4096 tokens, 16 request slots`. Across
+  the final smoke plus three retained rounds, all 1780 prefill batches logged
+  `cuda graph: True`; zero logged `False`.
+- Preserved intermediate evidence:
+  `$RUN/logs/server-padding-fix-auto8-slots.log` and
+  `$RUN/results/moss-full-smoke16-auto8-slots/`.
+
+### F-005: terminating only the CLI parent left the GPU stage alive
+
+- Symptom: an early cleanup stopped the recorded parent PID but left its
+  spawned stage worker using about 79.8 GiB.
+- Root cause: the multiprocessing worker had been reparented while remaining in
+  the service's process group.
+- Fix: identify ownership by command line, source working directory, virtual
+  environment, PPID, PGID, and SID; terminate the complete owned process group.
+  Later shutdown checks require an empty GPU process list and a closed service
+  port before powering off the instance.
+- Scope: no unrelated process was terminated.
+
+### F-006: local pre-commit executable was absent
+
+- Symptom: `pre-commit run ...` returned `command not found`; the first `uvx`
+  attempt was blocked from the sandbox-owned uv cache.
+- Fix: run `uvx pre-commit` outside the filesystem sandbox using the existing uv
+  cache. The first pass deterministically reordered one import block and Black
+  formatted two files. No validation was bypassed.
+
+### Exact FULL benchmark command
+
+The server command is recorded in
+`$RUN/manifest/benchmark-commands.txt`; the retained service used
+`$RUN/manifest/moss-full-backend.json` on port 18100. Each of the three rounds
+used the command below with `N=1`, `2`, and `3`:
+
+```bash
+ENV=/root/autodl-tmp/sglang-eval-lab/envs/omni-cu13-py312-sglang-0.5.15-20260713
+SRC=/root/autodl-tmp/sglang-eval-lab/src/sglang-omni/moss-full-backend-20260713
+RUN=/root/autodl-tmp/sglang-eval-lab/runs/moss-full-backend-20260713-v1
+DATA=/root/autodl-tmp/huggingface/hub/datasets--zhaochenyang20--movies800time/snapshots/382168daa4e9d764318a20c1365fd0af0d00d785
+PATH="$ENV/bin:$PATH" PYTHONPATH="$SRC" \
+TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+"$ENV/bin/python" -m benchmarks.eval.benchmark_asr_transcribe_diarize \
+  --dataset movies800times \
+  --repo-id "$DATA" \
+  --max-samples 800 \
+  --max-concurrency 16 \
+  --max-new-tokens 5120 \
+  --use-existing-server \
+  --base-url http://127.0.0.1:18100 \
+  --model-path /root/autodl-tmp/models/OpenMOSS-Team/MOSS-Transcribe-Diarize \
+  --output-dir "$RUN/results/moss-full-backend-r$N" \
+  --disable-tqdm
+```
+
+- Dataset: Movies800Time validation, 800 samples per round.
+- Original raw input: `$DATA` above.
+- FULL raw results:
+  `$RUN/results/moss-full-backend-r{1,2,3}/transcribe_diarize_results.json`.
+- FULL client logs: `$RUN/logs/moss-full-backend-r{1,2,3}.log`.
+- FULL server log: `$RUN/logs/server.log`.
+- Historical main and tc-piecewise raw results:
+  `/root/autodl-tmp/sglang-eval-lab/runs/sglang-0.5.15-pcg-regression-20260713-v1/results/moss/`.
+
+### FULL performance and accuracy
+
+All values are arithmetic means over three complete 800-request rounds.
+
+| Variant | Backend | Avg QPS | Mean latency s | P95 s | P99 s | CER no speaker | Completed |
+|---|---|---:|---:|---:|---:|---:|---:|
+| main + SGLang 0.5.12.post1 | prefill off | 25.465 | 0.548 | 1.147 | 1.468 | 21.642% | 2400/2400 |
+| target + SGLang 0.5.15 | tc_piecewise | 26.798 | 0.515 | 1.094 | 1.384 | 21.677% | 2400/2400 |
+| latest target + SGLang 0.5.15 | full | 28.041 | 0.490 | 1.042 | 1.316 | 21.678% | 2400/2400 |
+
+- FULL versus old main: +10.12% QPS, -10.47% mean latency, and -9.15%
+  P95 latency.
+- FULL versus tc-piecewise: +4.64% QPS, -4.85% mean latency, and -4.78%
+  P95 latency.
+- CER differs from tc-piecewise by 0.0011 percentage point and from main by
+  0.0365 percentage point. Cross-round normalized-output variation for FULL
+  (765-772 exact matches out of 800) is within the variation already present
+  inside main (762-766) and tc-piecewise (766-778).
+- FULL prefill capture: 3.28 s and 0.43 GB; workspace 100 MB for a 4096-token
+  maximum bucket and 16 request slots. Decode capture: 0.87 s and 0.11 GB.
+- The old main run was intentionally reused as requested. It used the same GPU
+  model, dataset snapshot, checkpoint, concurrency, and generation limit, but
+  came from AutoDL instance `af9bv589z3-7cbf32ff`; FULL ran on
+  `vucplt44gz-066faf92`. This same-SKU/different-physical-instance boundary is
+  retained as a comparison caveat.
+
+### Follow-up test matrix
+
+Focused policy/model contract command:
+
+```bash
+PATH="$ENV/bin:$PATH" PYTHONPATH="$SRC" \
+TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
+"$ENV/bin/python" -m pytest \
+  tests/unit_test/serve/test_generation_batch_policy.py \
+  tests/unit_test/moss_transcribe_diarize/test_prefill_cuda_graph.py \
+  -q -p no:cacheprovider
+```
+
+- Dataset: synthetic unit-test fixtures.
+- Original raw input: the two named repository test files under `$SRC`.
+- Result: 25 passed, 18 warnings in 8.66 s.
+
+Expanded MOSS/config compatibility command:
+
+```bash
+PATH="$ENV/bin:$PATH" PYTHONPATH="$SRC" \
+TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
+"$ENV/bin/python" -m pytest \
+  tests/unit_test/moss_transcribe_diarize \
+  tests/unit_test/serve/test_generation_batch_policy.py \
+  tests/unit_test/serve/test_generation_server_args.py \
+  -q -p no:cacheprovider
+```
+
+- Dataset: synthetic unit-test fixtures.
+- Original raw input: the named repository test directories/files under `$SRC`.
+- Result: 85 passed, 14 skipped, 14 warnings in 8.58 s.
+
+Final full non-benchmark command on the pre-commit-formatted source:
+
+```bash
+PATH="$ENV/bin:$PATH" PYTHONPATH="$SRC" \
+TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
+"$ENV/bin/python" -m pytest tests/ -q -m "not benchmark" -p no:cacheprovider
+```
+
+- Dataset: repository unit/integration fixtures; no external benchmark corpus.
+- Original raw input: `$SRC/tests/`.
+- Result: 1934 passed, 32 skipped, 42 deselected, 26 warnings in 40.86 s.
+- Raw log: `$RUN/logs/pytest-full-final.log`.
+
+Final retained live checks:
+
+- Correctness smoke: 16/16 requests completed after F-003.
+- Graph-coverage smoke: 16/16 completed after F-004; the 1-request, 15-request,
+  and remainder prefill batches all used CUDA graph.
+- Three-round benchmark: 2400/2400 completed, zero per-request error.
+- Server/round logs: no `Traceback`, `RuntimeError`, CUDA OOM, or error-level
+  entry; 1780/1780 prefill batches used CUDA graph.
+
+### Follow-up review disposition
+
+- P0 correctness: F-003 is fixed and covered by a focused raw/static buffer
+  contract test plus 2416 successful live requests.
+- P1 performance: F-004 is fixed; no eager prefill fallback occurred in the
+  retained run, and FULL improved all reported latency/throughput metrics.
+- Accuracy: no request failed and the CER delta is within existing run-to-run
+  variation.
+- P2 maintainability: generic backend selection stays in the shared generation
+  policy; MOSS-only FULL slot sizing and padded multimodal input adaptation stay
+  at the MOSS integration boundary.
+- Residual scope: validation covers one SM120 GPU and Movies800Time. H100/A100,
+  TP>1, and workloads above 16 concurrent requests remain CI/future matrix
+  items rather than claimed coverage.
