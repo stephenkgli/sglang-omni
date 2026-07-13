@@ -762,11 +762,13 @@ Final retained live checks:
   TP>1, and workloads above 16 concurrent requests remain CI/future matrix
   items rather than claimed coverage.
 
-## Higgs FULL prefill-CUDA-graph follow-up (code-only)
+## Higgs FULL prefill-CUDA-graph follow-up (authoritative GPU validation)
 
-- Source base: `cebcccf8b35fae7207d7fbeeafd936b9eaaa2600`.
+- Validated source: `b641aa508b5321bb12cefe5649b6e3ae55326818`.
+- Implementation parent: `cebcccf8b35fae7207d7fbeeafd936b9eaaa2600`.
 - Scope: switch the Higgs default prefill backend from `tc_piecewise` to
-  SGLang 0.5.15's `Backend.FULL`; no GPU result is claimed in this section.
+  SGLang 0.5.15's `Backend.FULL`, then compare the same source with prefill PCG
+  explicitly disabled and enabled.
 - Backend contract: FULL captures only the inner Qwen3 transformer body. Higgs
   still builds reference-audio embeddings eagerly, and the runner copies those
   live embeddings into its stable graph buffer before replay.
@@ -787,10 +789,239 @@ Final retained live checks:
   static embedding rows, sparse reference replacement, rejection of non-FULL
   backends, truthful FULL capability reporting, and the existing radix
   eager fallback.
-- Local validation: syntax compilation, Ruff checks, Black 24.10.0 checks, and
-  `git diff --check` pass. The local macOS environment has no importable SGLang
-  or PyTorch test stack, so the new pytest contracts are not reported as run.
-- Required GPU follow-up: capture/startup, graph-eligibility counts, SeedTTS
-  WER and output consistency, latency/RTF/QPS, peak memory, exact cache hits,
-  partial Radix branches, mixed zero-shot/reference requests, and concurrency
-  above SGLang's old auto-derived 16 request slots.
+
+### Retained environment and scope
+
+- AutoDL instance: `vucplt44gz-066faf92`.
+- GPU: NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB.
+- Feature environment:
+  `/root/autodl-tmp/sglang-eval-lab/envs/omni-cu13-py312-sglang-0.5.15-20260713`.
+- Feature source mirror:
+  `/root/autodl-tmp/sglang-eval-lab/src/sglang-omni/feature-b641aa50-20260713`.
+  An `rsync --dry-run --itemize-changes` against the clean local worktree had
+  no source differences; `.git`, local environments, caches, `AGENTS.md`, and
+  temporary files were intentionally excluded.
+- Retained run root:
+  `/root/autodl-tmp/sglang-eval-lab/runs/full-main-ab-20260713-v1`.
+  Despite the early run-directory name, the retained performance scope is only
+  Higgs SeedTTS feature-off versus feature-FULL.
+- Checkpoint:
+  `/root/autodl-tmp/huggingface/hub/models--bosonai--higgs-tts-3-4b/snapshots/7556c17e05201fccd9c8cc120bc216dcc7b5d561`.
+- Dataset: SeedTTS English, 1,088 samples per round, three rounds per variant,
+  seed 17, concurrency 16, non-streaming, maximum 2,048 generated tokens.
+- Original raw input:
+  `/root/autodl-tmp/datasets/seed-tts-eval-arrow/data/en-00000-of-00001.parquet`.
+- Unified accuracy model:
+  `/root/autodl-tmp/models/Qwen3-ASR-1.7B`, concurrency 24.
+- The user narrowed the run after startup: no new main-branch SeedTTS service
+  was launched. The main numbers below reuse the already-retained three-round
+  run originally produced on `af9bv589z3-7cbf32ff`, which has the same GPU SKU
+  but is a different physical instance. It is a historical reference, not the
+  strict acceptance baseline. The strict A/B is feature-off versus feature-FULL
+  on `vucplt44gz-066faf92`.
+
+### Exact test commands and results
+
+Feature full non-benchmark suite:
+
+```bash
+SRC=/root/autodl-tmp/sglang-eval-lab/src/sglang-omni/feature-b641aa50-20260713
+ENV=/root/autodl-tmp/sglang-eval-lab/envs/omni-cu13-py312-sglang-0.5.15-20260713
+cd "$SRC"
+PATH="$ENV/bin:$PATH" PYTHONPATH="$SRC" \
+TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+  "$ENV/bin/python" -m pytest tests/ -q -m 'not benchmark' -p no:cacheprovider
+```
+
+- Dataset: repository unit/integration fixtures; no external benchmark corpus.
+- Original raw input: `$SRC/tests/`.
+- Result: 1,941 passed, 32 skipped, 42 deselected, 26 warnings in 41.53 s.
+- Raw log: `$RUN/logs/pytest-feature-full.log`.
+
+FULL-PCG focused contracts:
+
+```bash
+PATH="$ENV/bin:$PATH" PYTHONPATH="$SRC" \
+TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+  "$ENV/bin/python" -m pytest \
+    tests/unit_test/higgs_tts/test_prefill_cuda_graph.py \
+    tests/unit_test/higgs_tts/test_pipeline.py \
+    tests/unit_test/moss_transcribe_diarize/test_prefill_cuda_graph.py \
+    tests/unit_test/scheduling/test_sglang_server_args_builder.py \
+    tests/unit_test/serve/test_generation_batch_policy.py \
+    -q -p no:cacheprovider
+```
+
+- Dataset: synthetic repository unit-test fixtures.
+- Original raw input: the five named files under `$SRC/tests/unit_test/`.
+- Result: 89 passed, 14 warnings in 8.53 s.
+- Raw log: `$RUN/logs/pytest-feature-pcg-focused.log`.
+
+The first orchestrator invocation also ran the following old-main compatibility
+suite before the user narrowed the scope. It is retained for transparency, but
+no main performance result was generated in this follow-up:
+
+```bash
+BASE_SRC=/root/autodl-tmp/sglang-eval-lab/src/sglang-omni/main-baseline-20260712
+BASE_ENV=/root/autodl-tmp/sglang-eval-lab/envs/omni-cu13-py312-sm120-20260706
+cd "$BASE_SRC"
+PATH="$BASE_ENV/bin:$PATH" PYTHONPATH="$BASE_SRC" \
+TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+  "$BASE_ENV/bin/python" -m pytest tests/ -q -m 'not benchmark' -p no:cacheprovider
+```
+
+- Dataset: repository unit/integration fixtures; no external benchmark corpus.
+- Original raw input: `$BASE_SRC/tests/`.
+- Result: 1,895 passed, 30 skipped, 42 deselected, 4 failed, 28 warnings
+  in 34.76 s.
+- The four failures are the already-documented C-006/C-007 old-main defects:
+  two SM120 MOSS-TTS-local FlashAttention tests and two speech-protocol URL
+  validation tests. The feature full suite passes all four contracts.
+- Raw log: `$RUN/logs/pytest-baseline-full.log`; retained exit code: 1.
+
+### Exact retained SeedTTS commands
+
+The only service-config difference between the strict variants is
+`enable_prefill_cuda_graph`; both set `max_running_requests=16`,
+`cuda_graph_max_bs=16`, asynchronous decode enabled, and the same checkpoint.
+The immutable configs and hashes are under `$RUN/manifest/configs/` and
+`$RUN/manifest/config-sha256.txt`.
+
+```bash
+RUN=/root/autodl-tmp/sglang-eval-lab/runs/full-main-ab-20260713-v1
+
+# VARIANT is higgs-feature-off or higgs-feature-full.
+PATH="$ENV/bin:$PATH" PYTHONPATH="$SRC" \
+TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+  "$ENV/bin/sgl-omni" serve \
+    --config "$RUN/manifest/configs/$VARIANT.json" \
+    --host 127.0.0.1 --port 18100 --log-level info
+
+# NAME is VARIANT-r1, VARIANT-r2, or VARIANT-r3.
+PATH="$ENV/bin:$PATH" PYTHONPATH="$SRC" \
+TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+  "$ENV/bin/python" "$SRC/benchmarks/eval/benchmark_tts_seedtts.py" \
+    --use-existing-server --generate-only \
+    --host 127.0.0.1 --port 18100 \
+    --model bosonai/higgs-tts-3-4b \
+    --meta /root/autodl-tmp/datasets/seed-tts-eval-arrow \
+    --lang en --ref-format flat \
+    --output-dir "$RUN/results/higgs/$NAME" \
+    --concurrency 16 --disable-tqdm --seed 17
+```
+
+Each service first received an additional 16-sample warmup with the same
+command plus `--max-samples 16`. The driver also performed its built-in
+one-request warmup for every invocation.
+
+Unified ASR and each transcription pass:
+
+```bash
+PATH="$ENV/bin:$PATH" PYTHONPATH="$SRC" \
+TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+  "$ENV/bin/sgl-omni" serve \
+    --model-path /root/autodl-tmp/models/Qwen3-ASR-1.7B \
+    --host 127.0.0.1 --port 18100 \
+    --allowed-local-media-path /root/autodl-tmp --log-level info
+
+PATH="$ENV/bin:$PATH" PYTHONPATH="$SRC" \
+TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+  "$ENV/bin/python" "$SRC/benchmarks/eval/benchmark_tts_seedtts.py" \
+    --use-existing-server --transcribe-only \
+    --host 127.0.0.1 --port 18100 \
+    --model bosonai/higgs-tts-3-4b \
+    --meta /root/autodl-tmp/datasets/seed-tts-eval-arrow \
+    --lang en --ref-format flat \
+    --output-dir "$RUN/results/higgs/$NAME" \
+    --asr-model-path /root/autodl-tmp/models/Qwen3-ASR-1.7B \
+    --asr-concurrency 24 --disable-tqdm --seed 17
+```
+
+- Generated audio, per-request speed data, and WER data:
+  `$RUN/results/higgs/higgs-feature-{off,full}-r{1,2,3}/`.
+- Server, client, GPU, and ASR logs: `$RUN/logs/`.
+- Machine-readable aggregate: `$RUN/manifest/seedtts-summary.json`.
+- Orchestrator and analysis source: `$RUN/manifest/run_full_ab.sh` and
+  `$RUN/manifest/summarize_seedtts.py`.
+- Final orchestrator exit code: 0; the owned service processes exited and the
+  GPU process list was empty.
+
+The current benchmark driver's result metadata reports its managed-server
+defaults (`max_running_requests=64`, `cuda_graph_max_bs=64`). Those fields are
+inactive in the `--use-existing-server` branch: the driver calls `benchmark()`
+directly and does not launch or configure a service. The actual external
+service configs above both pin the values to 16. This metadata difference from
+the older main result is therefore recorded but is not a runtime confound.
+
+### SeedTTS performance and accuracy
+
+Arithmetic means of the three full 1,088-request rounds:
+
+| Variant | Avg QPS | Mean latency s | P95 s | Codec tok/s | Corpus WER | WER >50% |
+|---|---:|---:|---:|---:|---:|---:|
+| existing main + SGLang 0.5.12.post1 | 11.227 | 1.417 | 2.007 | 1254.0 | 0.9350% | 0 |
+| feature, prefill PCG off | 10.955 | 1.450 | 2.079 | 1224.7 | 0.9350% | 0 |
+| feature, FULL prefill PCG | 11.466 | 1.388 | 1.958 | 1280.7 | 0.9266% | 0 |
+
+Per-round evidence for the strict same-host A/B:
+
+| Round | Off QPS | FULL QPS | Off mean s | FULL mean s | Off P95 s | FULL P95 s |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 10.799 | 11.025 | 1.470 | 1.443 | 2.112 | 2.041 |
+| 2 | 11.017 | 11.733 | 1.442 | 1.355 | 2.061 | 1.910 |
+| 3 | 11.049 | 11.639 | 1.439 | 1.365 | 2.063 | 1.923 |
+
+- FULL versus feature-off: +4.66% QPS, +4.57% codec-token throughput,
+  -4.32% mean latency, -5.81% P95, -5.10% P99, and -3.99% mean RTF.
+- FULL versus the existing same-SKU/different-host main reference: +2.13% QPS,
+  +2.13% codec-token throughput, -2.07% mean latency, and -2.43% P95. These
+  cross-host deltas are descriptive only.
+- Output totals were 364,901 tokens off, 364,574 FULL, and 364,578 in the
+  existing main reference. FULL versus off differs by -0.09%, so the throughput
+  improvement is not explained by meaningfully shorter outputs.
+- Every strict variant generated and transcribed 3,264/3,264 samples with zero
+  failed or skipped request. FULL corpus WER was 0.9266% versus 0.9350% off;
+  per-sample mean WER was 0.8943% versus 0.8979%. There is no accuracy
+  regression at this measurement resolution.
+- The maximum WER was 42.857% in all variants for
+  `common_voice_en_19284142-common_voice_en_19284143`, caused by the ASR
+  contraction rendering of "aren't/you're", not a prompt echo. No sample
+  crossed the 50% outlier gate.
+
+### FULL graph coverage and resource cost
+
+- Prefill capture selected `backend=full`, 50 token buckets from 4 through
+  4,096 tokens, and 16 request slots. Capture took 4.87 s and reported 1.00 GB
+  memory use; FlashInfer's FULL workspace was 360 MB.
+- Across the 16-sample warmup and three complete rounds, FULL replay covered
+  2,151/2,235 prefill batches (96.24%) and 3,197/3,284 sequences (97.35%).
+  The 84 eager batches / 87 sequences all carried cached prefixes with
+  multi-token extension, consistent with the retained partial-Radix safety
+  guard. Cold requests and exact one-token cache replays remained graph
+  eligible.
+- Feature-off recorded 0/2,315 graph prefill batches, proving the control did
+  not silently enable PCG.
+- Whole-pipeline peak GPU memory was 85,065 MiB with FULL versus 84,053 MiB
+  off, a +1,012 MiB cost consistent with the capture report.
+- Server-log audit found no traceback, CUDA error, device-side assertion, OOM,
+  segmentation fault, or error-level entry in either TTS service or the unified
+  ASR service.
+- Startup latency is not compared: feature-off was the first cold service and
+  feature-FULL was started second with warm host/model caches. Only post-ready,
+  post-warmup request metrics are used for the performance conclusion.
+
+### Scope changes, discarded work, and residual coverage
+
+- The initial all-model orchestrator reached a MOSS main benchmark before the
+  user narrowed the task to SeedTTS. It was terminated by process group, its
+  service and client exited, and the GPU was confirmed empty. No partial MOSS
+  number is retained or cited.
+- Main SeedTTS was not rerun after the user explicitly removed that branch from
+  scope. The strict conclusion therefore rests on same-source feature-off versus
+  FULL; the older main result remains a secondary reference with a documented
+  physical-host boundary.
+- This run covers reference-audio SeedTTS at concurrency 16 on one SM120 GPU.
+  Mixed zero-shot/reference traffic, concurrency above 16, TP greater than 1,
+  and H100/A100 are not claimed. The sparse/mixed buffer paths and 64-slot
+  sizing are covered by the 89-test focused contract suite, not by this live
+  workload.
