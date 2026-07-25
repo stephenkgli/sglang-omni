@@ -85,6 +85,9 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             ),
             next="vocoder",
             stream_to=["vocoder"],
+            project_payload={
+                "vocoder": (f"{_PKG}.request_builders.project_tts_engine_to_vocoder")
+            },
         ),
         StageConfig(
             name="vocoder",

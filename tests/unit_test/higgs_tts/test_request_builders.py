@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang_omni.models.higgs_tts import request_builders
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 
 
 def test_higgs_reference_audio_namespaces_radix_cache() -> None:
@@ -56,13 +57,29 @@ def test_higgs_scheduler_adapters_clamp_cap_and_record_engine_time(
     )
     payload = StagePayload(
         request_id="req-higgs",
-        request=OmniRequest(inputs={}),
+        request=OmniRequest(
+            inputs={"references": ["large-reference"]},
+            params={
+                "stream": True,
+                INITIAL_CODEC_CHUNK_FRAMES_PARAM: 8,
+                "ref_audio": "large-reference",
+            },
+            metadata={"frontend_only": True},
+        ),
         data=state.to_dict(),
     )
 
     data = request_builder(payload)
+    assert data.stage_payload.data == {}
+    assert data.stage_payload.request.inputs is None
+    assert data.stage_payload.request.params == {
+        "stream": True,
+        INITIAL_CODEC_CHUNK_FRAMES_PARAM: 8,
+    }
+    assert data.stage_payload.request.metadata == {}
     data.output_codes.append(torch.tensor([1, 2, 3], dtype=torch.long))
     result = result_adapter(data)
+    projected = request_builders.project_tts_engine_to_vocoder(result)
 
     assert data.max_new_tokens == 2048
     assert data.req.sampling_params.max_new_tokens == 2048
@@ -72,6 +89,16 @@ def test_higgs_scheduler_adapters_clamp_cap_and_record_engine_time(
     )
     assert result.data["completion_tokens"] == 1
     assert result.data["engine_time_s"] == 2.5
+    assert set(projected.data) == {
+        "num_codebooks",
+        "codebook_size",
+        "output_codes_delayed",
+        "prompt_tokens",
+        "completion_tokens",
+        "engine_time_s",
+    }
+    assert "prompt_token_ids" not in projected.data
+    assert "reference_codes_delayed" not in projected.data
 
 
 def test_higgs_result_adapter_reads_output_code_buffer() -> None:
