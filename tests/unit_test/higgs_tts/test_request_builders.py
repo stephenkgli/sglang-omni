@@ -138,6 +138,33 @@ def test_higgs_result_adapter_propagates_conversion_failure(
         result_adapter(data)
 
 
+def test_higgs_reference_fingerprint_matches_legacy_byte_packing() -> None:
+    """The digest is a radix-cache namespace key, so it must survive dtype and
+    layout changes. Pinned against the original two-bytes-per-code encoding."""
+    rows = [
+        [0, 1, 1023, 1024, 1025],
+        [1025, 1024, 1023, 1, 0],
+    ]
+    expected_fingerprint = "1cc3f6dbe1b650d2b1b4ab25b32bce4f"
+
+    # Non-contiguous int32 view: strides must not leak into the hashed bytes.
+    backing = torch.tensor(rows, dtype=torch.int32).repeat_interleave(2, dim=1)
+    strided_codes = backing[:, ::2]
+    assert not strided_codes.is_contiguous()
+
+    strided_data = request_builders.build_sglang_higgs_request(
+        HiggsTtsState(reference_codes_delayed=strided_codes)
+    )
+    contiguous_data = request_builders.build_sglang_higgs_request(
+        HiggsTtsState(reference_codes_delayed=torch.tensor(rows, dtype=torch.long))
+    )
+
+    assert strided_data.req.extra_key == expected_fingerprint
+    assert contiguous_data.req.extra_key == expected_fingerprint
+    # Aliased, not copied: the engine reads these rows throughout prefill.
+    assert strided_data.reference_codes_delayed.data_ptr() == strided_codes.data_ptr()
+
+
 def test_higgs_request_builder_rejects_non_tensor_reference_codes() -> None:
     """Delayed rows are tensor-only on the wire; a nested list means an upstream
     stage regressed to the list handoff and must fail at the boundary."""

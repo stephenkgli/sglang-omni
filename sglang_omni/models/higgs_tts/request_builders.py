@@ -91,13 +91,8 @@ def _ref_audio_fingerprint(codes: torch.Tensor | None) -> str | None:
     """
     if codes is None or codes.numel() == 0:
         return None
-    buf = bytearray(2 * codes.numel())
-    i = 0
-    for c in codes.reshape(-1).tolist():
-        buf[i] = c & 0xFF
-        buf[i + 1] = (c >> 8) & 0xFF
-        i += 2
-    return hashlib.blake2b(bytes(buf), digest_size=16).hexdigest()
+    packed = codes.detach().reshape(-1).to(device="cpu", dtype=torch.int16)
+    return hashlib.blake2b(packed.numpy().tobytes(), digest_size=16).hexdigest()
 
 
 def build_sglang_higgs_request(
