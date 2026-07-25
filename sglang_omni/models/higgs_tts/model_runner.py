@@ -438,9 +438,15 @@ class HiggsTTSModelRunner(ModelRunner):
                 offset = end
                 continue
 
-            consumed = data.num_ref_codes_consumed
+            consumed = self._num_ref_codes_before_extend(data)
+            next_consumed = consumed + n_placeholders
+            total_rows = int(codes_rows.shape[0])
+            assert next_consumed <= total_rows, (
+                "Higgs reference placeholder count exceeds delayed code rows: "
+                f"consumed={consumed}, requested={n_placeholders}, total={total_rows}"
+            )
             # Slice on the host so only the rows this extend needs cross to device.
-            codes = codes_rows[consumed : consumed + n_placeholders].to(
+            codes = codes_rows[consumed:next_consumed].to(
                 device=device,
                 dtype=torch.long,
             )
@@ -448,10 +454,20 @@ class HiggsTTSModelRunner(ModelRunner):
                 embed = fused_embed(codes)
             mask_idx = full_mask.nonzero(as_tuple=True)[0] + offset
             text_embeds[mask_idx] = embed.to(text_embeds.dtype)
-            data.num_ref_codes_consumed = consumed + n_placeholders
             offset = end
 
         return text_embeds
+
+    @staticmethod
+    def _num_ref_codes_before_extend(data: Any) -> int:
+        """Delayed ref-code rows already embedded before this extend region."""
+        prefix_len = len(data.req.prefix_indices)
+        if prefix_len <= 0:
+            return 0
+        # input_ids holds the prompt only; a prefix that reached into generated
+        # tokens clamps here to "all reference rows consumed".
+        prompt_prefix = data.input_ids[:prefix_len]
+        return int((prompt_prefix == AUDIO_PLACEHOLDER_ID).sum())
 
     def _collect_step_outputs(
         self, result: Any, requests: list, forward_batch: Any | None = None

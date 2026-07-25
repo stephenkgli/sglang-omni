@@ -1178,35 +1178,74 @@ _PREFILL_REF_CODES = torch.tensor(
 )
 
 
-def test_higgs_model_runner_prefill_slices_tensor_reference_codes() -> None:
-    """Reference rows arrive as a CPU tensor. Only the slice this extend needs
-    crosses to the device, and the fused embedding always sees int64 rows
-    whatever dtype the frontend stored them in."""
+def test_higgs_model_runner_prefill_slices_chunks_by_prefix_length() -> None:
     capture = _CaptureEmbedding()
     runner = _make_prefill_runner(capture)
     data = SimpleNamespace(
-        req=SimpleNamespace(extend_input_len=3),
+        req=SimpleNamespace(extend_input_len=3, prefix_indices=[]),
         input_ids=_PREFILL_PROMPT_IDS,
         reference_codes_delayed=_PREFILL_REF_CODES,
-        num_ref_codes_consumed=0,
     )
 
     first_embeds = runner._build_prefill_input_embeds(
         SimpleNamespace(input_ids=_PREFILL_PROMPT_IDS[:3]),
         [SimpleNamespace(data=data)],
     )
-    assert data.num_ref_codes_consumed == 2
 
+    # Chunk two resumes where the tree cache left off: 3 tokens cached, of which
+    # 2 were placeholders, so this chunk must start at ref row 2.
+    data.req.prefix_indices = [0, 1, 2]
     data.req.extend_input_len = 2
     second_embeds = runner._build_prefill_input_embeds(
         SimpleNamespace(input_ids=_PREFILL_PROMPT_IDS[3:]),
         [SimpleNamespace(data=data)],
     )
 
-    assert data.num_ref_codes_consumed == 4
     assert torch.equal(first_embeds[1:], _PREFILL_REF_CODES[:2].to(torch.float32))
     assert torch.equal(second_embeds, _PREFILL_REF_CODES[2:].to(torch.float32))
     assert capture.dtypes == [torch.long, torch.long]
+
+
+def test_higgs_model_runner_prefill_survives_retraction_reprefill() -> None:
+    """KV-pressure retraction requeues the request for a full re-prefill; the
+    reference rows must be re-embedded, not skipped as already consumed."""
+    capture = _CaptureEmbedding()
+    runner = _make_prefill_runner(capture)
+    data = SimpleNamespace(
+        req=SimpleNamespace(extend_input_len=5, prefix_indices=[]),
+        input_ids=_PREFILL_PROMPT_IDS,
+        reference_codes_delayed=_PREFILL_REF_CODES,
+    )
+    forward_batch = SimpleNamespace(input_ids=_PREFILL_PROMPT_IDS)
+    sched_reqs = [SimpleNamespace(data=data)]
+
+    first_embeds = runner._build_prefill_input_embeds(forward_batch, sched_reqs)
+    # retract_decode() frees the KV and resets the prefix; the same _omni_data
+    # object comes back through the prefill waiting queue.
+    second_embeds = runner._build_prefill_input_embeds(forward_batch, sched_reqs)
+
+    assert torch.equal(first_embeds, second_embeds)
+    assert torch.equal(first_embeds[1:], _PREFILL_REF_CODES.to(torch.float32))
+
+
+def test_higgs_model_runner_prefill_skips_fully_cached_reference() -> None:
+    """A retracted request whose radix prefix reached into generated tokens has
+    every reference row cached already, so this extend embeds nothing."""
+    capture = _CaptureEmbedding()
+    runner = _make_prefill_runner(capture)
+    data = SimpleNamespace(
+        req=SimpleNamespace(extend_input_len=1, prefix_indices=list(range(7))),
+        input_ids=_PREFILL_PROMPT_IDS,
+        reference_codes_delayed=_PREFILL_REF_CODES,
+    )
+
+    embeds = runner._build_prefill_input_embeds(
+        SimpleNamespace(input_ids=torch.tensor([2], dtype=torch.long)),
+        [SimpleNamespace(data=data)],
+    )
+
+    assert embeds.shape[0] == 1
+    assert capture.dtypes == []
 
 
 def _make_payload(request_id: str, state: HiggsTtsState) -> StagePayload:
