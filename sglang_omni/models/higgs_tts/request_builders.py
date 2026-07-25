@@ -21,7 +21,7 @@ from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     HIGGS_STREAM_FOLLOWUP_STRIDE_METADATA,
     HIGGS_STREAM_STRIDE_METADATA,
 )
-from sglang_omni.proto import StagePayload
+from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 
@@ -54,6 +54,16 @@ class _ResettableHiggsModel(Protocol):
 
 _HiggsRequestBuilder = Callable[[StagePayload], HiggsSGLangRequestData]
 _HiggsResultAdapter = Callable[[HiggsSGLangRequestData], StagePayload]
+_VOCODER_REQUEST_PARAMS = ("stream", INITIAL_CODEC_CHUNK_FRAMES_PARAM)
+_VOCODER_STATE_FIELDS = (
+    "num_codebooks",
+    "codebook_size",
+    "output_codes_delayed",
+    "omni_rollout",
+    "prompt_tokens",
+    "completion_tokens",
+    "engine_time_s",
+)
 
 
 def _perf_counter() -> float:
@@ -80,6 +90,18 @@ def _normalize_reference_codes(codes: Any) -> torch.Tensor | None:
             f"Higgs reference codes must have shape [T, N], got {tuple(tensor.shape)}"
         )
     return tensor
+
+
+def _vocoder_request(request: OmniRequest) -> OmniRequest:
+    params = request.params
+    if not isinstance(params, dict):
+        raise TypeError(
+            f"Higgs request params must be a dict, got {type(params).__name__}"
+        )
+    return OmniRequest(
+        inputs=None,
+        params={key: params[key] for key in _VOCODER_REQUEST_PARAMS if key in params},
+    )
 
 
 def _ref_audio_fingerprint(codes: torch.Tensor | None) -> str | None:
@@ -216,6 +238,23 @@ def apply_higgs_result(state: HiggsTtsState, data: HiggsSGLangRequestData) -> No
     state.prompt_tokens = len(data.input_ids)
 
 
+def project_tts_engine_to_vocoder(payload: StagePayload) -> StagePayload:
+    """Keep the final vocoder hop free of frontend and generation-only state."""
+    if not isinstance(payload.data, dict):
+        raise TypeError(
+            f"Higgs TTS payload data must be a dict, got {type(payload.data).__name__}"
+        )
+    return StagePayload(
+        request_id=payload.request_id,
+        request=payload.request,
+        data={
+            key: payload.data[key]
+            for key in _VOCODER_STATE_FIELDS
+            if key in payload.data
+        },
+    )
+
+
 def make_higgs_scheduler_adapters(
     model: _ResettableHiggsModel,
     *,
@@ -240,18 +279,27 @@ def make_higgs_scheduler_adapters(
             )
         data = build_sglang_higgs_request(state, request_id=payload.request_id)
         data.engine_start_s = _perf_counter()
-        data.stage_payload = payload
         data.stream_metadata = build_higgs_stream_metadata(
             payload,
             data,
             stream_stride=stream_stride,
             stream_followup_stride=stream_followup_stride,
         )
+        # Park a vocoder-sized payload now: holding the inbound one would pin the
+        # frontend's reference codes and prompt ids for the whole AR generation.
+        data.stage_payload = StagePayload(
+            request_id=payload.request_id,
+            request=_vocoder_request(payload.request),
+            data={},
+        )
         return data
 
     def result_adapter(data: HiggsSGLangRequestData) -> StagePayload:
         payload = data.stage_payload
-        state = HiggsTtsState.from_dict(payload.data)
+        state = HiggsTtsState(
+            num_codebooks=int(data.num_codebooks),
+            codebook_size=int(data.codebook_size),
+        )
         apply_higgs_result(state, data)
         if data.engine_start_s:
             state.engine_time_s = _perf_counter() - data.engine_start_s
@@ -272,4 +320,5 @@ __all__ = [
     "build_higgs_stream_metadata",
     "build_sglang_higgs_request",
     "make_higgs_scheduler_adapters",
+    "project_tts_engine_to_vocoder",
 ]
