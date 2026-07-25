@@ -428,7 +428,7 @@ class HiggsTTSModelRunner(ModelRunner):
             data = sched_req.data
             end = offset + int(data.req.extend_input_len)
             codes_rows = data.reference_codes_delayed
-            if not codes_rows:
+            if codes_rows is None:
                 offset = end
                 continue
 
@@ -438,10 +438,14 @@ class HiggsTTSModelRunner(ModelRunner):
                 offset = end
                 continue
 
-            codes = torch.tensor(codes_rows, dtype=torch.long, device=device)
             consumed = data.num_ref_codes_consumed
+            # Slice on the host so only the rows this extend needs cross to device.
+            codes = codes_rows[consumed : consumed + n_placeholders].to(
+                device=device,
+                dtype=torch.long,
+            )
             with torch.no_grad():
-                embed = fused_embed(codes[consumed : consumed + n_placeholders])
+                embed = fused_embed(codes)
             mask_idx = full_mask.nonzero(as_tuple=True)[0] + offset
             text_embeds[mask_idx] = embed.to(text_embeds.dtype)
             data.num_ref_codes_consumed = consumed + n_placeholders
