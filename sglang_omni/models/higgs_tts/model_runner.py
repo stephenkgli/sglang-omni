@@ -440,14 +440,16 @@ class HiggsTTSModelRunner(ModelRunner):
                 token == AUDIO_PLACEHOLDER_ID
                 for token in data.req.origin_input_ids[: data.req.extend_range.start]
             )
-            if consumed + n_placeholders > len(codes_rows):
+            next_consumed = consumed + n_placeholders
+            total_rows = int(codes_rows.shape[0])
+            if next_consumed > total_rows:
                 raise RuntimeError(
                     "Higgs reference-code rows do not cover the live audio "
                     f"placeholders: consumed={consumed}, "
-                    f"live={n_placeholders}, available={len(codes_rows)}"
+                    f"live={n_placeholders}, available={total_rows}"
                 )
             # Slice on the host so only the rows this extend needs cross to device.
-            codes = codes_rows[consumed : consumed + n_placeholders].to(
+            codes = codes_rows[consumed:next_consumed].to(
                 device=device,
                 dtype=torch.long,
             )
