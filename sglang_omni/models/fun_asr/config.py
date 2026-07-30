@@ -4,12 +4,7 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from sglang_omni.config import (
-    PipelineConfig,
-    SchedulingConfig,
-    StageConfig,
-    StageRuntimeConfig,
-)
+from sglang_omni.config import PipelineConfig, StageConfig
 
 _PKG = "sglang_omni.models.fun_asr"
 
@@ -49,7 +44,6 @@ class FunASRPipelineConfig(PipelineConfig):
                 "request_build_max_pending": 16,
             },
             gpu=0,
-            runtime=StageRuntimeConfig(scheduling=SchedulingConfig()),
             terminal=True,
         )
     ]

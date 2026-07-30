@@ -7,7 +7,6 @@ from typing import Any, ClassVar
 
 from sglang_omni.config import (
     PipelineConfig,
-    SchedulingConfig,
     StageConfig,
     StageResourceConfig,
     StageRuntimeConfig,
@@ -69,7 +68,6 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             gpu=0,
             runtime=StageRuntimeConfig(
                 resources=StageResourceConfig(total_gpu_memory_fraction=0.85),
-                scheduling=SchedulingConfig(),
             ),
             next="vocoder",
             stream_to=["vocoder"],

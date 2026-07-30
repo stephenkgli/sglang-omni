@@ -62,9 +62,7 @@ def test_cli_sets_coalesce_args(config_cls, stage_name):
 def test_typed_scheduling_field_reaches_factory_args():
     config = HiggsTtsPipelineConfig(model_path="dummy")
     stage = next(s for s in config.stages if s.name == "tts_engine")
-    stage.runtime.scheduling = type(stage.runtime.scheduling)(
-        prefill_coalesce_requests=16
-    )
+    stage.runtime.scheduling = SchedulingConfig(prefill_coalesce_requests=16)
     args = _ar_stage_args(config, "tts_engine")
     assert args["prefill_coalesce_requests"] == 16
     # Note (maydomine): An omitted typed value must preserve the factory default.
