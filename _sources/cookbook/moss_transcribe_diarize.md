@@ -73,7 +73,9 @@ At c=1 with longer audio, AR Decode takes 94%+ of total time — the leverage is
 
 The optimization stack mirrors [what we built for TTS](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/sglang/sglang-omni/tts-optimization.md), sharing the same core infrastructure with ASR-specific adaptations.
 
-**CUDA Graph.** The LLM decode step pads batch size to predefined buckets (1, 2, 4, 8, …) and replays a captured CUDA graph, eliminating kernel launch overhead on every token. This is the single biggest optimization for AR Decode. Encoder CUDA Graph is also implemented — the Whisper encoder is a stateless function where only the chunk count varies across requests, so we bucket over chunk count and pad to the nearest captured bucket on replay — but this is not yet merged to main.
+**CUDA Graph.** The LLM decode step pads batch size to predefined buckets (1, 2, 4, 8, …) and replays a captured CUDA graph, eliminating kernel launch overhead on every token. This is the single biggest optimization for AR Decode. The Whisper encoder gets the same treatment, bucketed over chunk count (`encoder_chunk_buckets`, default `1..8` ≈ 4 min of audio).
+
+**Encoder Torch Compile (opt-in).** `encoder_torch_compile=True` swaps the encoder CUDA graph for `torch.compile` (default mode) with kernel fusion. The two are mutually exclusive. Reduce-overhead mode must not be used: its cudagraph trees corrupt memory alongside the decode CUDA graphs that always run in this process (illegal memory access after ~60s of serving). The cost is a one-time per-bucket compile at startup; `dynamic=False` means only the warmed chunk counts are accelerated, anything else runs eager.
 
 **Async Decode.** Same one-step lookahead as TTS: launch the current decode step's GPU work, then resolve the previous step's host-side work (D2H copy, finish detection, result dispatch) in parallel. Falls back to synchronous mode at batch size 1, where the host work is too small to overlap. Two alternating pinned host buffers prevent read/write races between the GPU's async D2H write and the CPU's read. For the full mechanism and code pointers, see [Asynchronous Decode + Lookahead](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/sglang/sglang-omni/tts-optimization.md#asynchronous-decode--lookahead) in the TTS optimization guide.
 
@@ -170,7 +172,7 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 
 ## Benchmarking
 
-Thanks to the Moss team for providing the benchmark datasets, we prepare movies800times and aishell4_long as benchmark datasets for multi-speaker ASR. movies800times is a short-sequence dataset with 800 dialog clips, and aishell4_long is a long-sequence dataset with 20 long-form meeting audio. These two datasets are right now under private license, and you can contact the Moss team for access.
+Thanks to the Moss team for providing the benchmark datasets, we prepare movies800times, aishell4_long, and googletime as benchmark datasets for multi-speaker ASR. movies800times is a short-sequence dataset with 800 dialog clips, aishell4_long with googletime are long-sequence dataset of long-form meeting audio, and English podcasts. These datasets are right now under private license, and you can contact the Moss team for access.
 
 
 ```bash
@@ -193,6 +195,17 @@ python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
   --max-new-tokens 65536 \
   --request-timeout-s 1800 \
   --output-dir results/moss_transcribe_diarize_aishell4_long
+
+# Long-sequence English podcast ASR / diarization
+python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
+  --dataset googletime \
+  --concurrency 16 \
+  --max-running-requests 16 \
+  --cuda-graph-max-bs 16 \
+  --mem-fraction-static 0.80 \
+  --max-new-tokens 65536 \
+  --request-timeout-s 1800 \
+  --output-dir results/moss_transcribe_diarize_googletime
 ```
 
 ## Benchmark Results

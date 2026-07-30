@@ -173,10 +173,31 @@ sgl-omni serve \
 
 Use `examples/configs/qwen3_omni_colocated_h200.yaml` on single-H200 workers.
 
+Exact-shape CUDA Graph replay is enabled by default for Qwen3-Omni Code2Wav.
+The default stage config supplies a 2% typed GPU memory budget; colocated
+example configs override it with their hardware-specific budget.
+
+To disable replay, add this runtime override to the YAML config:
+
+```yaml
+runtime_overrides:
+  code2wav:
+    enable_cuda_graph: false
+```
+
+When replay is enabled, a custom Code2Wav stage must define
+`runtime.resources.total_gpu_memory_fraction`; startup rejects a missing typed
+budget before loading the model.
+
+The feature derives the exact `B=1` threshold windows from
+`stream_chunk_size` and `left_context_size`; the defaults capture
+`T{10,20,30,35}`. Unsupported shapes and final stream tails run eagerly.
+Capture-time incompatibilities also fall back to eager execution.
+
 For manual multi-GPU placement, use the example script:
 
 ```bash
-python examples/run_qwen3_omni_speech_server.py \
+python examples/run_omni.py qwen3-speech-server \
   --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --gpu-thinker 0 \
   --gpu-talker 1 \
@@ -217,7 +238,7 @@ sgl-omni serve \
 The speech server launcher exposes the same per-stage controls:
 
 ```bash
-python examples/run_qwen3_omni_speech_server.py \
+python examples/run_omni.py qwen3-speech-server \
   --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --gpu-thinker 0 \
   --gpu-talker 1 \
@@ -231,6 +252,27 @@ python examples/run_qwen3_omni_speech_server.py \
 `--mem-fraction-static` applies to both Qwen AR stages. Per-stage flags override
 the global value for that stage. Values must be greater than `0` and less than
 `1`.
+
+The thinker admits up to 64 running requests by default. Use the
+thinker-specific flag to lower or raise that limit in either text-only or
+speech mode:
+
+```bash
+sgl-omni serve \
+  --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --thinker-max-running-requests 16
+```
+
+`--max-running-requests` continues to target the generation stage, which is the
+talker in the Qwen3-Omni speech pipeline. To configure the thinker through a
+pipeline YAML file instead, use the stage runtime override:
+
+```yaml
+runtime_overrides:
+  thinker:
+    server_args_overrides:
+      max_running_requests: 16
+```
 
 ## Single-GPU FP8 on H100/H20
 
@@ -267,6 +309,31 @@ SGLANG_JIT_DEEPGEMM_PRECOMPILE=1 sgl-omni serve \
   --model-name qwen3-omni \
   --port 8008
 ```
+
+## Single-GPU AutoRound INT4 Thinker on H100/H20
+
+SGLang-Omni also supports AutoRound INT4 quantized Qwen3-Omni checkpoints.
+AutoRound uses a 4-bit quantization scheme with group size 128, significantly
+reducing memory footprint compared to BF16 or FP8.
+
+The public AutoRound checkpoint quantizes the thinker transformer layers. In
+speech mode, the talker and code2wav stages load as BF16 from the same
+checkpoint. For one-GPU H100/H20 colocated launch, use the colocated config
+with the AutoRound checkpoint:
+
+```bash
+sgl-omni serve \
+  --config examples/configs/qwen3_omni_colocated_h20.yaml \
+  --colocate \
+  --model-name qwen3-omni \
+  --model-path Intel/Qwen3-Omni-30B-A3B-Instruct-int4-AutoRound \
+  --port 8008
+```
+
+AutoRound quantization provides:
+- **~50% memory reduction** compared to BF16 (from ~60GB to ~30GB)
+- **~25% memory reduction** compared to FP8 (from ~40GB to ~30GB)
+- **Accuracy at ultra-low bit widths**: maintains high accuracy even at 2–4 bits, requiring minimal tuning effort thanks to its sign-gradient descent optimization.
 
 ### Image and Text Input
 
