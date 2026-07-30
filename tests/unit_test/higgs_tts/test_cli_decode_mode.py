@@ -91,7 +91,10 @@ def test_decode_mode_cli_rejects_unsupported_config():
     config = Qwen3TTSPipelineConfig(model_path="dummy")
     with pytest.raises(
         typer.BadParameter,
-        match="Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, and Fun-ASR",
+        match=(
+            "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
+            "and the Qwen3-Omni thinker"
+        ),
     ):
         apply_decode_mode_cli_overrides(
             config, decode_mode="sync", async_lookahead_min_batch_size=None
