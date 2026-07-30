@@ -11,6 +11,7 @@ from sglang_omni.config.manager import ConfigManager
 from sglang_omni.preprocessing.resource_connector import (
     resolve_allowed_local_media_path,
 )
+from sglang_omni.scheduling.prefill_coalesce import validate_prefill_coalesce_args
 from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
 from sglang_omni.utils.gpu_compat import should_disable_custom_all_reduce_for_gpus
 
@@ -45,6 +46,10 @@ _PREFILL_COALESCE_FACTORIES = frozenset(
         "create_sglang_moss_transcribe_diarize_executor",
         "sglang_omni.models.fun_asr.stages.create_sglang_fun_asr_executor",
     }
+)
+_PREFILL_COALESCE_SUPPORTED_MODELS = (
+    "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
+    "and the Qwen3-Omni thinker"
 )
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
@@ -876,27 +881,21 @@ def apply_prefill_coalesce_cli_overrides(
     prefill_coalesce_requests: int | None,
     prefill_coalesce_wait_ms: float | None,
 ) -> PipelineConfig:
-    if prefill_coalesce_requests is None and prefill_coalesce_wait_ms is None:
-        return pipeline_config
-    # Note (maydomine): Validate before factory imports so malformed CLI values
-    # fail without loading model dependencies.
-    from sglang_omni.config.schema import SchedulingConfig
-
     try:
-        cli_values = SchedulingConfig(
-            **{
-                name: value
-                for name, value in {
-                    "prefill_coalesce_requests": prefill_coalesce_requests,
-                    "prefill_coalesce_wait_ms": prefill_coalesce_wait_ms,
-                }.items()
-                if value is not None
-            }
+        requests, wait_ms = validate_prefill_coalesce_args(
+            prefill_coalesce_requests,
+            prefill_coalesce_wait_ms,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    # Note (maydomine): Factory identity keeps CLI discovery stable for full
-    # stage YAML files created before runtime.scheduling existed.
+
+    updates: dict[str, object] = {}
+    if requests is not None:
+        updates["prefill_coalesce_requests"] = requests
+    if wait_ms is not None:
+        updates["prefill_coalesce_wait_ms"] = wait_ms
+    if not updates:
+        return pipeline_config
     matching_stages = [
         stage
         for stage in pipeline_config.stages
@@ -904,55 +903,22 @@ def apply_prefill_coalesce_cli_overrides(
     ]
     if not matching_stages:
         raise typer.BadParameter(
-            "--prefill-coalesce-requests/--prefill-coalesce-wait-ms require a "
-            "stage whose factory declares prefill coalescing; no stage in "
-            f"{type(pipeline_config).__name__} does"
+            "--prefill-coalesce-requests/--prefill-coalesce-wait-ms currently "
+            f"support only {_PREFILL_COALESCE_SUPPORTED_MODELS}; no stage in "
+            "this pipeline uses a supported factory"
         )
-    if len(matching_stages) > 1:
-        stage_names = ", ".join(stage.name for stage in matching_stages)
-        logger.warning(
-            "Prefill coalescing CLI values apply to all supporting stages "
-            f"({stage_names}); use per-stage runtime.scheduling values to "
-            "configure them independently"
-        )
-
-    def configured_requests(stage: StageConfig) -> int:
-        scheduling = stage.runtime.scheduling
-        if scheduling is not None and scheduling.prefill_coalesce_requests is not None:
-            return scheduling.prefill_coalesce_requests
-        overrides = pipeline_config.runtime_overrides.get(stage.name, {})
-        if "prefill_coalesce_requests" in overrides:
-            raw_value = overrides["prefill_coalesce_requests"]
-        elif "prefill_coalesce_requests" in stage.factory_args:
-            raw_value = stage.factory_args["prefill_coalesce_requests"]
-        else:
-            return 0
-        try:
-            validated = SchedulingConfig(prefill_coalesce_requests=raw_value)
-        except ValueError as exc:
-            raise typer.BadParameter(str(exc)) from exc
-        return validated.prefill_coalesce_requests or 0
-
-    if cli_values.prefill_coalesce_requests is None and not any(
-        # Note (maydomine): YAML may already enable the gate, in which case a
-        # CLI wait override is effective and should not trigger a warning.
-        configured_requests(stage) >= 2
+    if prefill_coalesce_requests is None and not any(
+        # The YAML may already enable the gate; only warn when tuning the wait
+        # would genuinely have no effect on any targeted stage.
+        int((stage.factory_args or {}).get("prefill_coalesce_requests", 0)) >= 2
         for stage in matching_stages
     ):
         logger.warning(
             "--prefill-coalesce-wait-ms alone does not enable coalescing; the "
             "gate engages only when prefill_coalesce_requests is >= 2 (via "
-            "--prefill-coalesce-requests or runtime.scheduling in the config)"
+            "--prefill-coalesce-requests or the stage's factory_args)"
         )
-    cli_updates = cli_values.model_dump(exclude_none=True)
-    for stage in matching_stages:
-        # Note (maydomine): Explicit CLI values override their legacy sources
-        # instead of creating a typed-versus-legacy conflict at launch.
-        for knob in cli_updates:
-            stage.factory_args.pop(knob, None)
-            pipeline_config.runtime_overrides.get(stage.name, {}).pop(knob, None)
-        scheduling = stage.runtime.scheduling or SchedulingConfig()
-        stage.runtime.scheduling = scheduling.model_copy(update=cli_updates)
+    _apply_factory_args_updates(pipeline_config, matching_stages, updates)
     return pipeline_config
 
 
@@ -1290,7 +1256,7 @@ def serve(
                 "amortizing the per-step host cost. The gate engages at >= 2; "
                 "0 disables (default), and 1 is likewise a no-op (logs a "
                 "warning). "
-                "Applies to every stage whose factory supports coalescing."
+                f"Available for {_PREFILL_COALESCE_SUPPORTED_MODELS}."
             ),
         ),
     ] = None,

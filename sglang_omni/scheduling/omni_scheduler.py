@@ -31,7 +31,6 @@ from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.utils import broadcast_pyobj
 
-from sglang_omni.config.schema import SchedulingConfig
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
 from sglang_omni.proto.admin import (
@@ -46,6 +45,7 @@ from sglang_omni.proto.admin import (
     ADMIN_WEIGHTS_CHECKER,
 )
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.prefill_coalesce import validate_prefill_coalesce_args
 
 logger = logging.getLogger(__name__)
 
@@ -199,22 +199,23 @@ class OmniScheduler:
         if model_runner is not None:
             model_runner._async_enabled = enable_async_decode
 
-        # Note (maydomine): Revalidate here because direct construction can
-        # bypass the typed YAML and CLI entrypoints.
-        validated = SchedulingConfig(
-            prefill_coalesce_requests=prefill_coalesce_requests,
-            prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+        # Note: (maydomine) coalescing gate: hold prefill until K requests wait
+        # or the oldest has waited T ms; the gate engages at K >= 2 (0 and 1
+        # both leave it off — validate_prefill_coalesce_args warns on 1).
+        requests, wait_ms = validate_prefill_coalesce_args(
+            prefill_coalesce_requests,
+            prefill_coalesce_wait_ms,
         )
-        requests = validated.prefill_coalesce_requests
-        wait_ms = validated.prefill_coalesce_wait_ms
         if requests is None or wait_ms is None:
-            # Note (maydomine): Reject explicit nulls rather than guessing
-            # whether they mean the concrete defaults or disabled coalescing.
+            # The factory defaults are concrete; None can only reach here from
+            # an explicit null in a config file (e.g. prefill_coalesce_requests:
+            # null in YAML), where the intent is ambiguous — fail loudly rather
+            # than guess.
             raise ValueError(
                 "prefill_coalesce_requests and prefill_coalesce_wait_ms must "
                 "be concrete values at the scheduler (got "
                 f"requests={requests!r}, wait_ms={wait_ms!r}); use 0 to "
-                "disable coalescing instead of None"
+                "disable coalescing instead of null"
             )
         if requests > 1 and int(server_args.tp_size) > 1:
             logger.warning(

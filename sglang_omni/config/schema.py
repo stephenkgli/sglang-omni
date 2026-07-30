@@ -3,11 +3,9 @@
 
 from __future__ import annotations
 
-import logging
-import math
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class CommConfig(BaseModel):
@@ -86,72 +84,6 @@ class SGLangServerArgsConfig(BaseModel):
             )
 
 
-class SchedulingConfig(BaseModel):
-    """Typed OmniScheduler tuning for one AR stage.
-
-    Owned by the scheduling layer, not by any model factory: these knobs
-    configure ``OmniScheduler`` behavior and are translated into the AR
-    factory's kwargs by ``resolve_stage_factory_args``. Omitted fields use the
-    scheduler defaults; explicit nulls are rejected as ambiguous.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    prefill_coalesce_requests: int | None = None
-    prefill_coalesce_wait_ms: float | None = None
-
-    @field_validator("prefill_coalesce_requests", mode="before")
-    @classmethod
-    def _validate_requests(cls, value: Any) -> Any:
-        if value is None:
-            raise ValueError(
-                "prefill_coalesce_requests cannot be null; omit it to use the "
-                "scheduler default or use 0 to disable coalescing"
-            )
-        # Note (maydomine): Reject lossy coercions before int() can silently
-        # turn invalid YAML values into valid but unintended settings.
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError("prefill_coalesce_requests must be an integer")
-        if isinstance(value, float) and (
-            not math.isfinite(value) or not value.is_integer()
-        ):
-            raise ValueError(
-                f"prefill_coalesce_requests must be an integer, got {value!r}"
-            )
-        value = int(value)
-        if value < 0:
-            raise ValueError("prefill_coalesce_requests must be >= 0")
-        if value == 1:
-            # Note (maydomine): Keep 1 compatible as an off value, but surface
-            # its likely accidental use because the gate starts at 2.
-            logging.getLogger(__name__).warning(
-                "prefill_coalesce_requests=1 disables coalescing: the "
-                "admission gate only engages at >= 2. Use 0 to disable "
-                "explicitly, or >= 2 to enable."
-            )
-        return value
-
-    @field_validator("prefill_coalesce_wait_ms", mode="before")
-    @classmethod
-    def _validate_wait_ms(cls, value: Any) -> Any:
-        if value is None:
-            raise ValueError(
-                "prefill_coalesce_wait_ms cannot be null; omit it to use the "
-                "scheduler default"
-            )
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError("prefill_coalesce_wait_ms must be a number")
-        try:
-            value = float(value)
-        except OverflowError as exc:
-            raise ValueError(
-                "prefill_coalesce_wait_ms must be a finite value > 0"
-            ) from exc
-        if not (math.isfinite(value) and value > 0):
-            raise ValueError("prefill_coalesce_wait_ms must be a finite value > 0")
-        return value
-
-
 class StageRuntimeConfig(BaseModel):
     """Typed runtime intent for one stage.
 
@@ -168,7 +100,6 @@ class StageRuntimeConfig(BaseModel):
     sglang_server_args: SGLangServerArgsConfig = Field(
         default_factory=SGLangServerArgsConfig
     )
-    scheduling: SchedulingConfig | None = None
 
     def model_post_init(self, __context: Any = None) -> None:
         if self.max_seq_len is not None and self.max_seq_len <= 0:
