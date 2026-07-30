@@ -177,6 +177,19 @@ def test_cli_value_overrides_legacy_source(legacy_source):
     assert _ar_stage_args(config, "tts_engine")["prefill_coalesce_requests"] == 64
 
 
+@pytest.mark.parametrize("legacy_source", ["factory_args", "runtime_overrides"])
+def test_legacy_explicit_null_is_rejected(legacy_source):
+    config = HiggsTtsPipelineConfig(model_path="dummy")
+    stage = next(s for s in config.stages if s.name == "tts_engine")
+    if legacy_source == "factory_args":
+        stage.factory_args["prefill_coalesce_requests"] = None
+    else:
+        config.runtime_overrides[stage.name] = {"prefill_coalesce_requests": None}
+
+    with pytest.raises(ValueError, match="cannot be null"):
+        _ar_stage_args(config, "tts_engine")
+
+
 def test_typed_and_legacy_values_conflict():
     config = HiggsTtsPipelineConfig(model_path="dummy")
     stage = next(s for s in config.stages if s.name == "tts_engine")

@@ -25,6 +25,8 @@ def test_accepts_integral_floats():
 @pytest.mark.parametrize(
     "kwargs",
     [
+        {"prefill_coalesce_requests": None},
+        {"prefill_coalesce_wait_ms": None},
         {"prefill_coalesce_requests": -1},
         {"prefill_coalesce_wait_ms": 0.0},
         {"prefill_coalesce_wait_ms": float("nan")},

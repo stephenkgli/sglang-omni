@@ -91,8 +91,8 @@ class SchedulingConfig(BaseModel):
 
     Owned by the scheduling layer, not by any model factory: these knobs
     configure ``OmniScheduler`` behavior and are translated into the AR
-    factory's kwargs by ``resolve_stage_factory_args``. ``None`` means
-    "use the scheduler default".
+    factory's kwargs by ``resolve_stage_factory_args``. Omitted fields use the
+    scheduler defaults; explicit nulls are rejected as ambiguous.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -104,7 +104,10 @@ class SchedulingConfig(BaseModel):
     @classmethod
     def _validate_requests(cls, value: Any) -> Any:
         if value is None:
-            return None
+            raise ValueError(
+                "prefill_coalesce_requests cannot be null; omit it to use the "
+                "scheduler default or use 0 to disable coalescing"
+            )
         # Note (maydomine): Reject lossy coercions before int() can silently
         # turn invalid YAML values into valid but unintended settings.
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -132,7 +135,10 @@ class SchedulingConfig(BaseModel):
     @classmethod
     def _validate_wait_ms(cls, value: Any) -> Any:
         if value is None:
-            return None
+            raise ValueError(
+                "prefill_coalesce_wait_ms cannot be null; omit it to use the "
+                "scheduler default"
+            )
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("prefill_coalesce_wait_ms must be a number")
         try:

@@ -884,8 +884,14 @@ def apply_prefill_coalesce_cli_overrides(
 
     try:
         cli_values = SchedulingConfig(
-            prefill_coalesce_requests=prefill_coalesce_requests,
-            prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+            **{
+                name: value
+                for name, value in {
+                    "prefill_coalesce_requests": prefill_coalesce_requests,
+                    "prefill_coalesce_wait_ms": prefill_coalesce_wait_ms,
+                }.items()
+                if value is not None
+            }
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -917,8 +923,10 @@ def apply_prefill_coalesce_cli_overrides(
         overrides = pipeline_config.runtime_overrides.get(stage.name, {})
         if "prefill_coalesce_requests" in overrides:
             raw_value = overrides["prefill_coalesce_requests"]
+        elif "prefill_coalesce_requests" in stage.factory_args:
+            raw_value = stage.factory_args["prefill_coalesce_requests"]
         else:
-            raw_value = stage.factory_args.get("prefill_coalesce_requests")
+            return 0
         try:
             validated = SchedulingConfig(prefill_coalesce_requests=raw_value)
         except ValueError as exc:
