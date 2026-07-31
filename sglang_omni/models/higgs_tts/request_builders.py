@@ -54,15 +54,6 @@ class HiggsSGLangRequestData(SGLangARRequestData):
 _HiggsRequestBuilder = Callable[[StagePayload], HiggsSGLangRequestData]
 _HiggsResultAdapter = Callable[[HiggsSGLangRequestData], StagePayload]
 _VOCODER_REQUEST_PARAMS = ("stream", INITIAL_CODEC_CHUNK_FRAMES_PARAM)
-_VOCODER_STATE_FIELDS = (
-    "num_codebooks",
-    "codebook_size",
-    "output_codes_delayed",
-    "omni_rollout",
-    "prompt_tokens",
-    "completion_tokens",
-    "engine_time_s",
-)
 
 
 def _perf_counter() -> float:
@@ -92,11 +83,9 @@ def _normalize_reference_codes(codes: Any) -> torch.Tensor | None:
 
 
 def _vocoder_request(request: OmniRequest) -> OmniRequest:
+    # params was already type-checked by build_higgs_stream_metadata earlier in
+    # request_builder; the vocoder only ever reads these two keys.
     params = request.params
-    if not isinstance(params, dict):
-        raise TypeError(
-            f"Higgs request params must be a dict, got {type(params).__name__}"
-        )
     return OmniRequest(
         inputs=None,
         params={key: params[key] for key in _VOCODER_REQUEST_PARAMS if key in params},
@@ -239,23 +228,6 @@ def apply_higgs_result(state: HiggsTtsState, data: HiggsSGLangRequestData) -> No
     state.prompt_tokens = len(data.input_ids)
 
 
-def project_tts_engine_to_vocoder(payload: StagePayload) -> StagePayload:
-    """Keep the final vocoder hop free of frontend and generation-only state."""
-    if not isinstance(payload.data, dict):
-        raise TypeError(
-            f"Higgs TTS payload data must be a dict, got {type(payload.data).__name__}"
-        )
-    return StagePayload(
-        request_id=payload.request_id,
-        request=payload.request,
-        data={
-            key: payload.data[key]
-            for key in _VOCODER_STATE_FIELDS
-            if key in payload.data
-        },
-    )
-
-
 def make_higgs_scheduler_adapters(
     *,
     max_new_tokens_cap: int | None = None,
@@ -315,5 +287,4 @@ __all__ = [
     "build_higgs_stream_metadata",
     "build_sglang_higgs_request",
     "make_higgs_scheduler_adapters",
-    "project_tts_engine_to_vocoder",
 ]

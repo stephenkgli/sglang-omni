@@ -28,7 +28,11 @@ DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES = 20
 
 
 def _delayed_rows_tensor(rows: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
-    """``[L, N]`` int64 view of delayed rows."""
+    """``[L, N]`` int64 delayed rows.
+
+    Allocates whenever the input is a row list (stacked) or a non-int64 tensor
+    (converted); only an int64 tensor passes through untouched.
+    """
     if isinstance(rows, torch.Tensor):
         return rows.to(dtype=torch.long)
     if len(rows) == 0:
@@ -228,7 +232,7 @@ class HiggsStreamingVocoderScheduler(StreamingVocoderBase[_HiggsStreamState, Non
             0, state.emitted_raw_frames - self._stream_overlap_tokens
         )
         rows_end = emit_until_raw + num_codebooks - 1
-        rows = state.delayed_rows[window_start_raw:rows_end]
+        rows = _delayed_rows_tensor(state.delayed_rows[window_start_raw:rows_end])
         audio = self._decode_delayed_rows(
             rows,
             num_codebooks=num_codebooks,
@@ -440,12 +444,11 @@ class HiggsStreamingVocoderScheduler(StreamingVocoderBase[_HiggsStreamState, Non
 
     def _decode_delayed_rows(
         self,
-        rows: torch.Tensor | list[torch.Tensor],
+        delayed_LN: torch.Tensor,
         *,
         num_codebooks: int,
         codebook_size: int,
     ) -> torch.Tensor:
-        delayed_LN = _delayed_rows_tensor(rows)
         if delayed_LN.shape[0] < int(num_codebooks):
             raise ValueError(
                 f"Higgs delayed rows must include at least {num_codebooks} rows, "
