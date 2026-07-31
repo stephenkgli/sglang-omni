@@ -55,7 +55,6 @@ def test_higgs_scheduler_adapters_clamp_cap_and_record_engine_time(
     assert data.stage_payload.request.metadata == {}
     data.output_codes.append(torch.tensor([1, 2, 3], dtype=torch.long))
     result = result_adapter(data)
-    projected = request_builders.project_tts_engine_to_vocoder(result)
 
     assert data.max_new_tokens == 2048
     assert data.req.sampling_params.max_new_tokens == 2048
@@ -65,16 +64,13 @@ def test_higgs_scheduler_adapters_clamp_cap_and_record_engine_time(
     )
     assert result.data["completion_tokens"] == 1
     assert result.data["engine_time_s"] == 2.5
-    assert set(projected.data) == {
-        "num_codebooks",
-        "codebook_size",
-        "output_codes_delayed",
-        "prompt_tokens",
-        "completion_tokens",
-        "engine_time_s",
-    }
-    assert "prompt_token_ids" not in projected.data
-    assert "reference_codes_delayed" not in projected.data
+    # The result adapter rebuilds the state from the engine's own contract, so
+    # frontend fields cannot ride the vocoder hop even though the inbound
+    # payload carried them.
+    assert result.data["num_codebooks"] == data.num_codebooks
+    assert result.data["codebook_size"] == data.codebook_size
+    assert result.data["prompt_token_ids"] == []
+    assert "reference_codes_delayed" not in result.data
     assert reset_calls == ["req-higgs"]
 
 
