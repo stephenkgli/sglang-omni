@@ -1144,15 +1144,21 @@ PY
 }
 
 start_server() {
-  local server_mps_env=(
+  local server_env_options=(
     -u CUDA_MPS_PIPE_DIRECTORY
     -u CUDA_MPS_LOG_DIRECTORY
     -u CUDA_MPS_ACTIVE_THREAD_PERCENTAGE
     -u CUDA_MPS_PINNED_DEVICE_MEM_LIMIT
     -u CUDA_MPS_CLIENT_PRIORITY
+    -u CUDA_VISIBLE_DEVICES
   )
+  local server_device_env=(CUDA_VISIBLE_DEVICES="${GPU_SELECTOR}")
   if [[ "${SERVER_MPS_ENABLED}" == "1" ]]; then
-    server_mps_env+=(
+    # The MPS daemon remaps its selected physical GPU to client ordinal 0.
+    # Keeping a non-zero physical CUDA_VISIBLE_DEVICES index in the client
+    # would filter that remapped device out. NVIDIA therefore requires MPS
+    # clients to leave CUDA_VISIBLE_DEVICES unset.
+    server_device_env=(
       CUDA_MPS_PIPE_DIRECTORY="${SERVER_MPS_PIPE_DIRECTORY}"
       CUDA_MPS_LOG_DIRECTORY="${SERVER_MPS_LOG_DIRECTORY}"
     )
@@ -1162,9 +1168,9 @@ start_server() {
     taskset
     --cpu-list "${SERVER_CPUSET}"
     env
-    "${server_mps_env[@]}"
+    "${server_env_options[@]}"
+    "${server_device_env[@]}"
     PATH="${PYTHON_BIN_DIR}:${PATH}"
-    CUDA_VISIBLE_DEVICES="${GPU_SELECTOR}"
     PYTHONPATH="${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
     OMP_NUM_THREADS="${SERVER_THREADS}"
     MKL_NUM_THREADS="${SERVER_THREADS}"
@@ -1492,6 +1498,7 @@ main() {
     "server_mps_pipe_directory=${SERVER_MPS_PIPE_DIRECTORY:-disabled}" \
     "server_mps_log_directory=${SERVER_MPS_LOG_DIRECTORY:-disabled}" \
     "server_mps_attachment_gate=exact_configured_gpu_process_pid_set" \
+    "server_cuda_visible_devices=$([[ "${SERVER_MPS_ENABLED}" == "1" ]] && printf 'unset_mps_remapped_ordinal_0' || printf '%s' "${GPU_SELECTOR}")" \
     "vocoder_process=isolated" \
     "vocoder_compile_decode=false" \
     "vocoder_decode_cuda_graph_frame_counts=1..${DECODE_CUDA_GRAPH_MAX_FRAMES}" \

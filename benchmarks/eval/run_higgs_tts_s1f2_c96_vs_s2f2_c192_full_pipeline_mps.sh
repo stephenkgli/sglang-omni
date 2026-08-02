@@ -616,6 +616,7 @@ for spec in specs:
         "scheduler_cuda_graph_max_bs_each": "96",
         "server_mps_mode": "required",
         "server_mps_enabled": "1",
+        "server_cuda_visible_devices": "unset_mps_remapped_ordinal_0",
         "vocoder_process": "isolated",
         "vocoder_compile_decode": "false",
         "vocoder_decode_cuda_graph_frame_counts": "1..512",
@@ -781,6 +782,7 @@ main() {
     "mps_scope=all_gpu_processes_in_server_tree" \
     "mps_daemon=fresh_private_daemon_per_arm" \
     "mps_active_thread_percentage=default_100" \
+    "mps_client_cuda_visible_devices=unset;daemon-selected GPU is client ordinal 0" \
     "seconds=${SECS}" \
     "warmup_seconds=${WARMUP_SECS}" \
     "measurement_seconds=$((SECS - WARMUP_SECS))" \
