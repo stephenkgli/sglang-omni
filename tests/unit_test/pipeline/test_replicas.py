@@ -120,6 +120,25 @@ class TestExpandReplicaStages:
         assert [s.gpu for s in expanded] == [None, None]
         assert topo.to_dict() == {"s": ["s@r0", "s@r1"]}
 
+    def test_expansion_preserves_stage_env_for_every_replica(self):
+        stage_env = {
+            "CUDA_MPS_PIPE_DIRECTORY": "/tmp/private-mps/pipe",
+            "CUDA_MPS_LOG_DIRECTORY": "/tmp/private-mps/log",
+        }
+        expanded, _ = expand_replica_stages(
+            [
+                _stage(
+                    "tts_engine",
+                    gpu=0,
+                    num_replicas=2,
+                    replica_devices="0,0",
+                    env=stage_env,
+                )
+            ]
+        )
+
+        assert [stage.env for stage in expanded] == [stage_env, stage_env]
+
 
 class TestValidateDeviceAssignment:
     def test_valid_ids_pass(self):
