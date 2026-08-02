@@ -52,6 +52,7 @@ readonly SCHEDULER_MEMORY_FRACTION="${SCHEDULER_MEMORY_FRACTION:-0.85}"
 readonly SERVER_MPS_MODE="${SERVER_MPS_MODE:-disabled}"
 readonly SERVER_MPS_PIPE_DIRECTORY="${SERVER_MPS_PIPE_DIRECTORY:-}"
 readonly SERVER_MPS_LOG_DIRECTORY="${SERVER_MPS_LOG_DIRECTORY:-}"
+readonly SERVER_MPS_GPU_UUID="${SERVER_MPS_GPU_UUID:-}"
 # CAP and CUDA_GRAPH_MAX_BS describe the logical tts_engine stage.  Runtime
 # overrides are copied to every physical replica, so divide them here instead
 # of accidentally provisioning CAP independently on every scheduler replica.
@@ -82,6 +83,7 @@ PREFILL_COALESCING_ENABLED=""
 PREFILL_COALESCE_REQUESTS_EFFECTIVE="disabled"
 PREFILL_COALESCE_WAIT_MS_EFFECTIVE="disabled"
 SERVER_MPS_ENABLED="0"
+SERVER_CUDA_VISIBLE_DEVICES_EFFECTIVE=""
 
 SERVER_PID=""
 GPU_QUERY_PID=""
@@ -281,7 +283,10 @@ resolve_server_mps() {
         || die "disabled server MPS cannot receive a pipe directory"
       [[ -z "${SERVER_MPS_LOG_DIRECTORY}" ]] \
         || die "disabled server MPS cannot receive a log directory"
+      [[ -z "${SERVER_MPS_GPU_UUID}" ]] \
+        || die "disabled server MPS cannot receive a GPU UUID"
       SERVER_MPS_ENABLED="0"
+      SERVER_CUDA_VISIBLE_DEVICES_EFFECTIVE="${GPU_SELECTOR}"
       ;;
     required)
       [[ "${SERVER_MPS_PIPE_DIRECTORY}" == /* ]] \
@@ -298,6 +303,8 @@ resolve_server_mps() {
         || die "server MPS pipe directory is not writable"
       [[ -w "${SERVER_MPS_LOG_DIRECTORY}" ]] \
         || die "server MPS log directory is not writable"
+      [[ "${SERVER_MPS_GPU_UUID}" == GPU-* ]] \
+        || die "SERVER_MPS_GPU_UUID must be the daemon-selected GPU UUID"
       local inherited_mps_name
       for inherited_mps_name in \
         CUDA_MPS_PIPE_DIRECTORY \
@@ -310,6 +317,17 @@ resolve_server_mps() {
         fi
       done
       SERVER_MPS_ENABLED="1"
+      local observed_gpu_uuid
+      observed_gpu_uuid="$(
+        nvidia-smi -i "${GPU_ID}" --query-gpu=uuid \
+          --format=csv,noheader,nounits | tr -d '[:space:]'
+      )" || die "failed to resolve the selected physical GPU UUID"
+      [[ "${observed_gpu_uuid}" == GPU-* ]] \
+        || die "invalid selected physical GPU UUID: ${observed_gpu_uuid}"
+      [[ "${SERVER_MPS_GPU_UUID}" == "${observed_gpu_uuid}" ]] \
+        || die \
+          "MPS daemon/client GPU UUID mismatch: ${SERVER_MPS_GPU_UUID} != ${observed_gpu_uuid}"
+      SERVER_CUDA_VISIBLE_DEVICES_EFFECTIVE="${SERVER_MPS_GPU_UUID}"
       ;;
     *)
       die "SERVER_MPS_MODE must be disabled or required"
@@ -1152,13 +1170,16 @@ start_server() {
     -u CUDA_MPS_CLIENT_PRIORITY
     -u CUDA_VISIBLE_DEVICES
   )
-  local server_device_env=(CUDA_VISIBLE_DEVICES="${GPU_SELECTOR}")
+  local server_device_env=(
+    CUDA_VISIBLE_DEVICES="${SERVER_CUDA_VISIBLE_DEVICES_EFFECTIVE}"
+  )
   if [[ "${SERVER_MPS_ENABLED}" == "1" ]]; then
-    # The MPS daemon remaps its selected physical GPU to client ordinal 0.
-    # Keeping a non-zero physical CUDA_VISIBLE_DEVICES index in the client
-    # would filter that remapped device out. NVIDIA therefore requires MPS
-    # clients to leave CUDA_VISIBLE_DEVICES unset.
+    # Use the same UUID as the private MPS daemon. Numeric selectors are
+    # ambiguous after MPS remaps devices, while leaving this unset lets
+    # PyTorch's NVML path count unrelated host GPUs before CUDA sees the
+    # daemon's one-device namespace.
     server_device_env=(
+      CUDA_VISIBLE_DEVICES="${SERVER_CUDA_VISIBLE_DEVICES_EFFECTIVE}"
       CUDA_MPS_PIPE_DIRECTORY="${SERVER_MPS_PIPE_DIRECTORY}"
       CUDA_MPS_LOG_DIRECTORY="${SERVER_MPS_LOG_DIRECTORY}"
     )
@@ -1497,8 +1518,10 @@ main() {
     "server_mps_scope=all_gpu_processes_in_server_tree" \
     "server_mps_pipe_directory=${SERVER_MPS_PIPE_DIRECTORY:-disabled}" \
     "server_mps_log_directory=${SERVER_MPS_LOG_DIRECTORY:-disabled}" \
+    "server_mps_gpu_uuid=${SERVER_MPS_GPU_UUID:-disabled}" \
     "server_mps_attachment_gate=exact_configured_gpu_process_pid_set" \
-    "server_cuda_visible_devices=$([[ "${SERVER_MPS_ENABLED}" == "1" ]] && printf 'unset_mps_remapped_ordinal_0' || printf '%s' "${GPU_SELECTOR}")" \
+    "server_cuda_visible_devices=${SERVER_CUDA_VISIBLE_DEVICES_EFFECTIVE}" \
+    "server_cuda_visible_devices_mode=$([[ "${SERVER_MPS_ENABLED}" == "1" ]] && printf 'gpu_uuid' || printf 'physical_numeric_index')" \
     "vocoder_process=isolated" \
     "vocoder_compile_decode=false" \
     "vocoder_decode_cuda_graph_frame_counts=1..${DECODE_CUDA_GRAPH_MAX_FRAMES}" \

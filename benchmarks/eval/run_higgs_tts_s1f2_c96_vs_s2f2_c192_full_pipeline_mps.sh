@@ -46,6 +46,7 @@ RUN_ROOT=""
 STATUS_FILE=""
 MPS_STATE=""
 MPS_CONTROL_PID=""
+MPS_GPU_UUID=""
 MPS_ARTIFACT_DIR=""
 COMPLETED=0
 
@@ -162,12 +163,11 @@ start_private_mps() {
   ensure_no_mps_daemon
   ensure_gpu_idle
 
-  local gpu_uuid
-  gpu_uuid="$(
+  MPS_GPU_UUID="$(
     nvidia-smi -i "${GPU_SELECTOR}" --query-gpu=uuid \
       --format=csv,noheader,nounits | tr -d '[:space:]'
   )"
-  [[ -n "${gpu_uuid}" ]] || die "failed to resolve GPU UUID"
+  [[ "${MPS_GPU_UUID}" == GPU-* ]] || die "failed to resolve GPU UUID"
 
   MPS_STATE="$(mktemp -d /tmp/higgs-topology-full-mps.XXXXXX)"
   MPS_ARTIFACT_DIR="${arm_dir}/mps-daemon"
@@ -176,7 +176,7 @@ start_private_mps() {
   printf '%s\n' \
     "arm=${label}" \
     "gpu_selector=${GPU_SELECTOR}" \
-    "gpu_uuid=${gpu_uuid}" \
+    "gpu_uuid=${MPS_GPU_UUID}" \
     "scope=all_gpu_processes_in_server_tree" \
     > "${MPS_STATE}/manifest.txt"
 
@@ -184,7 +184,7 @@ start_private_mps() {
     -u CUDA_MPS_ACTIVE_THREAD_PERCENTAGE \
     -u CUDA_MPS_PINNED_DEVICE_MEM_LIMIT \
     -u CUDA_MPS_CLIENT_PRIORITY \
-    CUDA_VISIBLE_DEVICES="${gpu_uuid}" \
+    CUDA_VISIBLE_DEVICES="${MPS_GPU_UUID}" \
     CUDA_MPS_PIPE_DIRECTORY="${MPS_STATE}/pipe" \
     CUDA_MPS_LOG_DIRECTORY="${MPS_STATE}/log" \
     nvidia-cuda-mps-control -d \
@@ -245,6 +245,7 @@ stop_private_mps() {
   remove_private_mps_state
   MPS_STATE=""
   MPS_CONTROL_PID=""
+  MPS_GPU_UUID=""
   MPS_ARTIFACT_DIR=""
 }
 
@@ -444,6 +445,7 @@ run_arm() {
     SERVER_MPS_MODE=required \
     SERVER_MPS_PIPE_DIRECTORY="${MPS_STATE}/pipe" \
     SERVER_MPS_LOG_DIRECTORY="${MPS_STATE}/log" \
+    SERVER_MPS_GPU_UUID="${MPS_GPU_UUID}" \
     REPS=1 \
     RUN_DIR="${arm_dir}" \
     REPO_DIR="${REPO_DIR}" \
@@ -535,6 +537,11 @@ for spec in specs:
         for line in (arm_dir / "benchmark-contract.txt").read_text().splitlines()
         if "=" in line
     )
+    mps_daemon_contract = dict(
+        line.split("=", 1)
+        for line in (arm_dir / "mps-daemon/manifest.txt").read_text().splitlines()
+        if "=" in line
+    )
     observed_commit = (arm_dir / "manifest/git-commit.txt").read_text().strip()
     if observed_commit != source_commit:
         raise SystemExit(
@@ -593,6 +600,24 @@ for spec in specs:
         raise SystemExit(f"expected one MPS server in {spec['label']}")
     if len(attachment.get("mps_client_pids", [])) != expected_gpu_processes:
         raise SystemExit(f"MPS client count mismatch in {spec['label']}")
+    client_gpu_uuid = contract.get("server_cuda_visible_devices", "")
+    configured_daemon_gpu_uuid = contract.get("server_mps_gpu_uuid", "")
+    daemon_gpu_uuid = mps_daemon_contract.get("gpu_uuid", "")
+    if not client_gpu_uuid.startswith("GPU-"):
+        raise SystemExit(
+            f"MPS client did not use a GPU UUID in {spec['label']}: "
+            f"{client_gpu_uuid!r}"
+        )
+    if client_gpu_uuid != daemon_gpu_uuid:
+        raise SystemExit(
+            f"MPS daemon/client GPU UUID mismatch in {spec['label']}: "
+            f"{daemon_gpu_uuid!r} != {client_gpu_uuid!r}"
+        )
+    if configured_daemon_gpu_uuid != daemon_gpu_uuid:
+        raise SystemExit(
+            f"MPS runner/daemon GPU UUID mismatch in {spec['label']}: "
+            f"{configured_daemon_gpu_uuid!r} != {daemon_gpu_uuid!r}"
+        )
 
     stages = {stage["name"]: stage for stage in config["stages"]}
     expected_stage_replicas = {
@@ -616,7 +641,7 @@ for spec in specs:
         "scheduler_cuda_graph_max_bs_each": "96",
         "server_mps_mode": "required",
         "server_mps_enabled": "1",
-        "server_cuda_visible_devices": "unset_mps_remapped_ordinal_0",
+        "server_cuda_visible_devices_mode": "gpu_uuid",
         "vocoder_process": "isolated",
         "vocoder_compile_decode": "false",
         "vocoder_decode_cuda_graph_frame_counts": "1..512",
@@ -782,7 +807,7 @@ main() {
     "mps_scope=all_gpu_processes_in_server_tree" \
     "mps_daemon=fresh_private_daemon_per_arm" \
     "mps_active_thread_percentage=default_100" \
-    "mps_client_cuda_visible_devices=unset;daemon-selected GPU is client ordinal 0" \
+    "mps_client_cuda_visible_devices=same GPU UUID as private daemon;client ordinal is 0" \
     "seconds=${SECS}" \
     "warmup_seconds=${WARMUP_SECS}" \
     "measurement_seconds=$((SECS - WARMUP_SECS))" \
