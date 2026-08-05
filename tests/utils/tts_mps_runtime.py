@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import socket
 import subprocess
@@ -18,13 +17,14 @@ from typing import Any
 
 import requests
 
+from sglang_omni.mps import (
+    RUN_ID_PATTERN,
+    MpsRunPaths,
+    validate_control_socket,
+)
+from sglang_omni.mps import derive_core_blocks as derive_core_blocks
+
 REPLICA_COUNT = 2
-RUN_ID_PATTERN = re.compile(r"run-[A-Za-z0-9_-]+")
-# AF_UNIX sun_path is 108 bytes including the terminator on Linux.
-SUN_PATH_LIMIT = 107
-# Two pinned cores per replica.
-MINIMUM_CORES = 2 * REPLICA_COUNT
-HOST_RESERVE_RATIO = 0.25
 
 
 def atomic_write_json(path: str | Path, payload: dict[str, Any]) -> None:
@@ -101,82 +101,6 @@ def update_summary(path: str | Path, **sections: Any) -> dict[str, Any]:
     return payload
 
 
-def parse_cpu_list(value: str) -> list[int]:
-    cpus: list[int] = []
-    for item in value.split(","):
-        start, separator, end = item.strip().partition("-")
-        if not start:
-            continue
-        first = int(start)
-        last = int(end) if separator else first
-        if last < first:
-            raise ValueError(f"invalid CPU range {item!r}")
-        cpus.extend(range(first, last + 1))
-    return cpus
-
-
-def format_cpu_list(cpus: list[int]) -> str:
-    if not cpus:
-        raise ValueError("CPU block cannot be empty")
-    ranges: list[str] = []
-    start = previous = cpus[0]
-    for cpu in cpus[1:]:
-        if cpu == previous + 1:
-            previous = cpu
-            continue
-        ranges.append(str(start) if start == previous else f"{start}-{previous}")
-        start = previous = cpu
-    ranges.append(str(start) if start == previous else f"{start}-{previous}")
-    return ",".join(ranges)
-
-
-def derive_core_blocks(
-    gpu_id: int,
-    *,
-    pci_devices_root: Path = Path("/sys/bus/pci/devices"),
-    numa_nodes_root: Path = Path("/sys/devices/system/node"),
-) -> tuple[str, str]:
-    result = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-gpu=pci.bus_id",
-            "--format=csv,noheader",
-            "-i",
-            str(gpu_id),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    bus_id = result.stdout.strip().lower()
-    try:
-        domain, bus, device = bus_id.split(":")
-        pci_device = pci_devices_root / f"{int(domain, 16):04x}:{bus}:{device}"
-    except ValueError as exc:
-        raise RuntimeError(f"invalid PCI bus ID for GPU {gpu_id}: {bus_id!r}") from exc
-    if not pci_device.is_dir():
-        raise RuntimeError(f"cannot resolve one PCI device for GPU {gpu_id}")
-    numa_node = int((pci_device / "numa_node").read_text().strip())
-    if numa_node < 0:
-        raise RuntimeError(f"GPU {gpu_id} has no usable NUMA node")
-    node_cpus = set(
-        parse_cpu_list(
-            (numa_nodes_root / f"node{numa_node}" / "cpulist").read_text().strip()
-        )
-    )
-    allowed = sorted(node_cpus & set(os.sched_getaffinity(0)))
-    if len(allowed) < MINIMUM_CORES:
-        raise RuntimeError(
-            f"MPS DP2 requires {MINIMUM_CORES} allowed CPU cores on the GPU "
-            f"NUMA node, found {len(allowed)}"
-        )
-    # Reserve a slice for host-side work, but never below the hard minimum, so
-    # a host that does have enough cores is not reported as insufficient.
-    usable = allowed[: max(MINIMUM_CORES, int(len(allowed) * (1 - HOST_RESERVE_RATIO)))]
-    split = len(usable) // 2
-    return format_cpu_list(usable[:split]), format_cpu_list(usable[split:])
-
-
 def require_exact_request_counts(
     summary: dict[str, Any],
     *,
@@ -219,16 +143,7 @@ class MpsLaunchSpec:
             raise ValueError(f"MPS config does not exist: {self.config_path}")
         if not (self.repository_root / "examples/mps_dp/launch.sh").is_file():
             raise ValueError("production MPS launcher does not exist")
-        socket_bytes = len(str(self.control_socket).encode())
-        if socket_bytes > SUN_PATH_LIMIT:
-            # Note: (Jiaxin Deng) over the limit the daemon starts, fails to
-            # bind, and exits, and the launcher only ever reports "Cannot find
-            # MPS control daemon process". Name the real cause here instead.
-            raise ValueError(
-                f"MPS control socket path is {socket_bytes} bytes, over the "
-                f"{SUN_PATH_LIMIT}-byte AF_UNIX sun_path limit: "
-                f"{self.control_socket}. Use a shorter state root."
-            )
+        validate_control_socket(self.control_socket)
 
     @property
     def command(self) -> tuple[str, ...]:
@@ -248,12 +163,16 @@ class MpsLaunchSpec:
         )
 
     @property
+    def _run_paths(self) -> MpsRunPaths:
+        return MpsRunPaths(self.state_root, self.gpu_id, self.run_id)
+
+    @property
     def state_dir(self) -> Path:
-        return self.state_root / f"gpu-{self.gpu_id}" / self.run_id
+        return self._run_paths.state_dir
 
     @property
     def control_socket(self) -> Path:
-        return self.state_dir / "mps" / "pipe" / "control"
+        return self._run_paths.control_socket
 
     @property
     def worker_urls(self) -> tuple[str, ...]:
