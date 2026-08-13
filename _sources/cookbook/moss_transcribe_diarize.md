@@ -77,7 +77,7 @@ The optimization stack mirrors [what we built for TTS](https://github.com/zhaoch
 
 **Encoder Torch Compile (opt-in).** `encoder_torch_compile=True` swaps the encoder CUDA graph for `torch.compile` (default mode) with kernel fusion. The two are mutually exclusive. Reduce-overhead mode must not be used: its cudagraph trees corrupt memory alongside the decode CUDA graphs that always run in this process (illegal memory access after ~60s of serving). The cost is a one-time per-bucket compile at startup; `dynamic=False` means only the warmed chunk counts are accelerated, anything else runs eager.
 
-**Async Decode.** Same one-step lookahead as TTS: launch the current decode step's GPU work, then resolve the previous step's host-side work (D2H copy, finish detection, result dispatch) in parallel. Falls back to synchronous mode at batch size 1, where the host work is too small to overlap. Two alternating pinned host buffers prevent read/write races between the GPU's async D2H write and the CPU's read. For the full mechanism and code pointers, see [Asynchronous Decode + Lookahead](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/sglang/sglang-omni/tts-optimization.md#asynchronous-decode--lookahead) in the TTS optimization guide.
+**Async Decode.** Same one-step lookahead as TTS: launch the current decode step's GPU work, then resolve the previous step's host-side work (D2H copy, finish detection, result dispatch) in parallel. MOSS-TD enables lookahead starting at batch size 1 by default. Set `--async-lookahead-min-batch-size 2` to keep batch-size-1 decode synchronous, or use `--decode-mode sync` to disable lookahead for the stage. Two alternating pinned host buffers prevent read/write races between the GPU's async D2H write and the CPU's read. For the full mechanism and code pointers, see [Asynchronous Decode + Lookahead](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/sglang/sglang-omni/tts-optimization.md#asynchronous-decode--lookahead) in the TTS optimization guide.
 
 **LRU Encoder Cache.** The Whisper encoder forward is deterministic for identical input audio — same waveform always produces the same embeddings. We exploit this with an LRU cache (max 64 entries, 4 GB budget) that stores encoder outputs on CPU, keyed by a content hash of the input waveform. On a cache hit the stored tensor is transferred back to GPU asynchronously, skipping the encoder entirely. On a miss the encoder runs normally and the result is moved to CPU for storage. The cache evicts by both entry count and total bytes, always dropping the least-recently-used entry first.
 
@@ -109,6 +109,14 @@ sgl-omni serve \
   --cuda-graph-max-bs 16 \
   --mem-fraction-static 0.80
 ```
+
+MOSS-TD briefly holds newly built LM requests to admit larger prefills. The
+default target is 4 requests with a 12 ms oldest-request deadline. While more
+request builds are pending, the scheduler waits for either limit; after build
+work drains, it releases immediately only when decode is idle. During active
+decode, it continues coalescing until the target or deadline. Override the two
+limits with `--prefill-coalesce-requests` and `--prefill-coalesce-wait-ms`, or
+set the request target to `0` to disable coalescing.
 
 ### Sending Requests
 
@@ -144,7 +152,7 @@ for segment in payload.get("segments", []):
     )
 ```
 
-For longer multi-speaker audio, raise `max_new_tokens` so the decoder can finish the full diarized transcript. The example below uses a repo-local clip with two speakers:
+When a request omits `max_new_tokens`, the server sizes the output budget from the audio duration. The default is `max(5120, 10 tokens per audio second)`, so a 60 minute recording gets a 36000 token budget without any client changes. Operators can pin a fixed `max_new_tokens` in the stage config, which disables duration scaling for requests that omit the field. An explicit `max_new_tokens` in the request always wins over both defaults. The scheduler clamps the final value to the context remaining after the audio prompt, so large explicit values are safe to send. Set the field explicitly when you want a hard cap or a larger budget than the default, as in this example with a clip from the repo that has two speakers:
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/transcriptions \
@@ -163,7 +171,7 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 | `language` | string | unset | Optional language hint |
 | `response_format` | string | `json` | `json`, `verbose_json`, or `text` |
 | `temperature` | float | model default (`0.0`) | Sampling temperature |
-| `max_new_tokens` | int | `5120` | Max generated tokens; raise for long audio (e.g. `65536`) |
+| `max_new_tokens` | int | duration scaled | Max generated tokens. Omitted requests default to `max(5120, 10 * audio seconds)`, or to the fixed stage value when the operator configured one. Explicit values always win and are clamped to the remaining model context |
 | `prompt` | string | unset | Optional instruction override; omit to use the built-in transcribe+diarize prompt |
 
 `verbose_json` parses the model markup into OpenAI-style `segments` with
@@ -184,6 +192,15 @@ python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
   --cuda-graph-max-bs 16 \
   --mem-fraction-static 0.80 \
   --output-dir results/moss_transcribe_diarize_movies800times
+
+# note (Xinyu): Add one dedicated request-event profiling pass after the measured
+# evaluation. This pass is excluded from reported accuracy and speed metrics.
+python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
+  --dataset movies800times \
+  --concurrency 16 \
+  --profile-events \
+  --profile-event-dir /tmp/moss_td_bench_profile \
+  --output-dir results/moss_transcribe_diarize_movies800times_profile
 
 # Long-sequence ASR / diarization
 python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
@@ -207,6 +224,14 @@ python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
   --request-timeout-s 1800 \
   --output-dir results/moss_transcribe_diarize_googletime
 ```
+
+`--profile-events` starts request-level event recording through the serve
+profiler endpoints, runs one extra pass, and adds its `stage_breakdown`,
+`hop_breakdown`, and speed metrics under `profile` in both
+`transcribe_diarize_results.json` and `transcribe_diarize_speed_results.json`.
+The event directory is a server-side path, so report generation requires the
+benchmark process to see the same filesystem. For router or DP deployments,
+pass every worker serve URL with a comma-separated `--profile-urls` value.
 
 ## Benchmark Results
 

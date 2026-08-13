@@ -42,7 +42,7 @@
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
-    <script src="../_static/documentation_options.js?v=a1637f0b"></script>
+    <script src="../_static/documentation_options.js?v=1a9ffd16"></script>
     <script src="../_static/doctools.js?v=fd6eb6e6"></script>
     <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -51,7 +51,7 @@
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'cookbook/arkasr';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
-    <script src="../_static/js/qwen3_omni_server_generator.js?v=94f3a115"></script>
+    <script src="../_static/js/qwen3_omni_server_generator.js?v=66f6ff63"></script>
     <script src="../_static/js/ming_omni_server_generator.js?v=694b1473"></script>
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
@@ -60,8 +60,8 @@
     <link rel="prev" title="Fun-ASR-Nano" href="fun_asr.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="Aug 01, 2026"/>
+  <meta name="docsearch:version" content="0.1.1" />
+    <meta name="docbuild:last-update" content="Aug 13, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -207,6 +207,7 @@
         <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/release_notes.html">Release Notes</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
 <ul class="current nav bd-sidenav">
@@ -217,6 +218,8 @@
 <li class="toctree-l1"><a class="reference internal" href="ming_tts.html">Ming-Omni-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="moss_tts.html">MOSS-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="moss_tts_local.html">MOSS-TTS-Local</a></li>
+<li class="toctree-l1"><a class="reference internal" href="dots_tts.html">dots.tts</a></li>
+<li class="toctree-l1"><a class="reference internal" href="minimax_music3.html">MiniMax Music 3</a></li>
 <li class="toctree-l1"><a class="reference internal" href="zonos2.html">ZONOS2</a></li>
 <li class="toctree-l1"><a class="reference internal" href="qwen3_asr.html">Qwen3-ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="fun_asr.html">Fun-ASR-Nano</a></li>
@@ -248,6 +251,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/communication.html">Communication</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/reference_encode_service.html">Reference Encode Service</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/profiler.html">Request-level profiler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/qwen3_asr_concurrency_profile.html">Qwen3-ASR High-Concurrency Benchmark and Bottleneck Profile</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/rl_admin_control.html">RL Admin Control</a></li>
 </ul>
 
@@ -525,9 +529,44 @@ first launch will prompt to execute the checkpoint’s bundled code.</p>
 </section>
 <section id="server-configuration">
 <h2>Server Configuration<a class="headerlink" href="#server-configuration" title="Link to this heading">#</a></h2>
-<p>ARK-ASR runs a single ASR stage on one GPU, in <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code> by default.</p>
+<p>ARK-ASR runs a single ASR stage on one GPU, in <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code> by default.
+Async decode is enabled by default for decode batches of at least two requests,
+allowing the shared one-step-lookahead path to overlap host-side result
+processing with the next GPU decode forward. Use <code class="docutils literal notranslate"><span class="pre">--decode-mode</span> <span class="pre">sync</span></code> to disable
+it, or tune the crossover with <code class="docutils literal notranslate"><span class="pre">--async-lookahead-min-batch-size</span></code>.
+Request concurrency and audio-encoder batching are controlled separately:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">max_running_requests</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">32</span></code> and limits requests admitted by the
+ASR scheduler.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">8</span></code> and limits the number of uncached
+audio items processed by one encoder forward. Larger cache-miss batches are
+processed as sequential encoder microbatches, so request concurrency does
+not directly create an unbounded encoder batch.</p></li>
+</ul>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model-path<span class="w"> </span>AutoArk-AI/ARK-ASR-3B<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span>
+</pre></div>
+</div>
+<p>The encoder activation memory is in addition to the model weights and KV
+cache. For long clips or high concurrency, leave additional runtime headroom
+by lowering SGLang’s static memory fraction, for example:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>AutoArk-AI/ARK-ASR-3B<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.75<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">mem_fraction_static</span></code> controls the SGLang memory budget for model weights and
+the KV-cache pool; it does not replace <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code>. The two
+settings protect different parts of the serving path. ARK does not override
+SGLang’s default static memory fraction; use <code class="docutils literal notranslate"><span class="pre">0.75</span></code> when long clips or high
+concurrency still need additional encoder headroom and the reduced KV-cache
+capacity is acceptable.</p>
+<p>To force synchronous decode while comparing modes, use:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>AutoArk-AI/ARK-ASR-3B<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--decode-mode<span class="w"> </span>sync<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span>
 </pre></div>
 </div>
@@ -775,7 +814,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 01, 2026.
+  Last updated on Aug 13, 2026.
   <br/>
 </p>
   </div>
