@@ -22,28 +22,46 @@ sgl-omni serve --model-path <model> --mps auto
 Modes (`--mps` on the CLI or `mps:` in the pipeline config; default `off`):
 
 * `off`: MPS is never touched.
-* `auto`: a private, GPU-UUID-scoped MPS daemon is started for every GPU that
-  hosts two or more single-GPU, non-TP CUDA processes of this pipeline. GPUs
-  with one process, TP groups, and GPU-spanning processes run without MPS.
-* `on`: like `auto` but a single eligible process is enough, and an
-  MPS-incapable platform is a hard error instead of a warning.
+* `auto`: MPS is enabled on every GPU that hosts two or more single-GPU,
+  non-TP CUDA processes of this pipeline. GPUs with one process, TP groups,
+  and GPU-spanning processes run without MPS.
+* `on`: a single eligible process is enough, and an MPS-incapable platform is
+  a hard error instead of a warning. Use `on` for same-GPU data parallelism:
+  every `serve --mps on` on one GPU joins the same daemon.
+
+The daemon is shared per physical GPU (keyed by device UUID): MPS merges
+kernels only for clients of one server, so the first serve creates the
+daemon, later serves join it, and the last one to leave drains the clients
+and quits it. Same-GPU DP is therefore just N serve commands:
+
+```bash
+sgl-omni serve --model-path <model> --mps on --mem-fraction-static 0.35 --port 8807
+sgl-omni serve --model-path <model> --mps on --mem-fraction-static 0.35 --port 8808
+```
+
+Start replicas one after another and give each an explicit memory budget
+(`--mem-fraction-static` or `--max-total-tokens`), for the same KV-sizing
+reasons described under the script recipe below. Route traffic with the
+[Omni Router](omni_router.md).
 
 The runtime owns the full lifecycle. Every managed process is verified against
 the daemon's client list before serving starts, because a process that misses
 the pipe directory silently falls back to time slicing. A watchdog fails the
-pipeline if the daemon dies mid-serving. Shutdown drains clients before
-quitting the daemon and removes all state. After a hard kill of the server,
-the next start reclaims what the previous run left behind (orphaned stage
-processes and the idle daemon), under an ownership proof recorded at startup,
-so a crashed run does not block the next one. State directories that belong to
-a still-running pipeline or to another user's daemon are never touched.
+pipeline if the daemon dies mid-serving. Shutdown drains this serve's clients
+and quits the daemon only when no other serve still owns it. After a hard
+kill, the next start reclaims what the dead runs left behind (orphaned stage
+processes, and the daemon is adopted or replaced) under ownership records
+kept next to the daemon, so a crashed run does not block the next one. State
+that belongs to a still-running serve or to another user's daemon is never
+touched.
 
-Scope: native MPS covers colocation inside one pipeline. Running N complete
-serving replicas behind N ports still uses `examples/mps_dp/launch.sh` below,
-which also owns the opt-in CUDA IPC weight sharing; combining `WEIGHT_SHARE=1`
-with `--mps` is rejected. Note that N independent `serve --mps` commands on
-one GPU create N daemons whose servers time-slice against each other, so they
-do not replace the script for that shape.
+Operator notes: state lives under `/tmp/sglang-omni-mps-<user>/<gpu-uuid>/`
+(`SGLANG_OMNI_MPS_STATE_ROOT` overrides it). If startup refuses with a
+message naming live client PIDs, those processes survived SIGKILL and hold
+the GPU; kill them and restart. A globally exported `CUDA_MPS_PIPE_DIRECTORY`
+is rejected while `--mps` is enabled, and combining native `--mps` with the
+script's `WEIGHT_SHARE=1` is rejected: CUDA IPC weight sharing remains the
+one deployment shape that still uses `examples/mps_dp/launch.sh` below.
 
 ## Deploy
 

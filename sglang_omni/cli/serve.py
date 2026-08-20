@@ -1419,9 +1419,10 @@ def serve(
             "--mps",
             help=(
                 "CUDA MPS for colocated GPU processes: off, on, or auto. "
-                "auto starts a private MPS daemon on any GPU hosting two or "
-                "more single-GPU stage processes. Omit to use the pipeline "
-                "config default (off)."
+                "auto enables MPS on any GPU hosting two or more single-GPU "
+                "stage processes of this pipeline. on always joins the shared "
+                "per-GPU daemon; use it on every replica for same-GPU data "
+                "parallelism. Omit to use the pipeline config default (off)."
             ),
         ),
     ] = None,

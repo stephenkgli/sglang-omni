@@ -34,6 +34,9 @@ class MpsDeviceInfo(Protocol):
 def _default_state_root() -> Path:
     # Note (Jiaxin Deng): keep this short. The control socket lives under it
     # and must fit the 107-byte AF_UNIX sun_path budget.
+    override = os.environ.get("SGLANG_OMNI_MPS_STATE_ROOT")
+    if override:
+        return Path(override)
     return Path(tempfile.gettempdir()) / f"sglang-omni-mps-{getpass.getuser()}"
 
 
