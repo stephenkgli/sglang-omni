@@ -9,20 +9,18 @@ teardown.
 
 from __future__ import annotations
 
-import contextlib
 import getpass
 import logging
 import os
 import shutil
 import sys
 import tempfile
-import uuid
 from pathlib import Path
 from typing import Protocol
 
 from sglang_omni.mps.decision import MpsGpuPlan, plan_mps_gpus
 from sglang_omni.mps.manager import MpsControlClient, MpsError, MpsManager
-from sglang_omni.mps.state import MpsRunPaths
+from sglang_omni.mps.state import MpsGpuPaths
 
 logger = logging.getLogger(__name__)
 
@@ -31,24 +29,6 @@ class MpsDeviceInfo(Protocol):
     def gpu_uuid(self, gpu_id: int) -> str: ...
 
     def unsupported_reason(self, gpu_id: int) -> str | None: ...
-
-
-@contextlib.contextmanager
-def _state_root_lock(root: Path):
-    # Note (Jiaxin Deng): serializes preflight recovery and run-dir creation
-    # across concurrent serves on one host; no-op where flock is unavailable.
-    try:
-        import fcntl
-    except ImportError:
-        yield
-        return
-    lock_path = root / ".lock"
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 def _default_state_root() -> Path:
@@ -81,7 +61,6 @@ class MpsPipelineRuntime:
         device_info: MpsDeviceInfo,
         client: MpsControlClient,
         state_root: Path | None = None,
-        run_id: str | None = None,
     ) -> MpsPipelineRuntime | None:
         if os.environ.get("CUDA_MPS_PIPE_DIRECTORY"):
             raise MpsError(
@@ -115,30 +94,27 @@ class MpsPipelineRuntime:
             return None
 
         root = state_root if state_root is not None else _default_state_root()
-        run = run_id if run_id is not None else f"run-{uuid.uuid4().hex[:8]}"
-        managers = {
-            gpu_id: MpsManager(
-                paths=MpsRunPaths(state_root=root, gpu_id=gpu_id, run_id=run),
-                gpu_uuid=device_info.gpu_uuid(gpu_id),
+        managers = {}
+        for gpu_id in usable:
+            gpu_uuid = device_info.gpu_uuid(gpu_id)
+            managers[gpu_id] = MpsManager(
+                paths=MpsGpuPaths(state_root=root, gpu_uuid=gpu_uuid),
+                gpu_uuid=gpu_uuid,
                 client=client,
             )
-            for gpu_id in usable
-        }
         return cls(managers, usable, mode=mode)
 
     def start(self) -> None:
         root = next(iter(self.managers.values())).paths.state_root
         root.mkdir(parents=True, exist_ok=True)
         root.chmod(0o700)
-        with _state_root_lock(root):
-            for gpu_id, manager in self.managers.items():
-                manager.preflight()
-                manager.start()
-                logger.info(
-                    "MPS daemon ready on GPU %d (pipe dir %s)",
-                    gpu_id,
-                    manager.paths.pipe_dir,
-                )
+        for gpu_id, manager in self.managers.items():
+            manager.start()
+            logger.info(
+                "MPS daemon ready on GPU %d (pipe dir %s)",
+                gpu_id,
+                manager.paths.pipe_dir,
+            )
         logger.info(
             "MPS summary: mode=%s %s",
             self._mode,
@@ -222,11 +198,11 @@ def create_for_pipeline(mode: str, process_specs) -> MpsPipelineRuntime | None:
 
     torch = sys.modules.get("torch")
     if torch is not None and torch.cuda.is_initialized():
-        # Note (Jiaxin Deng): a parent CUDA context predates the MPS env and
-        # would not attach; refuse instead of serving a half-managed pipeline.
-        raise MpsError(
-            "CUDA was initialized in the parent process before MPS setup; "
-            "this is a runtime bug, please report it"
+        # Note (Jiaxin Deng): stage children are spawned, not forked, so a
+        # parent context cannot leak into them; it just will not attach.
+        logger.warning(
+            "CUDA was initialized in the parent before MPS setup; the "
+            "parent's own context will run outside MPS"
         )
 
     from sglang_omni.utils.ipc_weights import get_weight_share_config

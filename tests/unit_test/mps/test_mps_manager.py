@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""State-machine tests for MpsManager against an in-memory fake control client.
+"""State-machine tests for the shared per-GPU MpsManager against a fake client.
 
 The real ``nvidia-cuda-mps-control`` I/O lives behind the ``MpsControlClient``
 protocol; these tests script the fake to cover every lifecycle path without a
@@ -9,6 +9,7 @@ GPU. The subprocess-backed client is exercised by the GPU CI smoke instead.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -16,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from sglang_omni.mps.manager import MpsError, MpsManager, MpsState
-from sglang_omni.mps.state import MpsRunPaths
+from sglang_omni.mps.state import MpsGpuPaths
 
 
 class FakeControlClient:
@@ -26,6 +27,7 @@ class FakeControlClient:
         self.daemon_pid = 4242
         self.control_responsive = True
         self.start_fails = False
+        self.start_calls = 0
         # server pid -> list of client pids
         self.servers: dict[int, list[int]] = {}
         self.alive_pids: set[int] = set()
@@ -35,6 +37,7 @@ class FakeControlClient:
         self.quit_calls: list[str] = []
 
     def start_daemon(self, pipe_dir, log_dir, gpu_uuid):
+        self.start_calls += 1
         if self.start_fails:
             raise OSError("spawn failed")
         self.alive_pids.add(self.daemon_pid)
@@ -42,7 +45,11 @@ class FakeControlClient:
         return self.daemon_pid
 
     def control_responds(self, pipe_dir):
-        return self.control_responsive
+        if not self.control_responsive:
+            return False
+        return any(
+            self.pid_pipe_dirs.get(pid) == str(pipe_dir) for pid in self.alive_pids
+        )
 
     def get_server_list(self, pipe_dir):
         return list(self.servers)
@@ -60,14 +67,14 @@ class FakeControlClient:
     def pid_alive(self, pid):
         return pid in self.alive_pids
 
-    def daemon_owns_pipe(self, pid, pipe_dir):
-        return self.pid_pipe_dirs.get(pid) == str(pipe_dir)
+    def kill_pid(self, pid, force=False):
+        self.alive_pids.discard(pid)
 
     def parent_of(self, pid):
         return self.parents.get(pid)
 
-    def kill_pid(self, pid, force=False):
-        self.alive_pids.discard(pid)
+    def daemon_owns_pipe(self, pid, pipe_dir):
+        return self.pid_pipe_dirs.get(pid) == str(pipe_dir)
 
 
 GPU_UUID = "GPU-11111111-2222-3333-4444-555555555555"
@@ -82,10 +89,9 @@ def short_root():
     shutil.rmtree(root, ignore_errors=True)
 
 
-def make_manager(tmp_path, client, run_id="run-t1"):
-    paths = MpsRunPaths(state_root=tmp_path, gpu_id=0, run_id=run_id)
+def make_manager(root, client):
     return MpsManager(
-        paths=paths,
+        paths=MpsGpuPaths(state_root=root, gpu_uuid=GPU_UUID),
         gpu_uuid=GPU_UUID,
         client=client,
         poll_interval=0.0,
@@ -96,14 +102,190 @@ def make_manager(tmp_path, client, run_id="run-t1"):
     )
 
 
+def seed_shared_dir(root, client, *, daemon_pid, owners=(), clients=()):
+    """Simulate the state another (possibly dead) serve left behind."""
+    paths = MpsGpuPaths(state_root=root, gpu_uuid=GPU_UUID)
+    paths.pipe_dir.mkdir(parents=True)
+    paths.log_dir.mkdir(parents=True)
+    paths.owners_dir.mkdir(parents=True)
+    paths.manifest.write_text(
+        json.dumps(
+            {
+                "gpu_uuid": GPU_UUID,
+                "daemon_pid": daemon_pid,
+                "creator_pid": 1234,
+                "pipe_dir": str(paths.pipe_dir),
+            }
+        )
+    )
+    for owner in owners:
+        (paths.owners_dir / str(owner)).write_text("")
+    if clients:
+        client.servers = {9000: list(clients)}
+    return paths
+
+
+def start_serving(root, client):
+    mgr = make_manager(root, client)
+    mgr.start()
+    client.servers = {7000: [101]}
+    mgr.verify_attached({101})
+    return mgr
+
+
+# --- create / join / adopt ---
+
+
+def test_first_owner_creates_daemon_and_registers(short_root):
+    client = FakeControlClient()
+    mgr = make_manager(short_root, client)
+    mgr.start()
+
+    assert mgr.state is MpsState.READY
+    assert client.start_calls == 1
+    assert (mgr.paths.owners_dir / str(os.getpid())).exists()
+    manifest = json.loads(mgr.paths.manifest.read_text())
+    assert manifest["daemon_pid"] == client.daemon_pid
+    assert manifest["gpu_uuid"] == GPU_UUID
+
+
+def test_second_owner_joins_existing_daemon(short_root):
+    client = FakeControlClient()
+    client.alive_pids.update({999, 888})
+    paths = seed_shared_dir(short_root, client, daemon_pid=999, owners=[888])
+    client.pid_pipe_dirs[999] = str(paths.pipe_dir)
+
+    mgr = make_manager(short_root, client)
+    mgr.start()
+    assert client.start_calls == 0
+    assert mgr.daemon_pid == 999
+
+    mgr.stop()
+    assert mgr.state is MpsState.CLEANED
+    assert client.quit_calls == []
+    assert (paths.owners_dir / "888").exists()
+    assert not (paths.owners_dir / str(os.getpid())).exists()
+
+
+def test_orphan_daemon_is_adopted_after_reaping_clients(short_root):
+    client = FakeControlClient()
+    client.alive_pids.update({999, 555})
+    paths = seed_shared_dir(
+        short_root, client, daemon_pid=999, owners=[777], clients=[555]
+    )
+    client.pid_pipe_dirs[999] = str(paths.pipe_dir)  # owner 777 is dead
+
+    mgr = make_manager(short_root, client)
+    mgr.start()
+    assert client.start_calls == 0
+    assert mgr.daemon_pid == 999
+    assert 555 not in client.alive_pids
+    assert not (paths.owners_dir / "777").exists()
+
+
+def test_dead_daemon_is_replaced_by_fresh_spawn(short_root):
+    client = FakeControlClient()
+    seed_shared_dir(short_root, client, daemon_pid=999, owners=[777])  # all dead
+
+    mgr = make_manager(short_root, client)
+    mgr.start()
+    assert client.start_calls == 1
+    assert mgr.daemon_pid == client.daemon_pid
+
+
+def test_reap_requeries_membership_before_kill(short_root):
+    client = FakeControlClient()
+    client.alive_pids.update({999, 555})
+    paths = seed_shared_dir(
+        short_root, client, daemon_pid=999, owners=[], clients=[555]
+    )
+    client.pid_pipe_dirs[999] = str(paths.pipe_dir)
+    killed = []
+    client.kill_pid = lambda pid, force=False: killed.append(pid)
+    # Between discovery and the kill loop the client exits and its PID is
+    # recycled by a stranger: still alive, but no longer an MPS client.
+    calls = {"n": 0}
+    original = client.get_client_list
+
+    def racy_get_client_list(pipe_dir, server_pid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return original(pipe_dir, server_pid)
+        return []
+
+    client.get_client_list = racy_get_client_list
+
+    mgr = make_manager(short_root, client)
+    mgr.start()
+    assert killed == []
+
+
+def test_unkillable_orphan_client_blocks_startup(short_root):
+    client = FakeControlClient()
+    client.alive_pids.update({999, 555})
+    paths = seed_shared_dir(
+        short_root, client, daemon_pid=999, owners=[], clients=[555]
+    )
+    client.pid_pipe_dirs[999] = str(paths.pipe_dir)
+    client.kill_pid = lambda pid, force=False: None  # unkillable client
+
+    mgr = make_manager(short_root, client)
+    with pytest.raises(MpsError, match="[Kk]ill them manually"):
+        mgr.start()
+    assert mgr.state is MpsState.FAILED
+    assert client.quit_calls == []
+
+
+def test_unreadable_manifest_with_live_control_socket_refuses(short_root):
+    client = FakeControlClient()
+    paths = MpsGpuPaths(state_root=short_root, gpu_uuid=GPU_UUID)
+    paths.pipe_dir.mkdir(parents=True)
+    # A live daemon we have no record of answers on this pipe dir.
+    client.alive_pids.add(31337)
+    client.pid_pipe_dirs[31337] = str(paths.pipe_dir)
+
+    mgr = make_manager(short_root, client)
+    with pytest.raises(MpsError, match="manually"):
+        mgr.start()
+
+
+def test_start_control_never_responding_reaps_fresh_daemon(short_root):
+    client = FakeControlClient()
+    client.control_responsive = False
+    killed = []
+
+    def kill_pid(pid, force=False):
+        killed.append(pid)
+        client.alive_pids.discard(pid)
+
+    client.kill_pid = kill_pid
+    mgr = make_manager(short_root, client)
+
+    with pytest.raises(MpsError, match="control"):
+        mgr.start()
+    assert mgr.state is MpsState.FAILED
+    assert killed == [client.daemon_pid]
+    assert json.loads(mgr.paths.manifest.read_text())["daemon_pid"]
+
+
+def test_start_daemon_spawn_failure_fails_closed(short_root):
+    client = FakeControlClient()
+    client.start_fails = True
+    mgr = make_manager(short_root, client)
+
+    with pytest.raises(MpsError, match="spawn failed"):
+        mgr.start()
+    assert mgr.state is MpsState.FAILED
+    assert not (mgr.paths.owners_dir / str(os.getpid())).exists()
+
+
+# --- verify / watchdog ---
+
+
 def test_happy_path_reaches_cleaned_and_removes_state(short_root):
     client = FakeControlClient()
     mgr = make_manager(short_root, client)
-
-    mgr.preflight()
     mgr.start()
-    assert mgr.state is MpsState.READY
-    assert mgr.paths.state_dir.is_dir()
 
     env = mgr.env_for_stage()
     assert env["CUDA_MPS_PIPE_DIRECTORY"] == str(mgr.paths.pipe_dir)
@@ -121,31 +303,9 @@ def test_happy_path_reaches_cleaned_and_removes_state(short_root):
     assert client.quit_calls == [str(mgr.paths.pipe_dir)]
 
 
-def test_start_writes_ownership_manifest(short_root):
-    client = FakeControlClient()
-    mgr = make_manager(short_root, client)
-    mgr.preflight()
-    mgr.start()
-
-    manifest = json.loads(mgr.paths.manifest.read_text())
-    assert manifest["daemon_pid"] == client.daemon_pid
-    assert manifest["run_id"] == "run-t1"
-    assert manifest["pipe_dir"] == str(mgr.paths.pipe_dir)
-
-
-def start_serving(short_root, client, run_id="run-t1"):
-    mgr = make_manager(short_root, client, run_id=run_id)
-    mgr.preflight()
-    mgr.start()
-    client.servers = {7000: [101]}
-    mgr.verify_attached({101})
-    return mgr
-
-
 def test_verify_timeout_names_missing_pids_and_fails(short_root):
     client = FakeControlClient()
     mgr = make_manager(short_root, client)
-    mgr.preflight()
     mgr.start()
     client.servers = {7000: [101]}
 
@@ -155,9 +315,43 @@ def test_verify_timeout_names_missing_pids_and_fails(short_root):
     assert mgr.paths.state_dir.is_dir()
 
 
-def test_stop_refuses_to_quit_under_live_clients(short_root):
+def test_verify_matches_descendants_of_expected_pids(short_root):
+    client = FakeControlClient()
+    mgr = make_manager(short_root, client)
+    mgr.start()
+    # Engine child 200 (parent 100) creates the CUDA context, not wrapper 100.
+    client.servers = {7000: [200]}
+    client.parents = {200: 100}
+
+    mgr.verify_attached({100})
+    assert mgr.state is MpsState.SERVING
+
+
+def test_probe_detects_daemon_death(short_root):
     client = FakeControlClient()
     mgr = start_serving(short_root, client)
+    assert mgr.probe() is True
+
+    client.alive_pids.discard(client.daemon_pid)
+    assert mgr.probe() is False
+
+
+def test_proc_stat_zombie_is_not_alive():
+    from sglang_omni.mps.control import _stat_says_alive
+
+    assert _stat_says_alive("430465 (nvidia-cuda-mps) Z 1 430465 0") is False
+    assert _stat_says_alive("53748 (nvidia-cuda-mps-control) S 1 0 0") is True
+    # Process names may contain parentheses and spaces.
+    assert _stat_says_alive("7 (weird) name) Z 1 0") is False
+
+
+# --- teardown ---
+
+
+def test_last_owner_stop_refuses_to_quit_under_live_clients(short_root):
+    client = FakeControlClient()
+    mgr = start_serving(short_root, client)
+    client.alive_pids.add(101)  # the attached client is a live process
 
     with pytest.raises(MpsError, match="still attached"):
         mgr.stop()
@@ -178,141 +372,15 @@ def test_stop_daemon_refusing_to_exit_preserves_state(short_root):
     assert mgr.paths.state_dir.is_dir()
 
 
-def test_start_control_never_responding_fails(short_root):
-    client = FakeControlClient()
-    client.control_responsive = False
-    mgr = make_manager(short_root, client)
-    mgr.preflight()
-
-    with pytest.raises(MpsError, match="control"):
-        mgr.start()
-    assert mgr.state is MpsState.FAILED
-
-
-def test_probe_detects_daemon_death(short_root):
-    client = FakeControlClient()
-    mgr = start_serving(short_root, client)
-    assert mgr.probe() is True
-
-    client.alive_pids.discard(client.daemon_pid)
-    assert mgr.probe() is False
-
-
-def make_stale_dir(
-    short_root, client, *, daemon_pid, run_id="run-old", clients=(), owner_pid=777
-):
-    paths = MpsRunPaths(state_root=short_root, gpu_id=0, run_id=run_id)
-    paths.pipe_dir.mkdir(parents=True)
-    paths.log_dir.mkdir(parents=True)
-    paths.manifest.write_text(
-        json.dumps(
-            {
-                "run_id": run_id,
-                "gpu_id": 0,
-                "gpu_uuid": GPU_UUID,
-                "daemon_pid": daemon_pid,
-                "owner_pid": owner_pid,
-                "pipe_dir": str(paths.pipe_dir),
-            }
-        )
-    )
-    if clients:
-        client.servers = {9000: list(clients)}
-    return paths
-
-
-def test_preflight_removes_stale_dir_of_dead_daemon(short_root):
-    client = FakeControlClient()
-    stale = make_stale_dir(short_root, client, daemon_pid=999)  # 999 not alive
-
-    mgr = make_manager(short_root, client)
-    mgr.preflight()
-    assert not stale.state_dir.exists()
-
-
-def test_preflight_reclaims_idle_orphan_with_ownership_proof(short_root):
-    client = FakeControlClient()
-    client.alive_pids.add(999)
-    stale = make_stale_dir(short_root, client, daemon_pid=999)
-    client.pid_pipe_dirs[999] = str(stale.pipe_dir)
-
-    mgr = make_manager(short_root, client)
-    mgr.preflight()
-    assert not stale.state_dir.exists()
-    assert client.quit_calls == [str(stale.pipe_dir)]
-
-
-def test_preflight_refuses_orphan_whose_clients_survive_sigkill(short_root):
-    client = FakeControlClient()
-    client.alive_pids.update({999, 555})
-    stale = make_stale_dir(short_root, client, daemon_pid=999, clients=[555])
-    client.pid_pipe_dirs[999] = str(stale.pipe_dir)
-    client.kill_pid = lambda pid, force=False: None  # unkillable client
-
-    mgr = make_manager(short_root, client)
-    with pytest.raises(MpsError, match="[Kk]ill them manually"):
-        mgr.preflight()
-    assert stale.state_dir.is_dir()
-    assert client.quit_calls == []
-
-
-def test_preflight_treats_recycled_pid_as_dead(short_root):
-    client = FakeControlClient()
-    client.alive_pids.add(999)  # alive, but owns a different pipe dir
-    stale = make_stale_dir(short_root, client, daemon_pid=999)
-    client.pid_pipe_dirs[999] = "/somewhere/else"
-
-    mgr = make_manager(short_root, client)
-    mgr.preflight()
-    assert not stale.state_dir.exists()
-    assert client.quit_calls == []
-
-
 def test_stop_after_daemon_death_cleans_without_quit(short_root):
     client = FakeControlClient()
     mgr = start_serving(short_root, client)
     client.alive_pids.discard(client.daemon_pid)
-    client.get_server_list = lambda pipe_dir: (_ for _ in ()).throw(
-        OSError("control socket gone")
-    )
 
     mgr.stop()
     assert mgr.state is MpsState.CLEANED
     assert not mgr.paths.state_dir.exists()
     assert client.quit_calls == []
-
-
-def test_proc_stat_zombie_is_not_alive():
-    from sglang_omni.mps.control import _stat_says_alive
-
-    assert _stat_says_alive("430465 (nvidia-cuda-mps) Z 1 430465 0") is False
-    assert _stat_says_alive("53748 (nvidia-cuda-mps-control) S 1 0 0") is True
-    # Process names may contain parentheses and spaces.
-    assert _stat_says_alive("7 (weird) name) Z 1 0") is False
-
-
-def test_preflight_reaps_orphan_clients_of_owned_daemon(short_root):
-    client = FakeControlClient()
-    client.alive_pids.update({999, 555, 556})
-    stale = make_stale_dir(short_root, client, daemon_pid=999, clients=[555, 556])
-    client.pid_pipe_dirs[999] = str(stale.pipe_dir)
-
-    killed = []
-
-    def kill_pid(pid, force=False):
-        killed.append((pid, force))
-        client.alive_pids.discard(pid)
-        client.servers = {
-            s: [c for c in cs if c != pid] for s, cs in client.servers.items()
-        }
-
-    client.kill_pid = kill_pid
-
-    mgr = make_manager(short_root, client)
-    mgr.preflight()
-    assert {pid for pid, _ in killed} == {555, 556}
-    assert not stale.state_dir.exists()
-    assert client.quit_calls == [str(stale.pipe_dir)]
 
 
 def test_stop_before_start_cleans_quietly(short_root):
@@ -321,7 +389,6 @@ def test_stop_before_start_cleans_quietly(short_root):
         OSError("Cannot find MPS control daemon process")
     )
     mgr = make_manager(short_root, client)
-    mgr.preflight()
 
     mgr.stop()
     assert mgr.state is MpsState.CLEANED
@@ -337,108 +404,3 @@ def test_stop_wraps_client_io_errors_as_mps_error(short_root):
     with pytest.raises(MpsError, match="wedged"):
         mgr.stop()
     assert mgr.state is MpsState.FAILED
-
-
-def test_preflight_skips_run_of_live_owner(short_root):
-    client = FakeControlClient()
-    client.alive_pids.update({888, 999, 555})
-    stale = make_stale_dir(
-        short_root, client, daemon_pid=999, clients=[555], owner_pid=888
-    )
-    client.pid_pipe_dirs[999] = str(stale.pipe_dir)
-    killed = []
-    client.kill_pid = lambda pid, force=False: killed.append(pid)
-
-    mgr = make_manager(short_root, client)
-    mgr.preflight()
-    assert stale.state_dir.is_dir()
-    assert killed == []
-    assert client.quit_calls == []
-
-
-def test_start_failure_reaps_started_daemon(short_root):
-    client = FakeControlClient()
-    client.control_responsive = False
-    killed = []
-
-    def kill_pid(pid, force=False):
-        killed.append(pid)
-        client.alive_pids.discard(pid)
-
-    client.kill_pid = kill_pid
-    mgr = make_manager(short_root, client)
-    mgr.preflight()
-
-    with pytest.raises(MpsError, match="control"):
-        mgr.start()
-    assert killed == [client.daemon_pid]
-    assert mgr.paths.manifest.exists()
-
-
-def test_reap_requeries_membership_before_kill(short_root):
-    client = FakeControlClient()
-    client.alive_pids.update({999, 555})
-    stale = make_stale_dir(short_root, client, daemon_pid=999, clients=[555])
-    client.pid_pipe_dirs[999] = str(stale.pipe_dir)
-    killed = []
-
-    def kill_pid(pid, force=False):
-        killed.append(pid)
-        client.alive_pids.discard(pid)
-
-    client.kill_pid = kill_pid
-    # Between discovery and the kill loop the client exits and its PID is
-    # recycled by a stranger: still alive, but no longer an MPS client.
-    calls = {"n": 0}
-    original_get_client_list = client.get_client_list
-
-    def racy_get_client_list(pipe_dir, server_pid):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return original_get_client_list(pipe_dir, server_pid)
-        return []
-
-    client.get_client_list = racy_get_client_list
-
-    mgr = make_manager(short_root, client)
-    mgr.preflight()
-    assert killed == []
-    assert not stale.state_dir.exists()
-
-
-def test_verify_matches_descendants_of_expected_pids(short_root):
-    client = FakeControlClient()
-    mgr = make_manager(short_root, client)
-    mgr.preflight()
-    mgr.start()
-    # Engine child 200 (parent 100) creates the CUDA context, not wrapper 100.
-    client.servers = {7000: [200]}
-    client.parents = {200: 100}
-
-    mgr.verify_attached({100})
-    assert mgr.state is MpsState.SERVING
-
-
-def test_preflight_skips_inprogress_run_without_daemon_pid(short_root):
-    # A concurrent serve has created its dir and owner manifest but has not
-    # started its daemon yet; the scanner must not treat it as reclaimable.
-    client = FakeControlClient()
-    client.alive_pids.add(888)
-    paths = MpsRunPaths(state_root=short_root, gpu_id=0, run_id="run-young")
-    paths.pipe_dir.mkdir(parents=True)
-    paths.manifest.write_text(json.dumps({"run_id": "run-young", "owner_pid": 888}))
-
-    mgr = make_manager(short_root, client)
-    mgr.preflight()
-    assert paths.state_dir.is_dir()
-
-
-def test_start_daemon_spawn_failure_still_leaves_owner_manifest(short_root):
-    client = FakeControlClient()
-    client.start_fails = True
-    mgr = make_manager(short_root, client)
-    mgr.preflight()
-
-    with pytest.raises(MpsError):
-        mgr.start()
-    assert json.loads(mgr.paths.manifest.read_text())["owner_pid"]

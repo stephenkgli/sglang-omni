@@ -37,7 +37,7 @@ class FakeDeviceInfo:
         self.unsupported = unsupported or {}
 
     def gpu_uuid(self, gpu_id):
-        return f"GPU-fake-{gpu_id}"
+        return f"GPU-aaaaaaaa-bbbb-cccc-dddd-00000000000{gpu_id}"
 
     def unsupported_reason(self, gpu_id):
         return self.unsupported.get(gpu_id)
@@ -77,7 +77,7 @@ def test_env_only_for_client_processes(short_root):
     runtime.start()
 
     env = runtime.env_for_process("a")
-    assert env["CUDA_VISIBLE_DEVICES"] == "GPU-fake-0"
+    assert env["CUDA_VISIBLE_DEVICES"] == "GPU-aaaaaaaa-bbbb-cccc-dddd-000000000000"
     assert "CUDA_MPS_PIPE_DIRECTORY" in env
     assert env["SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS"] == "true"
     assert runtime.env_for_process("solo") == {}
