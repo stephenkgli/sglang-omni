@@ -101,6 +101,13 @@ class SubprocessMpsControlClient:
         except ProcessLookupError:
             pass
 
+    def parent_of(self, pid: int) -> int | None:
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text()
+            return int(stat_text.rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            return None
+
     def daemon_owns_pipe(self, pid: int, pipe_dir: Path) -> bool:
         try:
             environ = Path(f"/proc/{pid}/environ").read_bytes()

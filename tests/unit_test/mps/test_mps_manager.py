@@ -31,6 +31,7 @@ class FakeControlClient:
         self.alive_pids: set[int] = set()
         # pipe dirs (str) this fake believes each daemon pid owns
         self.pid_pipe_dirs: dict[int, str] = {}
+        self.parents: dict[int, int] = {}
         self.quit_calls: list[str] = []
 
     def start_daemon(self, pipe_dir, log_dir, gpu_uuid):
@@ -61,6 +62,12 @@ class FakeControlClient:
 
     def daemon_owns_pipe(self, pid, pipe_dir):
         return self.pid_pipe_dirs.get(pid) == str(pipe_dir)
+
+    def parent_of(self, pid):
+        return self.parents.get(pid)
+
+    def kill_pid(self, pid, force=False):
+        self.alive_pids.discard(pid)
 
 
 GPU_UUID = "GPU-11111111-2222-3333-4444-555555555555"
@@ -191,7 +198,9 @@ def test_probe_detects_daemon_death(short_root):
     assert mgr.probe() is False
 
 
-def make_stale_dir(short_root, client, *, daemon_pid, run_id="run-old", clients=()):
+def make_stale_dir(
+    short_root, client, *, daemon_pid, run_id="run-old", clients=(), owner_pid=777
+):
     paths = MpsRunPaths(state_root=short_root, gpu_id=0, run_id=run_id)
     paths.pipe_dir.mkdir(parents=True)
     paths.log_dir.mkdir(parents=True)
@@ -202,6 +211,7 @@ def make_stale_dir(short_root, client, *, daemon_pid, run_id="run-old", clients=
                 "gpu_id": 0,
                 "gpu_uuid": GPU_UUID,
                 "daemon_pid": daemon_pid,
+                "owner_pid": owner_pid,
                 "pipe_dir": str(paths.pipe_dir),
             }
         )
@@ -327,3 +337,83 @@ def test_stop_wraps_client_io_errors_as_mps_error(short_root):
     with pytest.raises(MpsError, match="wedged"):
         mgr.stop()
     assert mgr.state is MpsState.FAILED
+
+
+def test_preflight_skips_run_of_live_owner(short_root):
+    client = FakeControlClient()
+    client.alive_pids.update({888, 999, 555})
+    stale = make_stale_dir(
+        short_root, client, daemon_pid=999, clients=[555], owner_pid=888
+    )
+    client.pid_pipe_dirs[999] = str(stale.pipe_dir)
+    killed = []
+    client.kill_pid = lambda pid, force=False: killed.append(pid)
+
+    mgr = make_manager(short_root, client)
+    mgr.preflight()
+    assert stale.state_dir.is_dir()
+    assert killed == []
+    assert client.quit_calls == []
+
+
+def test_start_failure_reaps_started_daemon(short_root):
+    client = FakeControlClient()
+    client.control_responsive = False
+    killed = []
+
+    def kill_pid(pid, force=False):
+        killed.append(pid)
+        client.alive_pids.discard(pid)
+
+    client.kill_pid = kill_pid
+    mgr = make_manager(short_root, client)
+    mgr.preflight()
+
+    with pytest.raises(MpsError, match="control"):
+        mgr.start()
+    assert killed == [client.daemon_pid]
+    assert mgr.paths.manifest.exists()
+
+
+def test_reap_requeries_membership_before_kill(short_root):
+    client = FakeControlClient()
+    client.alive_pids.update({999, 555})
+    stale = make_stale_dir(short_root, client, daemon_pid=999, clients=[555])
+    client.pid_pipe_dirs[999] = str(stale.pipe_dir)
+    killed = []
+
+    def kill_pid(pid, force=False):
+        killed.append(pid)
+        client.alive_pids.discard(pid)
+
+    client.kill_pid = kill_pid
+    # Between discovery and the kill loop the client exits and its PID is
+    # recycled by a stranger: still alive, but no longer an MPS client.
+    calls = {"n": 0}
+    original_get_client_list = client.get_client_list
+
+    def racy_get_client_list(pipe_dir, server_pid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return original_get_client_list(pipe_dir, server_pid)
+        return []
+
+    client.get_client_list = racy_get_client_list
+
+    mgr = make_manager(short_root, client)
+    mgr.preflight()
+    assert killed == []
+    assert not stale.state_dir.exists()
+
+
+def test_verify_matches_descendants_of_expected_pids(short_root):
+    client = FakeControlClient()
+    mgr = make_manager(short_root, client)
+    mgr.preflight()
+    mgr.start()
+    # Engine child 200 (parent 100) creates the CUDA context, not wrapper 100.
+    client.servers = {7000: [200]}
+    client.parents = {200: 100}
+
+    mgr.verify_attached({100})
+    assert mgr.state is MpsState.SERVING

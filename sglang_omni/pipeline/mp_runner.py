@@ -566,7 +566,9 @@ class MultiProcessPipelineRunner:
                 total_procs,
             )
 
-        except Exception:
+        except BaseException:
+            # Note (Jiaxin Deng): BaseException so cancellation cannot skip
+            # cleanup and leak spawned processes or the MPS daemon.
             await self._cleanup_on_failure()
             raise
 
