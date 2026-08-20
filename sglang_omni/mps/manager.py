@@ -101,8 +101,9 @@ class MpsManager:
         owner_pid: int | None = None
         try:
             manifest = json.loads(manifest_path.read_text())
-            daemon_pid = int(manifest["daemon_pid"])
             owner_pid = int(manifest["owner_pid"])
+            daemon_raw = manifest.get("daemon_pid")
+            daemon_pid = int(daemon_raw) if daemon_raw is not None else None
         except (OSError, ValueError, KeyError, TypeError):
             # Note (Jiaxin Deng): no ownership record; a live unknown daemon is
             # not ours to kill, so reclaim only if its control socket is silent.
@@ -123,6 +124,11 @@ class MpsManager:
                 run_dir,
                 owner_pid,
             )
+            return
+
+        if daemon_pid is None:
+            # Owner died between creating the dir and spawning its daemon.
+            shutil.rmtree(run_dir)
             return
 
         owned = self.client.pid_alive(daemon_pid) and self.client.daemon_owns_pipe(
@@ -200,6 +206,9 @@ class MpsManager:
         self.state = MpsState.STARTING
         self.paths.pipe_dir.mkdir(parents=True, exist_ok=True)
         self.paths.log_dir.mkdir(parents=True, exist_ok=True)
+        # Note (Jiaxin Deng): claim ownership before spawning anything, so a
+        # concurrent preflight never sees this dir as an abandoned leftover.
+        self._write_manifest()
         try:
             self.daemon_pid = self.client.start_daemon(
                 self.paths.pipe_dir, self.paths.log_dir, self.gpu_uuid

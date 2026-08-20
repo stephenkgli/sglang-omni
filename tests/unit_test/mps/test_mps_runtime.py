@@ -112,3 +112,9 @@ def test_stop_cleans_all_state(short_root):
     client.servers = {}
     runtime.stop()
     assert all(m.state is MpsState.CLEANED for m in runtime.managers.values())
+
+
+def test_global_pipe_dir_export_is_rejected(short_root, monkeypatch):
+    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/tmp/nvidia-mps")
+    with pytest.raises(MpsError, match="CUDA_MPS_PIPE_DIRECTORY"):
+        create(short_root)

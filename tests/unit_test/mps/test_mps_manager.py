@@ -417,3 +417,28 @@ def test_verify_matches_descendants_of_expected_pids(short_root):
 
     mgr.verify_attached({100})
     assert mgr.state is MpsState.SERVING
+
+
+def test_preflight_skips_inprogress_run_without_daemon_pid(short_root):
+    # A concurrent serve has created its dir and owner manifest but has not
+    # started its daemon yet; the scanner must not treat it as reclaimable.
+    client = FakeControlClient()
+    client.alive_pids.add(888)
+    paths = MpsRunPaths(state_root=short_root, gpu_id=0, run_id="run-young")
+    paths.pipe_dir.mkdir(parents=True)
+    paths.manifest.write_text(json.dumps({"run_id": "run-young", "owner_pid": 888}))
+
+    mgr = make_manager(short_root, client)
+    mgr.preflight()
+    assert paths.state_dir.is_dir()
+
+
+def test_start_daemon_spawn_failure_still_leaves_owner_manifest(short_root):
+    client = FakeControlClient()
+    client.start_fails = True
+    mgr = make_manager(short_root, client)
+    mgr.preflight()
+
+    with pytest.raises(MpsError):
+        mgr.start()
+    assert json.loads(mgr.paths.manifest.read_text())["owner_pid"]
