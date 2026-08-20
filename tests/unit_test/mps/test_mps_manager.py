@@ -15,11 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from sglang_omni.mps.manager import (
-    MpsError,
-    MpsManager,
-    MpsState,
-)
+from sglang_omni.mps.manager import MpsError, MpsManager, MpsState
 from sglang_omni.mps.state import MpsRunPaths
 
 
@@ -236,14 +232,15 @@ def test_preflight_reclaims_idle_orphan_with_ownership_proof(short_root):
     assert client.quit_calls == [str(stale.pipe_dir)]
 
 
-def test_preflight_refuses_orphan_with_live_clients(short_root):
+def test_preflight_refuses_orphan_whose_clients_survive_sigkill(short_root):
     client = FakeControlClient()
-    client.alive_pids.add(999)
+    client.alive_pids.update({999, 555})
     stale = make_stale_dir(short_root, client, daemon_pid=999, clients=[555])
     client.pid_pipe_dirs[999] = str(stale.pipe_dir)
+    client.kill_pid = lambda pid, force=False: None  # unkillable client
 
     mgr = make_manager(short_root, client)
-    with pytest.raises(MpsError, match="999"):
+    with pytest.raises(MpsError, match="[Kk]ill them manually"):
         mgr.preflight()
     assert stale.state_dir.is_dir()
     assert client.quit_calls == []
@@ -259,3 +256,74 @@ def test_preflight_treats_recycled_pid_as_dead(short_root):
     mgr.preflight()
     assert not stale.state_dir.exists()
     assert client.quit_calls == []
+
+
+def test_stop_after_daemon_death_cleans_without_quit(short_root):
+    client = FakeControlClient()
+    mgr = start_serving(short_root, client)
+    client.alive_pids.discard(client.daemon_pid)
+    client.get_server_list = lambda pipe_dir: (_ for _ in ()).throw(
+        OSError("control socket gone")
+    )
+
+    mgr.stop()
+    assert mgr.state is MpsState.CLEANED
+    assert not mgr.paths.state_dir.exists()
+    assert client.quit_calls == []
+
+
+def test_proc_stat_zombie_is_not_alive():
+    from sglang_omni.mps.control import _stat_says_alive
+
+    assert _stat_says_alive("430465 (nvidia-cuda-mps) Z 1 430465 0") is False
+    assert _stat_says_alive("53748 (nvidia-cuda-mps-control) S 1 0 0") is True
+    # Process names may contain parentheses and spaces.
+    assert _stat_says_alive("7 (weird) name) Z 1 0") is False
+
+
+def test_preflight_reaps_orphan_clients_of_owned_daemon(short_root):
+    client = FakeControlClient()
+    client.alive_pids.update({999, 555, 556})
+    stale = make_stale_dir(short_root, client, daemon_pid=999, clients=[555, 556])
+    client.pid_pipe_dirs[999] = str(stale.pipe_dir)
+
+    killed = []
+
+    def kill_pid(pid, force=False):
+        killed.append((pid, force))
+        client.alive_pids.discard(pid)
+        client.servers = {
+            s: [c for c in cs if c != pid] for s, cs in client.servers.items()
+        }
+
+    client.kill_pid = kill_pid
+
+    mgr = make_manager(short_root, client)
+    mgr.preflight()
+    assert {pid for pid, _ in killed} == {555, 556}
+    assert not stale.state_dir.exists()
+    assert client.quit_calls == [str(stale.pipe_dir)]
+
+
+def test_stop_before_start_cleans_quietly(short_root):
+    client = FakeControlClient()
+    client.get_server_list = lambda pipe_dir: (_ for _ in ()).throw(
+        OSError("Cannot find MPS control daemon process")
+    )
+    mgr = make_manager(short_root, client)
+    mgr.preflight()
+
+    mgr.stop()
+    assert mgr.state is MpsState.CLEANED
+
+
+def test_stop_wraps_client_io_errors_as_mps_error(short_root):
+    client = FakeControlClient()
+    mgr = start_serving(short_root, client)
+    client.get_server_list = lambda pipe_dir: (_ for _ in ()).throw(
+        OSError("control socket wedged")
+    )
+
+    with pytest.raises(MpsError, match="wedged"):
+        mgr.stop()
+    assert mgr.state is MpsState.FAILED

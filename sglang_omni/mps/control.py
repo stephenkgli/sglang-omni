@@ -9,12 +9,19 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 
 _CONTROL_BINARY = "nvidia-cuda-mps-control"
 _QUERY_TIMEOUT_SECONDS = 10
 _PID_LINE = re.compile(r"^\d+$")
+
+
+def _stat_says_alive(stat_text: str) -> bool:
+    """Parse /proc/<pid>/stat; the state field follows the last ')'."""
+    state = stat_text.rsplit(")", 1)[1].split()
+    return bool(state) and state[0] != "Z"
 
 
 class SubprocessMpsControlClient:
@@ -42,9 +49,8 @@ class SubprocessMpsControlClient:
     def start_daemon(self, pipe_dir: Path, log_dir: Path, gpu_uuid: str) -> int:
         env = self._control_env(pipe_dir)
         env["CUDA_MPS_LOG_DIRECTORY"] = str(log_dir)
-        # Note (Jiaxin Deng): scope the daemon by GPU UUID, not ordinal.
-        # A daemon started with ordinal visibility remaps client-side
-        # ordinals; UUIDs are immune (same contract as examples/mps_dp).
+        # Note (Jiaxin Deng): UUID visibility, not ordinal: an ordinal-scoped
+        # daemon remaps client-side ordinals (same contract as examples/mps_dp).
         env["CUDA_VISIBLE_DEVICES"] = gpu_uuid
         subprocess.run(
             [_CONTROL_BINARY, "-d"],
@@ -78,11 +84,22 @@ class SubprocessMpsControlClient:
     def pid_alive(self, pid: int) -> bool:
         try:
             os.kill(pid, 0)
-            return True
         except ProcessLookupError:
             return False
         except PermissionError:
-            return True
+            pass
+        # Note (Jiaxin Deng): a quit daemon reparented to a non-reaping pid 1
+        # stays a zombie that os.kill still signals; count it as dead.
+        try:
+            return _stat_says_alive(Path(f"/proc/{pid}/stat").read_text())
+        except OSError:
+            return False
+
+    def kill_pid(self, pid: int, force: bool = False) -> None:
+        try:
+            os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+        except ProcessLookupError:
+            pass
 
     def daemon_owns_pipe(self, pid: int, pipe_dir: Path) -> bool:
         try:

@@ -110,8 +110,8 @@ class MpsPipelineRuntime:
         if gpu_id is None:
             return {}
         env = self.managers[gpu_id].env_for_stage()
-        # Reuse the existing single-visible-device contract so the worker
-        # normalizes its local gpu_id to 0 under the UUID-scoped daemon.
+        # Note (Jiaxin Deng): the single-visible-device contract makes the
+        # worker normalize its local gpu_id to 0 under the UUID-scoped daemon.
         env["SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS"] = "true"
         return env
 
@@ -127,9 +127,7 @@ class MpsPipelineRuntime:
 
     def probe_failures(self) -> list[int]:
         return [
-            gpu_id
-            for gpu_id, manager in self.managers.items()
-            if not manager.probe()
+            gpu_id for gpu_id, manager in self.managers.items() if not manager.probe()
         ]
 
     def stop(self) -> None:
@@ -147,3 +145,30 @@ class MpsPipelineRuntime:
             self.stop()
         except MpsError as exc:
             logger.error("MPS teardown incomplete: %s", exc)
+
+
+def create_for_pipeline(mode: str, process_specs) -> MpsPipelineRuntime | None:
+    """Build the orchestrator with production device info and control I/O.
+
+    Imports are deferred so the mps package stays importable on hosts without
+    the platform/NVML stack (unit tests inject fakes instead).
+    """
+    if mode == "off":
+        return None
+    from sglang_omni.platforms import current_platform
+
+    if not current_platform.is_cuda_alike():
+        if mode == "on":
+            raise MpsError("mps=on requires an NVIDIA CUDA platform")
+        logger.warning("MPS auto: platform is not CUDA; running without MPS")
+        return None
+
+    from sglang_omni.mps.control import SubprocessMpsControlClient
+    from sglang_omni.mps.devices import NvmlDeviceInfo
+
+    return MpsPipelineRuntime.create(
+        mode=mode,
+        process_specs=process_specs,
+        device_info=NvmlDeviceInfo(),
+        client=SubprocessMpsControlClient(),
+    )

@@ -17,12 +17,7 @@ from typing import Any
 
 import requests
 
-from sglang_omni.mps import (
-    RUN_ID_PATTERN,
-    MpsRunPaths,
-    validate_control_socket,
-)
-from sglang_omni.mps import derive_core_blocks as derive_core_blocks
+from sglang_omni.mps import RUN_ID_PATTERN, MpsRunPaths, validate_control_socket
 
 REPLICA_COUNT = 2
 

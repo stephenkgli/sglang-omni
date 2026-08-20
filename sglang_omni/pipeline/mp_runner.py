@@ -25,6 +25,7 @@ from sglang_omni.config.runtime import (
 )
 from sglang_omni.config.schema import PipelineConfig, StageConfig
 from sglang_omni.config.topology import LogicalProcessPlan, ProcessTopologyPlan
+from sglang_omni.mps.runtime import MpsPipelineRuntime, create_for_pipeline
 from sglang_omni.pipeline import Coordinator
 from sglang_omni.pipeline.replicas import ReplicaTopology
 from sglang_omni.pipeline.runtime_config import (
@@ -429,6 +430,7 @@ class MultiProcessPipelineRunner:
         self._fatal_error: BaseException | None = None
         self._prep: PipelineRuntimePrep | None = None
         self._started = False
+        self._mps: MpsPipelineRuntime | None = None
 
     @property
     def coordinator(self) -> Coordinator:
@@ -510,8 +512,27 @@ class MultiProcessPipelineRunner:
             if self._config.env_defaults:
                 env_names = ", ".join(sorted(self._config.env_defaults))
                 logger.info(f"Configured stage process env defaults: {env_names}")
+
+            # Note (Jiaxin Deng): daemons must predate the first CUDA init and
+            # ride the same spawn-time env patching; off must touch nothing.
+            extra_env_for = None
+            if self._config.mps != "off":
+                all_process_specs = [
+                    spec for group in groups for spec in group.process_specs
+                ]
+                self._mps = create_for_pipeline(self._config.mps, all_process_specs)
+            if self._mps is not None:
+                await asyncio.to_thread(self._mps.start)
+                mps = self._mps
+
+                def extra_env_for(spec: StageWorkerProcessSpec) -> dict[str, str]:
+                    return mps.env_for_process(spec.process_name)
+
             for group in self._groups:
-                group.spawn(ctx)
+                if extra_env_for is None:
+                    group.spawn(ctx)
+                else:
+                    group.spawn(ctx, extra_env_for=extra_env_for)
 
             await asyncio.gather(*(g.wait_ready(timeout) for g in self._groups))
 
@@ -521,6 +542,12 @@ class MultiProcessPipelineRunner:
                         f"Stage process(es) died during startup: "
                         f"{group.dead_summary()}"
                     )
+
+            if self._mps is not None:
+                pids_by_process: dict[str, int] = {}
+                for group in self._groups:
+                    pids_by_process.update(group.process_pids())
+                await asyncio.to_thread(self._mps.verify, pids_by_process)
 
             for group in self._groups:
                 for stage_name, endpoint in group.stage_control_endpoints.items():
@@ -549,6 +576,16 @@ class MultiProcessPipelineRunner:
                 if group.any_dead():
                     error = RuntimeError(
                         f"Dead stage process(es) detected: {group.dead_summary()}"
+                    )
+                    logger.error("%s", error)
+                    await self._fail_runtime(error)
+                    return
+            if self._mps is not None:
+                failed_gpus = await asyncio.to_thread(self._mps.probe_failures)
+                if failed_gpus:
+                    error = RuntimeError(
+                        f"MPS daemon died on GPU(s) {failed_gpus}; failing the "
+                        "pipeline instead of serving degraded"
                     )
                     logger.error("%s", error)
                     await self._fail_runtime(error)
@@ -610,6 +647,12 @@ class MultiProcessPipelineRunner:
             return_exceptions=True,
         )
 
+        if self._mps is not None:
+            # Note (Jiaxin Deng): stages exited means clients detached; quitting
+            # the daemon only after that is the required teardown order.
+            await asyncio.to_thread(self._mps.stop_best_effort)
+            self._mps = None
+
         await self._cancel_completion_task()
 
         await self._coordinator.stop()
@@ -631,6 +674,10 @@ class MultiProcessPipelineRunner:
                     p.join(timeout=2)
             group.close_control_channels()
         self._groups.clear()
+
+        if self._mps is not None:
+            await asyncio.to_thread(self._mps.stop_best_effort)
+            self._mps = None
 
         await self._cancel_completion_task()
 

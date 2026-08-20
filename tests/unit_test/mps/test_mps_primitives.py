@@ -12,9 +12,9 @@ from sglang_omni.mps import (
     derive_core_blocks,
     format_cpu_list,
     parse_cpu_list,
+    topology,
     validate_control_socket,
 )
-from sglang_omni.mps import topology
 
 
 def test_cpu_list_round_trip() -> None:

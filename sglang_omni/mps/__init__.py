@@ -13,11 +13,7 @@ from sglang_omni.mps.state import (
     MpsRunPaths,
     validate_control_socket,
 )
-from sglang_omni.mps.topology import (
-    derive_core_blocks,
-    format_cpu_list,
-    parse_cpu_list,
-)
+from sglang_omni.mps.topology import derive_core_blocks, format_cpu_list, parse_cpu_list
 
 __all__ = [
     "RUN_ID_PATTERN",

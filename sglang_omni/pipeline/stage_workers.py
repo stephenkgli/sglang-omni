@@ -10,7 +10,7 @@ import os
 import queue
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
@@ -151,7 +151,10 @@ def _get_worker_process_env(spec: StageWorkerProcessSpec) -> dict[str, str]:
 
 
 @contextmanager
-def _patched_spawn_env(spec: StageWorkerProcessSpec):
+def _patched_spawn_env(
+    spec: StageWorkerProcessSpec,
+    extra_env: dict[str, str] | None = None,
+):
     env_default_updates: dict[str, str] = {}
     for stage_spec in spec.stage_specs:
         for key, value in stage_spec.env_defaults.items():
@@ -176,6 +179,7 @@ def _patched_spawn_env(spec: StageWorkerProcessSpec):
         **env_default_updates,
         **compat_env_defaults,
         **worker_process_env,
+        **(extra_env or {}),
         "SGLANG_OMNI_PLATFORM_SPEC": get_platform_spec(current_platform),
     }
     backup = {key: os.environ.get(key) for key in updates}
@@ -245,7 +249,19 @@ class StageGroup:
     def processes(self) -> list[multiprocessing.Process]:
         return list(self._processes)
 
-    def spawn(self, ctx: multiprocessing.context.SpawnContext) -> None:
+    def process_pids(self) -> dict[str, int]:
+        """Map process_name to spawned PID, aligned with process_specs."""
+        return {
+            spec.process_name: proc.pid
+            for spec, proc in zip(self.process_specs, self._processes)
+            if proc.pid is not None
+        }
+
+    def spawn(
+        self,
+        ctx: multiprocessing.context.SpawnContext,
+        extra_env_for: Callable[[StageWorkerProcessSpec], dict[str, str]] | None = None,
+    ) -> None:
         """Spawn the OS process(es) owned by this group."""
         for spec in self.process_specs:
             event = ctx.Event()
@@ -258,7 +274,8 @@ class StageGroup:
                 daemon=True,
             )
             try:
-                with _patched_spawn_env(spec):
+                extra_env = extra_env_for(spec) if extra_env_for else None
+                with _patched_spawn_env(spec, extra_env=extra_env):
                     proc.start()
             except Exception:
                 _close_queue(startup_error_channel)

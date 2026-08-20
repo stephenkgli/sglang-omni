@@ -12,7 +12,6 @@ import pytest
 
 from sglang_omni.mps.manager import MpsError, MpsState
 from sglang_omni.mps.runtime import MpsPipelineRuntime
-
 from tests.unit_test.mps.test_mps_manager import FakeControlClient
 
 

@@ -57,6 +57,8 @@ class MpsControlClient(Protocol):
 
     def pid_alive(self, pid: int) -> bool: ...
 
+    def kill_pid(self, pid: int, force: bool = False) -> None: ...
+
     def daemon_owns_pipe(self, pid: int, pipe_dir: Path) -> bool: ...
 
 
@@ -96,9 +98,8 @@ class MpsManager:
         try:
             daemon_pid = int(json.loads(manifest_path.read_text())["daemon_pid"])
         except (OSError, ValueError, KeyError, TypeError):
-            # Note (Jiaxin Deng): no readable ownership record. Only reclaim
-            # when nothing answers on the stale control socket; a live unknown
-            # daemon is not ours to kill.
+            # Note (Jiaxin Deng): no ownership record; a live unknown daemon is
+            # not ours to kill, so reclaim only if its control socket is silent.
             if self.client.control_responds(pipe_dir):
                 raise MpsError(
                     f"stale MPS state dir {run_dir} has no readable manifest "
@@ -112,19 +113,17 @@ class MpsManager:
             daemon_pid, pipe_dir
         )
         if not owned:
-            # Dead daemon, or the PID was recycled by an unrelated process.
+            # Note (Jiaxin Deng): dead, or the PID was recycled by a stranger.
             shutil.rmtree(run_dir)
             return
 
-        clients: set[int] = set()
-        for server_pid in self.client.get_server_list(pipe_dir):
-            clients.update(self.client.get_client_list(pipe_dir, server_pid))
-        if clients:
-            raise MpsError(
-                f"MPS daemon pid {daemon_pid} from stale run dir {run_dir} is "
-                f"alive with attached clients {sorted(clients)}; it may belong "
-                "to a concurrent pipeline. Refusing to reclaim it."
-            )
+        live_clients = {
+            pid for pid in self._clients_of(pipe_dir) if self.client.pid_alive(pid)
+        }
+        if live_clients:
+            # Note (Jiaxin Deng): the manifest proves the daemon is our dead
+            # run's, so its clients are that run's orphans; reap, don't block.
+            self._reap_orphan_clients(run_dir, pipe_dir, daemon_pid, live_clients)
 
         logger.warning(
             "Reclaiming idle orphan MPS daemon pid %d from stale run dir %s",
@@ -138,6 +137,43 @@ class MpsManager:
             f"orphan MPS daemon pid {daemon_pid} did not exit after quit",
         )
         shutil.rmtree(run_dir)
+
+    def _reap_orphan_clients(
+        self,
+        run_dir: Path,
+        pipe_dir: Path,
+        daemon_pid: int,
+        live_clients: set[int],
+    ) -> None:
+        for force in (False, True):
+            for pid in sorted(live_clients):
+                logger.warning(
+                    "Killing orphaned MPS client pid %d left by stale run %s",
+                    pid,
+                    run_dir,
+                )
+                self.client.kill_pid(pid, force=force)
+            try:
+                self._wait_for(
+                    lambda: not any(self.client.pid_alive(pid) for pid in live_clients),
+                    self.stop_timeout,
+                    "orphaned MPS clients survived",
+                )
+                return
+            except MpsError:
+                if force:
+                    raise MpsError(
+                        f"MPS daemon pid {daemon_pid} from stale run dir "
+                        f"{run_dir} still has live clients "
+                        f"{sorted(live_clients)} after SIGKILL; refusing to "
+                        "reclaim it. Kill them manually."
+                    )
+
+    def _clients_of(self, pipe_dir: Path) -> set[int]:
+        pids: set[int] = set()
+        for server_pid in self.client.get_server_list(pipe_dir):
+            pids.update(self.client.get_client_list(pipe_dir, server_pid))
+        return pids
 
     def start(self) -> None:
         self.state = MpsState.STARTING
@@ -182,9 +218,8 @@ class MpsManager:
             self._wait_for(
                 attached,
                 self.verify_timeout,
-                # Note (Jiaxin Deng): a process that missed the pipe dir falls
-                # back to time-slicing without any error, so absence here must
-                # fail startup rather than degrade silently.
+                # Note (Jiaxin Deng): a client that missed the pipe dir
+                # time-slices with no error, so absence must fail startup.
                 lambda: (
                     f"stage process(es) {sorted(missing)} never attached to the "
                     f"MPS server (pipe dir {self.paths.pipe_dir})"
@@ -202,6 +237,19 @@ class MpsManager:
         return self.client.control_responds(self.paths.pipe_dir)
 
     def stop(self) -> None:
+        if self.daemon_pid is None:
+            shutil.rmtree(self.paths.state_dir, ignore_errors=True)
+            self.state = MpsState.CLEANED
+            return
+        if self.daemon_pid is not None and not self.client.pid_alive(self.daemon_pid):
+            logger.warning(
+                "MPS daemon pid %d already dead; removing state dir %s",
+                self.daemon_pid,
+                self.paths.state_dir,
+            )
+            shutil.rmtree(self.paths.state_dir, ignore_errors=True)
+            self.state = MpsState.CLEANED
+            return
         self.state = MpsState.DRAINING
         try:
             self._wait_for(
@@ -212,14 +260,22 @@ class MpsManager:
             self.state = MpsState.STOPPING
             self.client.quit_daemon(self.paths.pipe_dir)
             self._wait_for(
-                lambda: self.daemon_pid is None
-                or not self.client.pid_alive(self.daemon_pid),
+                lambda: (
+                    self.daemon_pid is None
+                    or not self.client.pid_alive(self.daemon_pid)
+                ),
                 self.stop_timeout,
                 "MPS daemon did not exit after quit",
             )
         except MpsError:
             self._fail()
             raise
+        except OSError as exc:
+            self._fail()
+            raise MpsError(
+                f"MPS control I/O failed during teardown: {exc}. State dir "
+                f"preserved for inspection: {self.paths.state_dir}"
+            ) from exc
         shutil.rmtree(self.paths.state_dir)
         self.state = MpsState.CLEANED
 

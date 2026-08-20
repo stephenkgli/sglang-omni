@@ -28,9 +28,7 @@ class MpsGpuPlan:
 
 
 def _process_gpu_ids(process_spec) -> set[int]:
-    return {
-        spec.gpu_id for spec in process_spec.stage_specs if spec.gpu_id is not None
-    }
+    return {spec.gpu_id for spec in process_spec.stage_specs if spec.gpu_id is not None}
 
 
 def _is_eligible(process_spec, gpu_ids: set[int]) -> bool:

@@ -1413,6 +1413,18 @@ def serve(
             ),
         ),
     ] = None,
+    mps: Annotated[
+        str | None,
+        typer.Option(
+            "--mps",
+            help=(
+                "CUDA MPS for colocated GPU processes: off, on, or auto. "
+                "auto starts a private MPS daemon on any GPU hosting two or "
+                "more single-GPU stage processes. Omit to use the pipeline "
+                "config default (off)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Serve the pipeline."""
     logging.basicConfig(
@@ -1458,6 +1470,10 @@ def serve(
         mem_fraction_static=mem_fraction_static,
         thinker_mem_fraction_static=thinker_mem_fraction_static,
     )
+    if mps is not None:
+        if mps not in ("off", "on", "auto"):
+            raise typer.BadParameter("--mps must be off, on, or auto")
+        merged_config = merged_config.model_copy(update={"mps": mps})
     merged_config = apply_backbone_server_args_cli_overrides(
         merged_config,
         cpu_offload_gb=cpu_offload_gb,
