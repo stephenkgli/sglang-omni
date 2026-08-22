@@ -122,8 +122,8 @@ class MpsGpuPaths:
 
 
 @contextmanager
-def state_root_lock(root: Path):
-    """Serialize daemon create/join/leave across processes on one host.
+def state_root_lock(root: Path, lock_name: str = ".lock"):
+    """Serialize daemon create/join/leave for one GPU across processes.
 
     No-op where flock is unavailable (non-POSIX unit-test hosts).
     """
@@ -131,7 +131,7 @@ def state_root_lock(root: Path):
         yield
         return
     root.mkdir(parents=True, exist_ok=True)
-    with open(root / ".lock", "w") as lock_file:
+    with open(root / lock_name, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
             yield

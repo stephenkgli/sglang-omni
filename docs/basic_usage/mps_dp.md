@@ -56,7 +56,9 @@ that belongs to a still-running serve or to another user's daemon is never
 touched.
 
 Operator notes: state lives under `/tmp/sglang-omni-mps-<user>/<gpu-uuid>/`
-(`SGLANG_OMNI_MPS_STATE_ROOT` overrides it). If startup refuses with a
+(`SGLANG_OMNI_MPS_STATE_ROOT` overrides it). Serves that are meant to share
+one GPU must use the same state root, or they cannot discover each other's
+daemon and will run separate MPS servers that time-slice against each other. If startup refuses with a
 message naming live client PIDs, those processes survived SIGKILL and hold
 the GPU; kill them and restart. A globally exported `CUDA_MPS_PIPE_DIRECTORY`
 is rejected while `--mps` is enabled, and combining native `--mps` with the

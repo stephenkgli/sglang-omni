@@ -42,6 +42,7 @@ import pytest
 
 from benchmarks.dataset.prepare import DATASETS, download_dataset
 from benchmarks.metrics.wer import print_wer_summary
+from sglang_omni.mps import derive_core_blocks
 from tests.test_ci.tts_mps_ci_config import (
     MPS_SIMILARITY_MEAN_MIN,
     check_mps_performance,
@@ -82,7 +83,6 @@ from tests.utils.tts_mps_runtime import (
     MpsLaunchSpec,
     atomic_write_json,
     capture_gpu_clients,
-    derive_core_blocks,
     launch_replicas,
     new_summary,
     read_model_path_activity,

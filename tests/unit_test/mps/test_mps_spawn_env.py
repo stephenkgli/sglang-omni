@@ -12,9 +12,13 @@ from sglang_omni.pipeline.stage_workers import _patched_spawn_env
 @dataclass
 class StubStageSpec:
     stage_name: str = "thinker"
-    gpu_id: int = 0
+    gpu_id: int | None = 0
     tp_size: int = 1
+    tp_rank: int = 0
+    placement_gpu_id: int | None = None
     env_defaults: dict = field(default_factory=dict)
+    factory_arg_defaults: dict = field(default_factory=dict)
+    comm_config: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -44,3 +48,17 @@ def test_no_extra_env_keeps_existing_behavior():
     spec = StubProcessSpec()
     with _patched_spawn_env(spec):
         assert "CUDA_MPS_PIPE_DIRECTORY" not in os.environ
+
+
+def test_cpu_stage_keeps_none_gpu_id_under_single_device_marker(monkeypatch):
+    import logging
+
+    from sglang_omni.pipeline.stage_workers import _prepare_accelerator_environment
+
+    spec = StubStageSpec(stage_name="preprocessing")
+    spec.gpu_id = None
+    monkeypatch.setenv("SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS", "true")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-abc")
+
+    _prepare_accelerator_environment(spec, logging.getLogger("test"))
+    assert spec.gpu_id is None

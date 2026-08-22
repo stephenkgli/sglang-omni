@@ -404,3 +404,72 @@ def test_stop_wraps_client_io_errors_as_mps_error(short_root):
     with pytest.raises(MpsError, match="wedged"):
         mgr.stop()
     assert mgr.state is MpsState.FAILED
+
+
+def test_verify_registers_own_clients_in_owner_file(short_root):
+    client = FakeControlClient()
+    mgr = start_serving(short_root, client)
+    del mgr
+    recorded = json.loads(
+        (
+            MpsGpuPaths(state_root=short_root, gpu_uuid=GPU_UUID).owners_dir
+            / str(os.getpid())
+        ).read_text()
+    )
+    assert recorded["pids"] == [101]
+
+
+def test_join_reaps_only_clients_unclaimed_by_live_owners(short_root):
+    client = FakeControlClient()
+    client.alive_pids.update({999, 888, 71, 75})
+    paths = seed_shared_dir(
+        short_root, client, daemon_pid=999, owners=[], clients=[71, 75]
+    )
+    client.pid_pipe_dirs[999] = str(paths.pipe_dir)
+    # Live owner 888 registered wrapper pid 70; client 71 is its child.
+    (paths.owners_dir / "888").write_text(json.dumps({"pids": [70]}))
+    client.parents = {71: 70}
+    killed = []
+
+    def kill_pid(pid, force=False):
+        killed.append(pid)
+        client.alive_pids.discard(pid)
+        client.servers = {
+            s: [c for c in cs if c != pid] for s, cs in client.servers.items()
+        }
+
+    client.kill_pid = kill_pid
+
+    mgr = make_manager(short_root, client)
+    mgr.start()
+    assert killed == [75]
+    assert 71 in client.alive_pids
+
+
+def test_manifest_daemon_pid_recovered_from_daemon_pid_file(short_root):
+    client = FakeControlClient()
+    client.alive_pids.add(999)
+    paths = seed_shared_dir(short_root, client, daemon_pid=999, owners=[888])
+    client.alive_pids.add(888)
+    client.pid_pipe_dirs[999] = str(paths.pipe_dir)
+    paths.manifest.write_text("{torn")  # unreadable manifest
+    (paths.pipe_dir / "nvidia-cuda-mps-control.pid").write_text("999\n")
+
+    mgr = make_manager(short_root, client)
+    mgr.start()
+    assert client.start_calls == 0
+    assert mgr.daemon_pid == 999
+
+
+def test_stop_wraps_arbitrary_control_exceptions(short_root):
+    import subprocess as sp
+
+    client = FakeControlClient()
+    mgr = start_serving(short_root, client)
+    client.get_server_list = lambda pipe_dir: (_ for _ in ()).throw(
+        sp.TimeoutExpired(cmd="nvidia-cuda-mps-control", timeout=10)
+    )
+
+    with pytest.raises(MpsError):
+        mgr.stop()
+    assert mgr.state is MpsState.FAILED

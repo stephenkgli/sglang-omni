@@ -819,6 +819,10 @@ def _prepare_accelerator_environment(
         current_platform.is_cuda_alike()
         and os.environ.get("SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS") == "true"
     ):
+        if spec.gpu_id is None:
+            # A CPU stage colocated in a GPU-narrowed process keeps its
+            # identity; normalizing it would bind it to the local device.
+            return
         mapped_gpu = os.environ.get("CUDA_VISIBLE_DEVICES", str(spec.gpu_id))
         _normalize_spec_gpu_id_to_local_device(spec)
         log.info(

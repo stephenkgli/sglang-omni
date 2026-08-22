@@ -163,7 +163,7 @@ class MpsPipelineRuntime:
         for manager in self.managers.values():
             try:
                 manager.stop()
-            except MpsError as exc:
+            except Exception as exc:
                 errors.append(str(exc))
         if errors:
             raise MpsError("; ".join(errors))

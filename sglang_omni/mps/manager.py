@@ -87,13 +87,11 @@ class MpsManager:
     def _owner_file(self) -> Path:
         return self.paths.owners_dir / str(os.getpid())
 
-    # --- startup: create or join the shared daemon ---
-
     def start(self) -> None:
         self.state = MpsState.STARTING
         validate_control_socket(self.paths.control_socket)
         try:
-            with state_root_lock(self.paths.state_root):
+            with state_root_lock(self.paths.state_root, f".lock-{self.gpu_uuid}"):
                 self._start_locked()
         except MpsError:
             self._fail()
@@ -123,13 +121,26 @@ class MpsManager:
                 self.gpu_uuid,
                 sorted(self._owner_pids()),
             )
+            # Note (Jiaxin Deng): a co-owner may have been hard-killed while
+            # others live on; its clients are the ones no live owner claims.
+            protected = self._registered_pids_of_live_owners()
+            if self._unclaimed_clients(protected):
+                self._reap_orphan_clients(
+                    self.paths.state_dir,
+                    self.paths.pipe_dir,
+                    daemon_pid,
+                    protected=protected,
+                )
         elif alive:
             # Every owner died (hard kill); the daemon and possibly its
             # clients are orphans of our namespace. Reap the clients, keep
             # the healthy daemon.
             if self._live_clients(self.paths.pipe_dir):
                 self._reap_orphan_clients(
-                    self.paths.state_dir, self.paths.pipe_dir, daemon_pid
+                    self.paths.state_dir,
+                    self.paths.pipe_dir,
+                    daemon_pid,
+                    protected=set(),
                 )
             self.daemon_pid = daemon_pid
             logger.warning(
@@ -139,13 +150,14 @@ class MpsManager:
             )
         else:
             self._spawn_fresh_daemon()
-        self._owner_file.write_text("")
+        self._owner_file.write_text(json.dumps({"pids": []}))
         self._registered = True
 
     def _spawn_fresh_daemon(self) -> None:
         # A stale control socket from a dead daemon confuses the new one.
         shutil.rmtree(self.paths.pipe_dir, ignore_errors=True)
         self.paths.pipe_dir.mkdir(parents=True, exist_ok=True)
+        self._write_manifest()
         try:
             self.daemon_pid = self.client.start_daemon(
                 self.paths.pipe_dir, self.paths.log_dir, self.gpu_uuid
@@ -166,11 +178,24 @@ class MpsManager:
         try:
             manifest = json.loads(self.paths.manifest.read_text())
             raw = manifest.get("daemon_pid")
-            return int(raw) if raw is not None else None
+            if raw is not None:
+                return int(raw)
         except (OSError, ValueError, KeyError, TypeError):
             pass
-        # Note (Jiaxin Deng): no readable ownership record; a live unknown
-        # daemon is not ours to kill or reuse, so refuse loudly.
+        # Note (Jiaxin Deng): the daemon's own PID file survives a torn or
+        # missing manifest; trust it only with the environ ownership proof.
+        try:
+            recovered = int(
+                (self.paths.pipe_dir / "nvidia-cuda-mps-control.pid")
+                .read_text()
+                .strip()
+            )
+            if self.client.pid_alive(recovered) and self.client.daemon_owns_pipe(
+                recovered, self.paths.pipe_dir
+            ):
+                return recovered
+        except (OSError, ValueError):
+            pass
         if self.client.control_responds(self.paths.pipe_dir):
             raise MpsError(
                 f"MPS state dir {self.paths.state_dir} has no readable "
@@ -201,12 +226,13 @@ class MpsManager:
         state_dir: Path,
         pipe_dir: Path,
         daemon_pid: int,
+        protected: set[int],
     ) -> None:
         targets: set[int] = set()
         for force in (False, True):
             # Note (Jiaxin Deng): re-query membership right before signalling
             # so a recycled PID that is no longer an MPS client is never hit.
-            targets = self._live_clients(pipe_dir)
+            targets = self._unclaimed_clients(protected)
             if not targets:
                 return
             for pid in sorted(targets):
@@ -218,7 +244,7 @@ class MpsManager:
                 self.client.kill_pid(pid, force=force)
             try:
                 self._wait_for(
-                    lambda: not self._live_clients(pipe_dir),
+                    lambda: not self._unclaimed_clients(protected),
                     self.stop_timeout,
                     "orphaned MPS clients survived",
                 )
@@ -231,8 +257,6 @@ class MpsManager:
                         "SIGKILL; refusing to proceed. Kill them manually."
                     )
 
-    # --- owner registry ---
-
     def _owner_pids(self) -> set[int]:
         if not self.paths.owners_dir.exists():
             return set()
@@ -242,12 +266,33 @@ class MpsManager:
             if entry.name.isdigit()
         }
 
+    def register_clients(self, expected_pids: set[int]) -> None:
+        with state_root_lock(self.paths.state_root, f".lock-{self.gpu_uuid}"):
+            self._owner_file.write_text(json.dumps({"pids": sorted(expected_pids)}))
+
+    def _registered_pids_of_live_owners(self) -> set[int]:
+        pids: set[int] = set()
+        for owner in self._owner_pids():
+            if owner != os.getpid() and not self.client.pid_alive(owner):
+                continue
+            try:
+                recorded = json.loads((self.paths.owners_dir / str(owner)).read_text())
+                pids.update(int(pid) for pid in recorded.get("pids", []))
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+        return pids
+
+    def _unclaimed_clients(self, protected: set[int]) -> set[int]:
+        return {
+            pid
+            for pid in self._live_clients(self.paths.pipe_dir)
+            if not any(self._tree_attached(p, {pid}) for p in protected)
+        }
+
     def _prune_dead_owners(self) -> None:
         for pid in self._owner_pids():
             if pid != os.getpid() and not self.client.pid_alive(pid):
                 (self.paths.owners_dir / str(pid)).unlink(missing_ok=True)
-
-    # --- serving-side surfaces ---
 
     def env_for_stage(self) -> dict[str, str]:
         return {
@@ -283,6 +328,7 @@ class MpsManager:
         except MpsError:
             self._fail()
             raise
+        self.register_clients(expected)
         self.state = MpsState.SERVING
 
     def probe(self) -> bool:
@@ -304,16 +350,14 @@ class MpsManager:
                 current = self.client.parent_of(current)
         return False
 
-    # --- teardown: leave, and quit when last owner ---
-
     def stop(self) -> None:
         try:
-            with state_root_lock(self.paths.state_root):
+            with state_root_lock(self.paths.state_root, f".lock-{self.gpu_uuid}"):
                 self._stop_locked()
         except MpsError:
             self._fail()
             raise
-        except OSError as exc:
+        except Exception as exc:
             self._fail()
             raise MpsError(
                 f"MPS control I/O failed during teardown: {exc}. State dir "
@@ -363,8 +407,6 @@ class MpsManager:
         shutil.rmtree(self.paths.state_dir)
         self.state = MpsState.CLEANED
 
-    # --- shared helpers ---
-
     def _live_clients(self, pipe_dir: Path) -> set[int]:
         return {pid for pid in self._clients_of(pipe_dir) if self.client.pid_alive(pid)}
 
@@ -384,7 +426,9 @@ class MpsManager:
             "creator_pid": os.getpid(),
             "pipe_dir": str(self.paths.pipe_dir),
         }
-        self.paths.manifest.write_text(json.dumps(manifest))
+        staging = self.paths.manifest.with_suffix(".tmp")
+        staging.write_text(json.dumps(manifest))
+        os.replace(staging, self.paths.manifest)
 
     def _wait_for(self, predicate, timeout: float, message) -> None:
         deadline = time.monotonic() + timeout

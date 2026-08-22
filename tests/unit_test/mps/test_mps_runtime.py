@@ -118,3 +118,24 @@ def test_global_pipe_dir_export_is_rejected(short_root, monkeypatch):
     monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/tmp/nvidia-mps")
     with pytest.raises(MpsError, match="CUDA_MPS_PIPE_DIRECTORY"):
         create(short_root)
+
+
+def test_runtime_stop_attempts_every_manager(short_root, monkeypatch):
+    client = FakeControlClient()
+    runtime = create(
+        short_root,
+        procs=[proc("a", 0), proc("b", 0), proc("c", 1), proc("d", 1)],
+        client=client,
+    )
+    runtime.start()
+    first = runtime.managers[0]
+    second = runtime.managers[1]
+    monkeypatch.setattr(
+        first, "stop", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    stopped = []
+    monkeypatch.setattr(second, "stop", lambda: stopped.append(True))
+
+    with pytest.raises(MpsError, match="boom"):
+        runtime.stop()
+    assert stopped == [True]

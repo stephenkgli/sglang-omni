@@ -55,7 +55,10 @@ class NvmlDeviceInfo:
             try:
                 mig_current, _ = pynvml.nvmlDeviceGetMigMode(handle)
                 if mig_current == pynvml.NVML_DEVICE_MIG_ENABLE:
-                    return "MIG mode is enabled; MIG instances already isolate"
+                    return (
+                        "MIG mode is enabled; native MPS is not validated "
+                        "for MIG deployments in SGLang Omni, run with mps=off"
+                    )
             except pynvml.NVMLError_NotSupported:
                 pass
             return None
