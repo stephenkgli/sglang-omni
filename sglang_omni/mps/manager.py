@@ -26,6 +26,11 @@ from typing import Protocol
 
 from sglang_omni.mps.state import MpsGpuPaths, state_root_lock, validate_control_socket
 
+try:
+    import fcntl
+except ImportError:  # non-POSIX unit-test hosts
+    fcntl = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,6 +71,8 @@ class MpsControlClient(Protocol):
 
     def daemon_owns_pipe(self, pid: int, pipe_dir: Path) -> bool: ...
 
+    def owner_lease_held(self, lease_file: Path) -> bool: ...
+
 
 @dataclass
 class MpsManager:
@@ -82,6 +89,7 @@ class MpsManager:
         self.state = MpsState.IDLE
         self.daemon_pid: int | None = None
         self._registered = False
+        self._owner_lease_fh = None
 
     @property
     def _owner_file(self) -> Path:
@@ -107,33 +115,61 @@ class MpsManager:
             self.paths.log_dir.mkdir(parents=True, exist_ok=True)
             self.paths.owners_dir.mkdir(parents=True, exist_ok=True)
             self._spawn_fresh_daemon()
-            self._owner_file.write_text("")
-            self._registered = True
+            self._acquire_owner_lease()
             return
 
         daemon_pid = self._manifest_daemon_pid()
         owners = self._owner_pids()
-        dead_owners = {pid for pid in owners if not self.client.pid_alive(pid)}
-        daemon_alive = (
+        live_owners = {pid for pid in owners if self._owner_alive(pid)}
+        dead_leases = owners - live_owners
+        daemon_healthy = (
             daemon_pid is not None
             and self.client.pid_alive(daemon_pid)
             and self.client.daemon_owns_pipe(daemon_pid, self.paths.pipe_dir)
+            and self.client.control_responds(self.paths.pipe_dir)
         )
-        # Note (Jiaxin Deng): the only healthy existing state is a live shared
-        # daemon whose owners are all alive. Anything else is dirty state from
-        # a hard kill; we fail with the full picture instead of guessing.
-        if daemon_alive and owners and not dead_owners:
+        if daemon_healthy and live_owners:
+            # A dead co-owner's lease was released by the kernel; the file is
+            # unowned and joining proceeds under the surviving pool.
+            self._remove_leases(dead_leases)
             self.daemon_pid = daemon_pid
-            self._owner_file.write_text("")
-            self._registered = True
+            self._acquire_owner_lease()
             logger.info(
                 "Joining shared MPS daemon pid %d on %s (owners: %s)",
                 daemon_pid,
                 self.gpu_uuid,
-                sorted(owners),
+                sorted(live_owners),
             )
             return
-        raise MpsError(self._dirty_state_report(daemon_pid, owners, dead_owners))
+        if daemon_healthy and not self._live_clients(self.paths.pipe_dir):
+            # The one allowed adoption: provable identity, healthy control,
+            # no live owner, empty client list.
+            self._remove_leases(dead_leases)
+            self.daemon_pid = daemon_pid
+            self._acquire_owner_lease()
+            logger.warning(
+                "Adopting idle MPS daemon pid %d on %s", daemon_pid, self.gpu_uuid
+            )
+            return
+        # Anything else is dirty state from a hard kill; fail with the full
+        # picture instead of guessing.
+        raise MpsError(self._dirty_state_report(daemon_pid, live_owners, dead_leases))
+
+    def _acquire_owner_lease(self) -> None:
+        self._owner_file.write_text("")
+        if fcntl is not None:
+            # Held for the life of this process; the kernel releases it on any
+            # exit, so liveness probing is immune to PID reuse.
+            self._owner_lease_fh = open(self._owner_file, "r+")
+            fcntl.flock(self._owner_lease_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self._registered = True
+
+    def _owner_alive(self, pid: int) -> bool:
+        return self.client.owner_lease_held(self.paths.owners_dir / str(pid))
+
+    def _remove_leases(self, pids: set[int]) -> None:
+        for pid in pids:
+            (self.paths.owners_dir / str(pid)).unlink(missing_ok=True)
 
     def _dirty_state_report(
         self,
@@ -292,9 +328,12 @@ class MpsManager:
 
     def _stop_locked(self) -> None:
         if self._registered:
+            if self._owner_lease_fh is not None:
+                self._owner_lease_fh.close()
+                self._owner_lease_fh = None
             self._owner_file.unlink(missing_ok=True)
             self._registered = False
-        remaining = {pid for pid in self._owner_pids() if self.client.pid_alive(pid)}
+        remaining = {pid for pid in self._owner_pids() if self._owner_alive(pid)}
         if remaining:
             logger.info(
                 "Leaving shared MPS daemon on %s to owners %s",

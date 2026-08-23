@@ -76,6 +76,12 @@ class FakeControlClient:
     def daemon_owns_pipe(self, pid, pipe_dir):
         return self.pid_pipe_dirs.get(pid) == str(pipe_dir)
 
+    def owner_lease_held(self, lease_file):
+        try:
+            return int(lease_file.name) in self.alive_pids
+        except ValueError:
+            return False
+
 
 GPU_UUID = "GPU-11111111-2222-3333-4444-555555555555"
 
@@ -370,15 +376,34 @@ def test_orphan_daemon_with_no_live_owner_fails(short_root):
     assert 555 in client.alive_pids  # nothing was signalled
 
 
-def test_join_with_dead_co_owner_fails(short_root):
+def test_join_removes_dead_co_owner_lease_and_joins(short_root):
+    # A dead co-owner's lease is already released by the kernel; the leftover
+    # file is unowned, so joining proceeds under the surviving owner's pool.
     client = FakeControlClient()
     client.alive_pids.update({999, 888})
     paths = seed_shared_dir(short_root, client, daemon_pid=999, owners=[888, 777])
     client.pid_pipe_dirs[999] = str(paths.pipe_dir)
 
     mgr = make_manager(short_root, client)
-    with pytest.raises(MpsError, match="777"):
-        mgr.start()
+    mgr.start()
+    assert mgr.daemon_pid == 999
+    assert not (paths.owners_dir / "777").exists()
+    assert (paths.owners_dir / "888").exists()
+
+
+def test_idle_healthy_daemon_is_adopted(short_root):
+    # The one allowed adoption: provable identity, healthy control, no live
+    # owner, and an empty client list.
+    client = FakeControlClient()
+    client.alive_pids.add(999)
+    paths = seed_shared_dir(short_root, client, daemon_pid=999, owners=[777])
+    client.pid_pipe_dirs[999] = str(paths.pipe_dir)
+
+    mgr = make_manager(short_root, client)
+    mgr.start()
+    assert mgr.daemon_pid == 999
+    assert client.start_calls == 0
+    assert not (paths.owners_dir / "777").exists()
 
 
 def test_torn_manifest_fails_with_guidance(short_root):

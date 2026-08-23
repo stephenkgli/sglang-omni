@@ -108,6 +108,21 @@ class SubprocessMpsControlClient:
         except (OSError, IndexError, ValueError):
             return None
 
+    def owner_lease_held(self, lease_file: Path) -> bool:
+        try:
+            import fcntl
+        except ImportError:
+            return False
+        try:
+            with open(lease_file, "r+") as probe:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(probe, fcntl.LOCK_UN)
+                return False
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+
     def daemon_owns_pipe(self, pid: int, pipe_dir: Path) -> bool:
         try:
             environ = Path(f"/proc/{pid}/environ").read_bytes()

@@ -32,6 +32,9 @@ MODEL = os.environ.get("MPS_NATIVE_CI_MODEL", "bosonai/higgs-tts-3-4b")
 STATE_ROOT = Path(os.environ.get("MPS_NATIVE_CI_STATE_ROOT", "/tmp/mps-native-ci"))
 HEALTH_TRIES = 150
 HEALTH_INTERVAL = 5
+# Dedicated CI cards start empty; a shared dev box can raise this to tolerate
+# other tenants' resident memory while still catching our own leaks.
+DRAIN_BASE_MIB = int(os.environ.get("MPS_NATIVE_CI_DRAIN_BASE_MIB", "2000"))
 
 pytestmark = pytest.mark.skipif(
     shutil.which("nvidia-cuda-mps-control") is None
@@ -164,7 +167,7 @@ def _wait_gpu_drained(timeout_s: int = 180) -> None:
         )
         used = result.stdout.strip()
         try:
-            if int(used) < 2000:
+            if int(used) < DRAIN_BASE_MIB:
                 return
         except ValueError:
             return
