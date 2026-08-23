@@ -167,88 +167,6 @@ def test_second_owner_joins_existing_daemon(short_root):
     assert not (paths.owners_dir / str(os.getpid())).exists()
 
 
-def test_orphan_daemon_is_adopted_after_reaping_clients(short_root):
-    client = FakeControlClient()
-    client.alive_pids.update({999, 555})
-    paths = seed_shared_dir(
-        short_root, client, daemon_pid=999, owners=[777], clients=[555]
-    )
-    client.pid_pipe_dirs[999] = str(paths.pipe_dir)  # owner 777 is dead
-
-    mgr = make_manager(short_root, client)
-    mgr.start()
-    assert client.start_calls == 0
-    assert mgr.daemon_pid == 999
-    assert 555 not in client.alive_pids
-    assert not (paths.owners_dir / "777").exists()
-
-
-def test_dead_daemon_is_replaced_by_fresh_spawn(short_root):
-    client = FakeControlClient()
-    seed_shared_dir(short_root, client, daemon_pid=999, owners=[777])  # all dead
-
-    mgr = make_manager(short_root, client)
-    mgr.start()
-    assert client.start_calls == 1
-    assert mgr.daemon_pid == client.daemon_pid
-
-
-def test_reap_requeries_membership_before_kill(short_root):
-    client = FakeControlClient()
-    client.alive_pids.update({999, 555})
-    paths = seed_shared_dir(
-        short_root, client, daemon_pid=999, owners=[], clients=[555]
-    )
-    client.pid_pipe_dirs[999] = str(paths.pipe_dir)
-    killed = []
-    client.kill_pid = lambda pid, force=False: killed.append(pid)
-    # Between discovery and the kill loop the client exits and its PID is
-    # recycled by a stranger: still alive, but no longer an MPS client.
-    calls = {"n": 0}
-    original = client.get_client_list
-
-    def racy_get_client_list(pipe_dir, server_pid):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return original(pipe_dir, server_pid)
-        return []
-
-    client.get_client_list = racy_get_client_list
-
-    mgr = make_manager(short_root, client)
-    mgr.start()
-    assert killed == []
-
-
-def test_unkillable_orphan_client_blocks_startup(short_root):
-    client = FakeControlClient()
-    client.alive_pids.update({999, 555})
-    paths = seed_shared_dir(
-        short_root, client, daemon_pid=999, owners=[], clients=[555]
-    )
-    client.pid_pipe_dirs[999] = str(paths.pipe_dir)
-    client.kill_pid = lambda pid, force=False: None  # unkillable client
-
-    mgr = make_manager(short_root, client)
-    with pytest.raises(MpsError, match="[Kk]ill them manually"):
-        mgr.start()
-    assert mgr.state is MpsState.FAILED
-    assert client.quit_calls == []
-
-
-def test_unreadable_manifest_with_live_control_socket_refuses(short_root):
-    client = FakeControlClient()
-    paths = MpsGpuPaths(state_root=short_root, gpu_uuid=GPU_UUID)
-    paths.pipe_dir.mkdir(parents=True)
-    # A live daemon we have no record of answers on this pipe dir.
-    client.alive_pids.add(31337)
-    client.pid_pipe_dirs[31337] = str(paths.pipe_dir)
-
-    mgr = make_manager(short_root, client)
-    with pytest.raises(MpsError, match="manually"):
-        mgr.start()
-
-
 def test_start_control_never_responding_reaps_fresh_daemon(short_root):
     client = FakeControlClient()
     client.control_responsive = False
@@ -406,61 +324,6 @@ def test_stop_wraps_client_io_errors_as_mps_error(short_root):
     assert mgr.state is MpsState.FAILED
 
 
-def test_verify_registers_own_clients_in_owner_file(short_root):
-    client = FakeControlClient()
-    mgr = start_serving(short_root, client)
-    del mgr
-    recorded = json.loads(
-        (
-            MpsGpuPaths(state_root=short_root, gpu_uuid=GPU_UUID).owners_dir
-            / str(os.getpid())
-        ).read_text()
-    )
-    assert recorded["pids"] == [101]
-
-
-def test_join_reaps_only_clients_unclaimed_by_live_owners(short_root):
-    client = FakeControlClient()
-    client.alive_pids.update({999, 888, 71, 75})
-    paths = seed_shared_dir(
-        short_root, client, daemon_pid=999, owners=[], clients=[71, 75]
-    )
-    client.pid_pipe_dirs[999] = str(paths.pipe_dir)
-    # Live owner 888 registered wrapper pid 70; client 71 is its child.
-    (paths.owners_dir / "888").write_text(json.dumps({"pids": [70]}))
-    client.parents = {71: 70}
-    killed = []
-
-    def kill_pid(pid, force=False):
-        killed.append(pid)
-        client.alive_pids.discard(pid)
-        client.servers = {
-            s: [c for c in cs if c != pid] for s, cs in client.servers.items()
-        }
-
-    client.kill_pid = kill_pid
-
-    mgr = make_manager(short_root, client)
-    mgr.start()
-    assert killed == [75]
-    assert 71 in client.alive_pids
-
-
-def test_manifest_daemon_pid_recovered_from_daemon_pid_file(short_root):
-    client = FakeControlClient()
-    client.alive_pids.add(999)
-    paths = seed_shared_dir(short_root, client, daemon_pid=999, owners=[888])
-    client.alive_pids.add(888)
-    client.pid_pipe_dirs[999] = str(paths.pipe_dir)
-    paths.manifest.write_text("{torn")  # unreadable manifest
-    (paths.pipe_dir / "nvidia-cuda-mps-control.pid").write_text("999\n")
-
-    mgr = make_manager(short_root, client)
-    mgr.start()
-    assert client.start_calls == 0
-    assert mgr.daemon_pid == 999
-
-
 def test_stop_wraps_arbitrary_control_exceptions(short_root):
     import subprocess as sp
 
@@ -473,3 +336,57 @@ def test_stop_wraps_arbitrary_control_exceptions(short_root):
     with pytest.raises(MpsError):
         mgr.stop()
     assert mgr.state is MpsState.FAILED
+
+
+def test_dead_owner_leftover_fails_with_cleanup_guidance(short_root):
+    client = FakeControlClient()
+    paths = seed_shared_dir(short_root, client, daemon_pid=999, owners=[777])
+
+    mgr = make_manager(short_root, client)
+    with pytest.raises(MpsError) as excinfo:
+        mgr.start()
+    message = str(excinfo.value)
+    assert str(paths.state_dir) in message
+    assert "777" in message
+    assert "rm -rf" in message
+    assert paths.state_dir.is_dir()  # nothing is deleted for the operator
+
+
+def test_orphan_daemon_with_no_live_owner_fails(short_root):
+    client = FakeControlClient()
+    client.alive_pids.update({999, 555})
+    paths = seed_shared_dir(
+        short_root, client, daemon_pid=999, owners=[777], clients=[555]
+    )
+    client.pid_pipe_dirs[999] = str(paths.pipe_dir)
+
+    mgr = make_manager(short_root, client)
+    with pytest.raises(MpsError) as excinfo:
+        mgr.start()
+    message = str(excinfo.value)
+    assert "999" in message  # the daemon to kill
+    assert "555" in message  # the client to kill
+    assert client.quit_calls == []
+    assert 555 in client.alive_pids  # nothing was signalled
+
+
+def test_join_with_dead_co_owner_fails(short_root):
+    client = FakeControlClient()
+    client.alive_pids.update({999, 888})
+    paths = seed_shared_dir(short_root, client, daemon_pid=999, owners=[888, 777])
+    client.pid_pipe_dirs[999] = str(paths.pipe_dir)
+
+    mgr = make_manager(short_root, client)
+    with pytest.raises(MpsError, match="777"):
+        mgr.start()
+
+
+def test_torn_manifest_fails_with_guidance(short_root):
+    client = FakeControlClient()
+    client.alive_pids.add(888)
+    paths = seed_shared_dir(short_root, client, daemon_pid=999, owners=[888])
+    paths.manifest.write_text("{torn")
+
+    mgr = make_manager(short_root, client)
+    with pytest.raises(MpsError, match="rm -rf"):
+        mgr.start()

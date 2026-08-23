@@ -55,6 +55,10 @@ def _serve(port: int, mps: str) -> subprocess.Popen:
             mps,
             "--mem-fraction-static",
             "0.45",
+            # DP replicas budget KV explicitly; the second serve profiles a
+            # shrunken free pool (see the KV sizing note in mps_dp.md).
+            "--max-total-tokens",
+            "20000",
             "--port",
             str(port),
         ],
@@ -108,7 +112,11 @@ def _terminate(proc: subprocess.Popen, timeout: float = 120.0) -> None:
 
 def _assert_no_residue() -> None:
     leftovers = (
-        [entry.name for entry in STATE_ROOT.iterdir() if entry.name != ".lock"]
+        [
+            entry.name
+            for entry in STATE_ROOT.iterdir()
+            if not entry.name.startswith(".lock")
+        ]
         if STATE_ROOT.exists()
         else []
     )
@@ -137,14 +145,56 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _wait_gpu_drained(timeout_s: int = 180) -> None:
+    # CUDA memory release lags SIGTERM, so back-to-back tests must wait for
+    # the previous serve's footprint to drain before profiling memory.
+    device = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
+    used = "unknown"
+    for _ in range(timeout_s // 5):
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+                "-i",
+                device,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        used = result.stdout.strip()
+        try:
+            if int(used) < 2000:
+                return
+        except ValueError:
+            return
+        time.sleep(5)
+    raise AssertionError(f"GPU {device} still holds {used} MiB before test start")
+
+
 @pytest.fixture(autouse=True)
 def clean_state_root():
     shutil.rmtree(STATE_ROOT, ignore_errors=True)
+    _wait_gpu_drained()
     yield
     shutil.rmtree(STATE_ROOT, ignore_errors=True)
 
 
-def test_auto_lifecycle_survives_hard_kill():
+def _operator_cleanup() -> None:
+    # The dirty-state error names the live client PIDs; those are the serve's
+    # orphaned spawn children, so the operator kills them along with the tree.
+    subprocess.run(["pkill", "-9", "-f", "sglang_omni.cli serve"], check=False)
+    subprocess.run(
+        ["pkill", "-9", "-f", "multiprocessing.spawn import spawn_main"],
+        check=False,
+    )
+    for pid in _daemon_pids():
+        subprocess.run(["kill", "-9", str(pid)], check=False)
+    time.sleep(10)
+    shutil.rmtree(STATE_ROOT, ignore_errors=True)
+
+
+def test_hard_kill_fails_fast_until_operator_cleans():
     port = _free_port()
     proc = _serve(port, "auto")
     try:
@@ -156,6 +206,16 @@ def test_auto_lifecycle_survives_hard_kill():
         proc.wait(timeout=30)
         time.sleep(10)
 
+        # Dirty state must fail the next start with the full picture instead
+        # of being silently repaired.
+        port = _free_port()
+        proc = _serve(port, "auto")
+        assert proc.wait(timeout=180) != 0, "serve started over dirty MPS state"
+        log = Path(f"/tmp/mps-native-ci-{port}.log").read_text(errors="replace")
+        assert "dirty state" in log and "rm -rf" in log
+
+        # After the documented operator cleanup, startup succeeds again.
+        _operator_cleanup()
         port = _free_port()
         proc = _serve(port, "auto")
         _wait_healthy(port, proc)

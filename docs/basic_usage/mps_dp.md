@@ -48,19 +48,20 @@ The runtime owns the full lifecycle. Every managed process is verified against
 the daemon's client list before serving starts, because a process that misses
 the pipe directory silently falls back to time slicing. A watchdog fails the
 pipeline if the daemon dies mid-serving. Shutdown drains this serve's clients
-and quits the daemon only when no other serve still owns it. After a hard
-kill, the next start reclaims what the dead runs left behind (orphaned stage
-processes, and the daemon is adopted or replaced) under ownership records
-kept next to the daemon, so a crashed run does not block the next one. State
-that belongs to a still-running serve or to another user's daemon is never
-touched.
+and quits the daemon only when no other serve still owns it.
+
+Dirty state is never repaired automatically. After a hard kill (SIGKILL, OOM
+kill, node crash), the next start finds leftover state, refuses to start, and
+prints the full picture: the state directory, the daemon and owner PIDs with
+their liveness, any live MPS clients, and the exact cleanup commands. Clean
+up and start again. A normal shutdown leaves nothing behind, so this only
+ever happens after a crash.
 
 Operator notes: state lives under `/tmp/sglang-omni-mps-<user>/<gpu-uuid>/`
 (`SGLANG_OMNI_MPS_STATE_ROOT` overrides it). Serves that are meant to share
 one GPU must use the same state root, or they cannot discover each other's
-daemon and will run separate MPS servers that time-slice against each other. If startup refuses with a
-message naming live client PIDs, those processes survived SIGKILL and hold
-the GPU; kill them and restart. A globally exported `CUDA_MPS_PIPE_DIRECTORY`
+daemon and will run separate MPS servers that time-slice against each other.
+A globally exported `CUDA_MPS_PIPE_DIRECTORY`
 is rejected while `--mps` is enabled, and combining native `--mps` with the
 script's `WEIGHT_SHARE=1` is rejected: CUDA IPC weight sharing remains the
 one deployment shape that still uses `examples/mps_dp/launch.sh` below.

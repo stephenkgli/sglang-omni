@@ -102,68 +102,80 @@ class MpsManager:
         self.state = MpsState.READY
 
     def _start_locked(self) -> None:
-        self.paths.pipe_dir.mkdir(parents=True, exist_ok=True)
-        self.paths.log_dir.mkdir(parents=True, exist_ok=True)
-        self.paths.owners_dir.mkdir(parents=True, exist_ok=True)
-        self._prune_dead_owners()
+        if not self.paths.state_dir.exists():
+            self.paths.pipe_dir.mkdir(parents=True, exist_ok=True)
+            self.paths.log_dir.mkdir(parents=True, exist_ok=True)
+            self.paths.owners_dir.mkdir(parents=True, exist_ok=True)
+            self._spawn_fresh_daemon()
+            self._owner_file.write_text("")
+            self._registered = True
+            return
 
         daemon_pid = self._manifest_daemon_pid()
-        alive = (
+        owners = self._owner_pids()
+        dead_owners = {pid for pid in owners if not self.client.pid_alive(pid)}
+        daemon_alive = (
             daemon_pid is not None
             and self.client.pid_alive(daemon_pid)
             and self.client.daemon_owns_pipe(daemon_pid, self.paths.pipe_dir)
         )
-        if alive and self._owner_pids():
+        # Note (Jiaxin Deng): the only healthy existing state is a live shared
+        # daemon whose owners are all alive. Anything else is dirty state from
+        # a hard kill; we fail with the full picture instead of guessing.
+        if daemon_alive and owners and not dead_owners:
             self.daemon_pid = daemon_pid
+            self._owner_file.write_text("")
+            self._registered = True
             logger.info(
                 "Joining shared MPS daemon pid %d on %s (owners: %s)",
                 daemon_pid,
                 self.gpu_uuid,
-                sorted(self._owner_pids()),
+                sorted(owners),
             )
-            # Note (Jiaxin Deng): a co-owner may have been hard-killed while
-            # others live on; its clients are the ones no live owner claims.
-            protected = self._registered_pids_of_live_owners()
-            if self._unclaimed_clients(protected):
-                self._reap_orphan_clients(
-                    self.paths.state_dir,
-                    self.paths.pipe_dir,
-                    daemon_pid,
-                    protected=protected,
-                )
-        elif alive:
-            # Every owner died (hard kill); the daemon and possibly its
-            # clients are orphans of our namespace. Reap the clients, keep
-            # the healthy daemon.
-            if self._live_clients(self.paths.pipe_dir):
-                self._reap_orphan_clients(
-                    self.paths.state_dir,
-                    self.paths.pipe_dir,
-                    daemon_pid,
-                    protected=set(),
-                )
-            self.daemon_pid = daemon_pid
-            logger.warning(
-                "Adopting orphan MPS daemon pid %d on %s left by dead owners",
-                daemon_pid,
-                self.gpu_uuid,
+            return
+        raise MpsError(self._dirty_state_report(daemon_pid, owners, dead_owners))
+
+    def _dirty_state_report(
+        self,
+        daemon_pid: int | None,
+        owners: set[int],
+        dead_owners: set[int],
+    ) -> str:
+        daemon_state = "unreadable manifest"
+        if daemon_pid is not None:
+            daemon_state = f"pid {daemon_pid} " + (
+                "alive" if self.client.pid_alive(daemon_pid) else "dead"
             )
-        else:
-            self._spawn_fresh_daemon()
-        self._owner_file.write_text(json.dumps({"pids": []}))
-        self._registered = True
+        try:
+            clients = sorted(self._live_clients(self.paths.pipe_dir))
+        except Exception:
+            clients = []
+        kill_targets = sorted(
+            {pid for pid in clients}
+            | (
+                {daemon_pid}
+                if daemon_pid and self.client.pid_alive(daemon_pid)
+                else set()
+            )
+        )
+        kill_hint = (
+            f"kill the leftover process(es) {kill_targets} and " if kill_targets else ""
+        )
+        return (
+            f"MPS state dir {self.paths.state_dir} holds dirty state from a "
+            f"previous run: daemon {daemon_state}; owners "
+            f"{sorted(owners) or 'none'} (dead: {sorted(dead_owners) or 'none'}); "
+            f"live clients {clients or 'none'}. Refusing to start. "
+            f"After confirming nothing on this GPU should be running, "
+            f"{kill_hint}remove the directory with: rm -rf {self.paths.state_dir}"
+        )
 
     def _spawn_fresh_daemon(self) -> None:
-        # A stale control socket from a dead daemon confuses the new one.
-        shutil.rmtree(self.paths.pipe_dir, ignore_errors=True)
-        self.paths.pipe_dir.mkdir(parents=True, exist_ok=True)
         self._write_manifest()
         try:
             self.daemon_pid = self.client.start_daemon(
                 self.paths.pipe_dir, self.paths.log_dir, self.gpu_uuid
             )
-            # Note (Jiaxin Deng): record ownership before waiting; a daemon
-            # that starts but never answers must stay findable and reapable.
             self._write_manifest()
             self._wait_for(
                 lambda: self.client.control_responds(self.paths.pipe_dir),
@@ -178,33 +190,12 @@ class MpsManager:
         try:
             manifest = json.loads(self.paths.manifest.read_text())
             raw = manifest.get("daemon_pid")
-            if raw is not None:
-                return int(raw)
+            return int(raw) if raw is not None else None
         except (OSError, ValueError, KeyError, TypeError):
-            pass
-        # Note (Jiaxin Deng): the daemon's own PID file survives a torn or
-        # missing manifest; trust it only with the environ ownership proof.
-        try:
-            recovered = int(
-                (self.paths.pipe_dir / "nvidia-cuda-mps-control.pid")
-                .read_text()
-                .strip()
-            )
-            if self.client.pid_alive(recovered) and self.client.daemon_owns_pipe(
-                recovered, self.paths.pipe_dir
-            ):
-                return recovered
-        except (OSError, ValueError):
-            pass
-        if self.client.control_responds(self.paths.pipe_dir):
-            raise MpsError(
-                f"MPS state dir {self.paths.state_dir} has no readable "
-                "manifest but its control socket still answers; refusing to "
-                "touch it. Clean it up manually."
-            )
-        return None
+            return None
 
     def _reap_failed_daemon(self) -> None:
+        # The one process this manager may signal: the daemon it just spawned.
         if self.daemon_pid is None or not self.client.pid_alive(self.daemon_pid):
             return
         logger.warning(
@@ -221,42 +212,6 @@ class MpsManager:
         except MpsError:
             self.client.kill_pid(self.daemon_pid, force=True)
 
-    def _reap_orphan_clients(
-        self,
-        state_dir: Path,
-        pipe_dir: Path,
-        daemon_pid: int,
-        protected: set[int],
-    ) -> None:
-        targets: set[int] = set()
-        for force in (False, True):
-            # Note (Jiaxin Deng): re-query membership right before signalling
-            # so a recycled PID that is no longer an MPS client is never hit.
-            targets = self._unclaimed_clients(protected)
-            if not targets:
-                return
-            for pid in sorted(targets):
-                logger.warning(
-                    "Killing orphaned MPS client pid %d left under %s",
-                    pid,
-                    state_dir,
-                )
-                self.client.kill_pid(pid, force=force)
-            try:
-                self._wait_for(
-                    lambda: not self._unclaimed_clients(protected),
-                    self.stop_timeout,
-                    "orphaned MPS clients survived",
-                )
-                return
-            except MpsError:
-                if force:
-                    raise MpsError(
-                        f"MPS daemon pid {daemon_pid} under {state_dir} "
-                        f"still has live clients {sorted(targets)} after "
-                        "SIGKILL; refusing to proceed. Kill them manually."
-                    )
-
     def _owner_pids(self) -> set[int]:
         if not self.paths.owners_dir.exists():
             return set()
@@ -265,34 +220,6 @@ class MpsManager:
             for entry in self.paths.owners_dir.iterdir()
             if entry.name.isdigit()
         }
-
-    def register_clients(self, expected_pids: set[int]) -> None:
-        with state_root_lock(self.paths.state_root, f".lock-{self.gpu_uuid}"):
-            self._owner_file.write_text(json.dumps({"pids": sorted(expected_pids)}))
-
-    def _registered_pids_of_live_owners(self) -> set[int]:
-        pids: set[int] = set()
-        for owner in self._owner_pids():
-            if owner != os.getpid() and not self.client.pid_alive(owner):
-                continue
-            try:
-                recorded = json.loads((self.paths.owners_dir / str(owner)).read_text())
-                pids.update(int(pid) for pid in recorded.get("pids", []))
-            except (OSError, ValueError, TypeError, AttributeError):
-                continue
-        return pids
-
-    def _unclaimed_clients(self, protected: set[int]) -> set[int]:
-        return {
-            pid
-            for pid in self._live_clients(self.paths.pipe_dir)
-            if not any(self._tree_attached(p, {pid}) for p in protected)
-        }
-
-    def _prune_dead_owners(self) -> None:
-        for pid in self._owner_pids():
-            if pid != os.getpid() and not self.client.pid_alive(pid):
-                (self.paths.owners_dir / str(pid)).unlink(missing_ok=True)
 
     def env_for_stage(self) -> dict[str, str]:
         return {
@@ -328,7 +255,6 @@ class MpsManager:
         except MpsError:
             self._fail()
             raise
-        self.register_clients(expected)
         self.state = MpsState.SERVING
 
     def probe(self) -> bool:
@@ -368,8 +294,7 @@ class MpsManager:
         if self._registered:
             self._owner_file.unlink(missing_ok=True)
             self._registered = False
-        self._prune_dead_owners()
-        remaining = self._owner_pids()
+        remaining = {pid for pid in self._owner_pids() if self.client.pid_alive(pid)}
         if remaining:
             logger.info(
                 "Leaving shared MPS daemon on %s to owners %s",
