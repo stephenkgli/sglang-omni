@@ -1,27 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Subprocess-backed MpsControlClient talking to nvidia-cuda-mps-control.
-
-Pure I/O; all lifecycle decisions live in :class:`sglang_omni.mps.manager.
-MpsManager`. Covered by the GPU CI smoke rather than unit tests.
-"""
+"""Strict subprocess and ``/proc`` operations for CUDA MPS lifecycle control."""
 
 from __future__ import annotations
 
+import fcntl
 import os
-import re
 import signal
 import subprocess
 from pathlib import Path
 
+from sglang_omni.mps.manager import MpsClientRef, MpsControlError
+
 _CONTROL_BINARY = "nvidia-cuda-mps-control"
 _QUERY_TIMEOUT_SECONDS = 10
-_PID_LINE = re.compile(r"^\d+$")
 
 
 def _stat_says_alive(stat_text: str) -> bool:
-    """Parse /proc/<pid>/stat; the state field follows the last ')'."""
-    state = stat_text.rsplit(")", 1)[1].split()
-    return bool(state) and state[0] != "Z"
+    """Parse ``/proc/<pid>/stat``; the state field follows the last ``)``."""
+
+    fields = stat_text.rsplit(")", 1)[1].split()
+    return bool(fields) and fields[0] != "Z"
+
+
+def _parse_pid_list(output: str, command: str) -> list[int]:
+    tokens = output.split()
+    if any(not token.isdigit() or int(token) <= 0 for token in tokens):
+        raise MpsControlError(
+            f"unexpected output from {_CONTROL_BINARY} {command!r}: {output!r}"
+        )
+    return [int(token) for token in tokens]
 
 
 class SubprocessMpsControlClient:
@@ -31,102 +38,150 @@ class SubprocessMpsControlClient:
         return env
 
     def _query(self, pipe_dir: Path, command: str) -> str:
-        result = subprocess.run(
-            [_CONTROL_BINARY],
-            input=command + "\n",
-            capture_output=True,
-            text=True,
-            timeout=_QUERY_TIMEOUT_SECONDS,
-            env=self._control_env(pipe_dir),
-        )
+        try:
+            result = subprocess.run(
+                [_CONTROL_BINARY],
+                input=command + "\n",
+                capture_output=True,
+                text=True,
+                timeout=_QUERY_TIMEOUT_SECONDS,
+                env=self._control_env(pipe_dir),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise MpsControlError(
+                f"{_CONTROL_BINARY} {command!r} failed: {exc}"
+            ) from exc
         if result.returncode != 0:
-            raise OSError(
+            raise MpsControlError(
                 f"{_CONTROL_BINARY} {command!r} failed "
                 f"(rc={result.returncode}): {result.stderr.strip()}"
             )
         return result.stdout
 
-    def start_daemon(self, pipe_dir: Path, log_dir: Path, gpu_uuid: str) -> int:
+    def start_daemon(self, pipe_dir: Path, log_dir: Path, gpu_uuid: str) -> None:
         env = self._control_env(pipe_dir)
         env["CUDA_MPS_LOG_DIRECTORY"] = str(log_dir)
-        # Note (Jiaxin Deng): UUID visibility, not ordinal: an ordinal-scoped
-        # daemon remaps client-side ordinals (same contract as examples/mps_dp).
+        # UUID visibility, not ordinal: an ordinal-scoped daemon remaps the
+        # client-side ordinals used by examples/mps_dp.
         env["CUDA_VISIBLE_DEVICES"] = gpu_uuid
-        subprocess.run(
-            [_CONTROL_BINARY, "-d"],
-            check=True,
-            capture_output=True,
-            timeout=_QUERY_TIMEOUT_SECONDS,
-            env=env,
-        )
-        pid_file = pipe_dir / f"{_CONTROL_BINARY}.pid"
-        return int(pid_file.read_text().strip())
-
-    def control_responds(self, pipe_dir: Path) -> bool:
         try:
-            self._query(pipe_dir, "get_default_active_thread_percentage")
-            return True
-        except (OSError, subprocess.SubprocessError, ValueError):
-            return False
+            subprocess.run(
+                [_CONTROL_BINARY, "-d"],
+                check=True,
+                capture_output=True,
+                timeout=_QUERY_TIMEOUT_SECONDS,
+                env=env,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise MpsControlError(f"failed to start {_CONTROL_BINARY}: {exc}") from exc
 
-    def _pid_lines(self, output: str) -> list[int]:
-        return [int(line) for line in output.split() if _PID_LINE.match(line)]
+    def read_daemon_identity(self, pipe_dir: Path) -> int:
+        """Read and prove the native control-daemon identity for ``pipe_dir``."""
 
-    def get_server_list(self, pipe_dir: Path) -> list[int]:
-        return self._pid_lines(self._query(pipe_dir, "get_server_list"))
+        pid_file = pipe_dir / f"{_CONTROL_BINARY}.pid"
+        try:
+            raw_pid = pid_file.read_text().strip()
+        except OSError as exc:
+            raise MpsControlError(
+                f"cannot read native PID file {pid_file}: {exc}"
+            ) from exc
+        if not raw_pid.isdigit() or int(raw_pid) <= 0:
+            raise MpsControlError(
+                f"native PID file {pid_file} is malformed: {raw_pid!r}"
+            )
+        pid = int(raw_pid)
+        if not self.daemon_process_alive(pid):
+            raise MpsControlError(f"native PID file {pid_file} names dead pid {pid}")
 
-    def get_client_list(self, pipe_dir: Path, server_pid: int) -> list[int]:
-        return self._pid_lines(self._query(pipe_dir, f"get_client_list {server_pid}"))
+        proc = Path(f"/proc/{pid}")
+        try:
+            cmdline = proc.joinpath("cmdline").read_bytes().split(b"\0", 1)[0]
+            environ = proc.joinpath("environ").read_bytes().split(b"\0")
+        except OSError as exc:
+            raise MpsControlError(f"cannot inspect daemon pid {pid}: {exc}") from exc
+        if Path(os.fsdecode(cmdline)).name != _CONTROL_BINARY:
+            raise MpsControlError(
+                f"native PID file {pid_file} names {os.fsdecode(cmdline)!r}, not "
+                f"{_CONTROL_BINARY}"
+            )
+        expected_pipe = f"CUDA_MPS_PIPE_DIRECTORY={pipe_dir}".encode()
+        if expected_pipe not in environ:
+            raise MpsControlError(
+                f"daemon pid {pid} does not own exact pipe directory {pipe_dir}"
+            )
+        return pid
+
+    def snapshot(self, pipe_dir: Path) -> set[MpsClientRef]:
+        """Return one strict server/client snapshot from the selected daemon."""
+
+        servers = _parse_pid_list(
+            self._query(pipe_dir, "get_server_list"), "get_server_list"
+        )
+        clients: set[MpsClientRef] = set()
+        for server_pid in servers:
+            command = f"get_client_list {server_pid}"
+            client_pids = _parse_pid_list(
+                self._query(pipe_dir, command), command
+            )
+            for client_pid in client_pids:
+                clients.add(MpsClientRef(server_pid, client_pid))
+        return clients
+
+    def terminate_client(self, pipe_dir: Path, client: MpsClientRef) -> None:
+        command = f"terminate_client {client.server_pid} {client.client_pid}"
+        output = self._query(pipe_dir, command).strip()
+        if output != "0":
+            raise MpsControlError(
+                f"{_CONTROL_BINARY} {command!r} returned {output!r}, expected '0'"
+            )
 
     def quit_daemon(self, pipe_dir: Path) -> None:
         self._query(pipe_dir, "quit")
 
-    def pid_alive(self, pid: int) -> bool:
+    def daemon_process_alive(self, pid: int) -> bool:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
             return False
-        except PermissionError:
-            pass
-        # Note (Jiaxin Deng): a quit daemon reparented to a non-reaping pid 1
-        # stays a zombie that os.kill still signals; count it as dead.
+        except PermissionError as exc:
+            raise MpsControlError(f"cannot probe daemon pid {pid}: {exc}") from exc
         try:
             return _stat_says_alive(Path(f"/proc/{pid}/stat").read_text())
-        except OSError:
+        except FileNotFoundError:
             return False
+        except (OSError, IndexError) as exc:
+            raise MpsControlError(f"cannot inspect daemon pid {pid}: {exc}") from exc
 
-    def kill_pid(self, pid: int, force: bool = False) -> None:
+    def terminate_daemon_process(self, pid: int, force: bool = False) -> None:
         try:
             os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
         except ProcessLookupError:
-            pass
+            return
+        except PermissionError as exc:
+            raise MpsControlError(f"cannot signal daemon pid {pid}: {exc}") from exc
 
     def parent_of(self, pid: int) -> int | None:
         try:
             stat_text = Path(f"/proc/{pid}/stat").read_text()
-            return int(stat_text.rsplit(")", 1)[1].split()[1])
-        except (OSError, IndexError, ValueError):
+        except FileNotFoundError:
             return None
+        except OSError as exc:
+            raise MpsControlError(f"cannot inspect client pid {pid}: {exc}") from exc
+        try:
+            return int(stat_text.rsplit(")", 1)[1].split()[1])
+        except (IndexError, ValueError) as exc:
+            raise MpsControlError(f"malformed /proc/{pid}/stat") from exc
 
     def owner_lease_held(self, lease_file: Path) -> bool:
         try:
-            import fcntl
-        except ImportError:
-            return False
-        try:
-            with open(lease_file, "r+") as probe:
-                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with lease_file.open("r+") as probe:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
                 fcntl.flock(probe, fcntl.LOCK_UN)
                 return False
-        except FileNotFoundError:
-            return False
-        except OSError:
-            return True
-
-    def daemon_owns_pipe(self, pid: int, pipe_dir: Path) -> bool:
-        try:
-            environ = Path(f"/proc/{pid}/environ").read_bytes()
-        except OSError:
-            return False
-        needle = f"CUDA_MPS_PIPE_DIRECTORY={pipe_dir}".encode()
-        return needle in environ.split(b"\0")
+        except OSError as exc:
+            raise MpsControlError(
+                f"cannot inspect owner lease {lease_file}: {exc}"
+            ) from exc

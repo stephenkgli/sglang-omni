@@ -29,6 +29,11 @@ Modes (`--mps` on the CLI or `mps:` in the pipeline config; default `off`):
   a hard error instead of a warning. Use `on` for same-GPU data parallelism:
   every `serve --mps on` on one GPU joins the same daemon.
 
+Native MPS v1 also excludes processes with an explicit nonzero `cuda:N`
+device and GPUs on either end of a local cross-GPU CUDA edge. Narrowing a
+worker to one UUID makes its only valid CUDA ordinal `cuda:0`; those topologies
+must run with `mps=off` until they have an explicit normalization contract.
+
 The daemon is shared per physical GPU (keyed by device UUID): MPS merges
 kernels only for clients of one server, so the first serve creates the
 daemon, later serves join it, and the last one to leave drains the clients
@@ -50,12 +55,27 @@ the pipe directory silently falls back to time slicing. A watchdog fails the
 pipeline if the daemon dies mid-serving. Shutdown drains this serve's clients
 and quits the daemon only when no other serve still owns it.
 
-Dirty state is never repaired automatically. After a hard kill (SIGKILL, OOM
-kill, node crash), the next start finds leftover state, refuses to start, and
-prints the full picture: the state directory, the daemon and owner PIDs with
-their liveness, any live MPS clients, and the exact cleanup commands. Clean
-up and start again. A normal shutdown leaves nothing behind, so this only
-ever happens after a crash.
+If a managed worker does not exit before the shutdown timeout, the runtime
+does not send `SIGTERM` or `SIGKILL`. It keeps that worker, its owner lease, and
+the state directory intact, then reports the exact operator cleanup commands.
+The serve parent also remains alive so Python cannot terminate the worker at
+interpreter exit and the kernel-held owner lease stays valid during cleanup.
+This also applies when the managed root process has died but an MPS descendant
+recorded during startup is still attached. While a lease is retained, repeated
+`SIGINT`/`SIGTERM` never terminate the owner directly. Follow the reported
+client-specific `terminate_client` commands and stop that serve's workload
+processes, then send either signal again to request a safe recheck. If another
+healthy owner remains, the recheck releases only this serve's owner lease and
+leaves the shared daemon running. The last owner quits the daemon and removes
+the state directory only after its client snapshot is empty. A retained owner
+also blocks new serves from joining until this recheck succeeds.
+
+Dirty state is never repaired automatically. A join requires the native
+`nvidia-cuda-mps-control.pid` identity, a responsive control socket, and every
+published owner lease to still be held. After a hard kill (SIGKILL, OOM kill,
+node crash), even an idle daemon or one dead co-owner makes the next start
+preserve the state and fail with owner/client details and safe cleanup guidance.
+Clean up and start again. A normal shutdown leaves nothing behind.
 
 Operator notes: state lives under `/tmp/sglang-omni-mps-<user>/<gpu-uuid>/`
 (`SGLANG_OMNI_MPS_STATE_ROOT` overrides it). Serves that are meant to share

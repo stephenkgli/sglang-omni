@@ -1,12 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Spawn-time env injection seam used to hand MPS env to stage processes."""
+"""Spawn-time env injection and fail-closed process shutdown tests."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 
-from sglang_omni.pipeline.stage_workers import _patched_spawn_env
+import pytest
+
+from sglang_omni.pipeline.stage_workers import (
+    StageGroup,
+    StageLaunchConfig,
+    StageProcessTeardownError,
+    StageWorkerProcessSpec,
+    _patched_spawn_env,
+)
 
 
 @dataclass
@@ -62,3 +70,96 @@ def test_cpu_stage_keeps_none_gpu_id_under_single_device_marker(monkeypatch):
 
     _prepare_accelerator_environment(spec, logging.getLogger("test"))
     assert spec.gpu_id is None
+
+
+def test_protected_process_is_not_a_multiprocessing_daemon():
+    class Queue:
+        def close(self):
+            return None
+
+        def join_thread(self):
+            return None
+
+    class Process:
+        pid = 123
+
+        def __init__(self, *, daemon, **kwargs):
+            del kwargs
+            self.daemon = daemon
+
+        def start(self):
+            return None
+
+    class Context:
+        def __init__(self):
+            self.processes = []
+
+        def Event(self):
+            return object()
+
+        def Queue(self):
+            return Queue()
+
+        def Process(self, **kwargs):
+            process = Process(**kwargs)
+            self.processes.append(process)
+            return process
+
+    context = Context()
+    group = StageGroup(
+        "group",
+        [
+            StageWorkerProcessSpec(
+                "protected", [StageLaunchConfig(stage_name="protected")]
+            ),
+            StageWorkerProcessSpec("ordinary", [StageLaunchConfig("ordinary")]),
+        ],
+    )
+
+    group.spawn(context, protected_process_names={"protected"})
+
+    assert [process.daemon for process in context.processes] == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_preserves_selected_stuck_process():
+    class Process:
+        def __init__(self, name, *, protected):
+            self.pid = 123 if protected else 456
+            self.name = name
+            self.alive = True
+            self.protected = protected
+
+        def join(self, timeout):
+            del timeout
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            if self.protected:
+                raise AssertionError("preserved process was signaled")
+
+        def kill(self):
+            if self.protected:
+                raise AssertionError("preserved process was signaled")
+            self.alive = False
+
+    protected = Process("protected", protected=True)
+    ordinary = Process("ordinary", protected=False)
+    group = StageGroup(
+        "group",
+        [
+            StageWorkerProcessSpec("protected", []),
+            StageWorkerProcessSpec("ordinary", []),
+        ],
+    )
+    group._processes = [protected, ordinary]
+
+    with pytest.raises(StageProcessTeardownError, match="still alive") as exc_info:
+        await group.shutdown(join_timeout=0, preserve_process_names={"protected"})
+
+    assert exc_info.value.process_names == {"protected"}
+    assert protected.is_alive()
+    assert not ordinary.is_alive()
+    assert group.processes == [protected, ordinary]

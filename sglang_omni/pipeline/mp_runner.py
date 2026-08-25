@@ -25,6 +25,7 @@ from sglang_omni.config.runtime import (
 )
 from sglang_omni.config.schema import PipelineConfig, StageConfig
 from sglang_omni.config.topology import LogicalProcessPlan, ProcessTopologyPlan
+from sglang_omni.mps.manager import MpsLeaseRetainedError
 from sglang_omni.mps.runtime import MpsPipelineRuntime, create_for_pipeline
 from sglang_omni.pipeline import Coordinator
 from sglang_omni.pipeline.replicas import ReplicaTopology
@@ -37,6 +38,7 @@ from sglang_omni.pipeline.runtime_config import (
 from sglang_omni.pipeline.stage_workers import (
     StageGroup,
     StageLaunchConfig,
+    StageProcessTeardownError,
     StageWorkerProcessSpec,
 )
 from sglang_omni.utils.imports import import_string
@@ -431,6 +433,7 @@ class MultiProcessPipelineRunner:
         self._prep: PipelineRuntimePrep | None = None
         self._started = False
         self._mps: MpsPipelineRuntime | None = None
+        self._stop_task: asyncio.Task | None = None
 
     @property
     def coordinator(self) -> Coordinator:
@@ -455,9 +458,25 @@ class MultiProcessPipelineRunner:
             endpoints.update(group.stage_control_endpoints)
         return endpoints
 
+    @property
+    def has_retained_mps_leases(self) -> bool:
+        """Whether process exit would drop an intentionally retained MPS lease."""
+
+        return self._mps is not None and self._mps.has_leases
+
     async def start(self, timeout: float = 120.0) -> None:
         if self._started:
             raise RuntimeError("Already started")
+        if self._stop_task is not None:
+            if not self._stop_task.done():
+                raise RuntimeError("Cannot start while cleanup is still running")
+            self._stop_task.result()
+            if self._mps is not None or self._groups:
+                raise RuntimeError(
+                    "Cannot start while resources from the previous cleanup "
+                    "remain owned"
+                )
+            self._stop_task = None
 
         try:
             ctx = multiprocessing.get_context("spawn")
@@ -522,17 +541,25 @@ class MultiProcessPipelineRunner:
                 ]
                 self._mps = create_for_pipeline(self._config.mps, all_process_specs)
             if self._mps is not None:
-                await asyncio.to_thread(self._mps.start)
+                await self._run_mps_call(self._mps.start)
                 mps = self._mps
 
                 def extra_env_for(spec: StageWorkerProcessSpec) -> dict[str, str]:
                     return mps.env_for_process(spec.process_name)
 
             for group in self._groups:
+                for stage_name, endpoint in group.stage_control_endpoints.items():
+                    # Register before spawn so startup rollback can gracefully
+                    # stop every process that did make it far enough to run.
+                    self._coordinator.register_stage(stage_name, endpoint)
                 if extra_env_for is None:
                     group.spawn(ctx)
                 else:
-                    group.spawn(ctx, extra_env_for=extra_env_for)
+                    group.spawn(
+                        ctx,
+                        extra_env_for=extra_env_for,
+                        protected_process_names=self._mps.process_names,
+                    )
 
             await asyncio.gather(*(g.wait_ready(timeout) for g in self._groups))
 
@@ -547,11 +574,7 @@ class MultiProcessPipelineRunner:
                 pids_by_process: dict[str, int] = {}
                 for group in self._groups:
                     pids_by_process.update(group.process_pids())
-                await asyncio.to_thread(self._mps.verify, pids_by_process)
-
-            for group in self._groups:
-                for stage_name, endpoint in group.stage_control_endpoints.items():
-                    self._coordinator.register_stage(stage_name, endpoint)
+                await self._run_mps_call(self._mps.verify, pids_by_process)
 
             self._started = True
             self._monitor_task = asyncio.create_task(self._monitor_children())
@@ -566,10 +589,14 @@ class MultiProcessPipelineRunner:
                 total_procs,
             )
 
-        except BaseException:
-            # Note (Jiaxin Deng): BaseException so cancellation cannot skip
-            # cleanup and leak spawned processes or the MPS daemon.
-            await self._cleanup_on_failure()
+        except BaseException as startup_error:
+            # Cancellation waits for any retained MPS worker before this one
+            # single-flight teardown rolls back acquired leases.
+            try:
+                await self._stop_once()
+            except BaseException as cleanup_exc:
+                logger.error("Pipeline startup cleanup failed: %s", cleanup_exc)
+                raise startup_error from cleanup_exc
             raise
 
     async def _monitor_children(self) -> None:
@@ -583,7 +610,7 @@ class MultiProcessPipelineRunner:
                     await self._fail_runtime(error)
                     return
             if self._mps is not None:
-                failed_gpus = await asyncio.to_thread(self._mps.probe_failures)
+                failed_gpus = await self._run_mps_call(self._mps.probe_failures)
                 if failed_gpus:
                     error = RuntimeError(
                         f"MPS daemon died on GPU(s) {failed_gpus}; failing the "
@@ -595,20 +622,85 @@ class MultiProcessPipelineRunner:
             await asyncio.sleep(5.0)
 
     async def _fail_runtime(self, error: BaseException) -> None:
+        # Once the monitor initiates failure handling, cleanup must not treat it
+        # as an independent task to cancel and join: it will itself await the
+        # single-flight stop task.
+        if asyncio.current_task() is self._monitor_task:
+            self._monitor_task = None
         self._fatal_error = error
         if self._coordinator is not None:
-            await self._coordinator.fail_pending_requests(error)
-        if self._fatal_event is not None:
-            self._fatal_event.set()
-        await self.stop()
+            try:
+                await self._coordinator.fail_pending_requests(error)
+            except Exception as exc:
+                logger.error("Failed to notify pending requests: %s", exc)
+        try:
+            await self.stop()
+        except Exception as exc:
+            # wait_failed() reports the serving failure as the primary error and
+            # chains this cleanup failure from the shared stop task.
+            logger.error("Pipeline cleanup after runtime failure failed: %s", exc)
+        finally:
+            if self._fatal_event is not None:
+                self._fatal_event.set()
 
     async def wait_failed(self) -> None:
         if self._fatal_event is None:
             raise RuntimeError("Runner not started")
         await self._fatal_event.wait()
+        cleanup_error: Exception | None = None
+        if self._stop_task is not None:
+            try:
+                await self._await_task_completion(self._stop_task)
+            except Exception as exc:
+                cleanup_error = exc
         if self._fatal_error is not None:
-            raise self._fatal_error
+            raise self._fatal_error from cleanup_error
+        if cleanup_error is not None:
+            raise cleanup_error
         raise RuntimeError("Pipeline runtime failed")
+
+    async def _await_task_completion(self, task: asyncio.Task) -> Any:
+        """Wait through caller cancellation, then propagate it after completion."""
+
+        caller = asyncio.current_task()
+        initial_cancels = caller.cancelling() if caller is not None else 0
+        interrupted: asyncio.CancelledError | None = None
+        completion_error: BaseException | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                interrupted = exc
+            except BaseException as exc:
+                completion_error = exc
+                break
+        result: Any = None
+        if completion_error is None:
+            try:
+                result = task.result()
+            except BaseException as exc:
+                completion_error = exc
+        if (
+            interrupted is None
+            and caller is not None
+            and caller.cancelling() > initial_cancels
+        ):
+            interrupted = asyncio.CancelledError()
+        if interrupted is not None:
+            if completion_error is not None and not isinstance(
+                completion_error, asyncio.CancelledError
+            ):
+                raise interrupted from completion_error
+            raise interrupted
+        if completion_error is not None:
+            raise completion_error
+        return result
+
+    async def _run_mps_call(self, call, *args) -> Any:
+        """Let a blocking MPS operation finish before propagating cancellation."""
+
+        worker = asyncio.create_task(asyncio.to_thread(call, *args))
+        return await self._await_task_completion(worker)
 
     async def _cancel_completion_task(self) -> None:
         if self._completion_task is None:
@@ -627,67 +719,145 @@ class MultiProcessPipelineRunner:
         self._ipc_runtime_dir = None
 
     async def stop(self) -> None:
-        if not self._started:
+        await self._stop_once()
+
+    def retry_retained_mps_cleanup(self) -> None:
+        """Recheck retained MPS leases after explicit operator cleanup."""
+
+        if self._mps is None or not self._mps.has_leases:
             return
-        self._started = False
-
-        if self._monitor_task is not None:
-            current = asyncio.current_task()
-            if current != self._monitor_task:
-                self._monitor_task.cancel()
-            self._monitor_task = None
-
-        # Send shutdown to stages via coordinator
+        live_pids = {
+            name: pid
+            for group in self._groups
+            for name, pid in group.alive_process_pids().items()
+            if name in self._mps.process_names
+        }
         try:
-            await self._coordinator.shutdown_stages()
-        except Exception as e:
-            logger.warning("shutdown_stages error: %s", e)
+            self._mps.stop(set(live_pids), live_pids)
+        finally:
+            if not self._mps.has_leases:
+                self._mps = None
 
-        # Shutdown all groups
-        await asyncio.gather(
-            *(g.shutdown() for g in self._groups),
+    async def _stop_once(self) -> None:
+        self._started = False
+        if self._stop_task is None:
+            initiator = asyncio.current_task()
+            self._stop_task = asyncio.create_task(
+                self._stop_impl(initiator=initiator)
+            )
+        await self._await_task_completion(self._stop_task)
+
+    async def _stop_impl(
+        self,
+        *,
+        initiator: asyncio.Task | None,
+    ) -> None:
+        cleanup_errors: list[BaseException] = []
+        unsafe_mps_processes = (
+            {
+                name
+                for group in self._groups
+                for name in group.dead_process_names()
+                if name in self._mps.process_names
+            }
+            if self._mps is not None
+            else set()
+        )
+        monitor = self._monitor_task
+        if monitor is not None and monitor is not initiator:
+            monitor.cancel()
+            try:
+                await monitor
+            except asyncio.CancelledError:
+                pass
+        self._monitor_task = None
+
+        if self._coordinator is not None:
+            try:
+                await self._coordinator.shutdown_stages()
+            except Exception as exc:
+                logger.warning("shutdown_stages error: %s", exc)
+
+        preserve_process_names = self._mps.process_names if self._mps else ()
+
+        shutdown_results = await asyncio.gather(
+            *(
+                group.shutdown(
+                    join_timeout=30.0,
+                    preserve_process_names=preserve_process_names,
+                )
+                for group in self._groups
+            ),
             return_exceptions=True,
         )
+        alive_processes: set[str] = set()
+        for result in shutdown_results:
+            if isinstance(result, BaseException):
+                logger.error("Stage process teardown incomplete: %s", result)
+                cleanup_errors.append(result)
+                if isinstance(result, StageProcessTeardownError):
+                    alive_processes.update(result.process_names)
 
         if self._mps is not None:
-            # Note (Jiaxin Deng): stages exited means clients detached; quitting
-            # the daemon only after that is the required teardown order.
-            await asyncio.to_thread(self._mps.stop_best_effort)
-            self._mps = None
+            preserve_processes = unsafe_mps_processes | alive_processes
+            live_pids = {
+                name: pid
+                for group in self._groups
+                for name, pid in group.alive_process_pids().items()
+                if name in preserve_processes
+            }
+            try:
+                await self._run_mps_call(
+                    self._mps.stop,
+                    preserve_processes,
+                    live_pids,
+                )
+            except Exception as exc:
+                logger.error("MPS teardown incomplete: %s", exc)
+                cleanup_errors.append(exc)
+            if not self._mps.has_leases:
+                self._mps = None
 
-        await self._cancel_completion_task()
-
-        await self._coordinator.stop()
-        self._groups.clear()
-        self._coordinator = None
-
-        self._close_runtime_dir()
-
-    async def _cleanup_on_failure(self) -> None:
-        """Best-effort cleanup after a failed start()."""
-        for group in self._groups:
-            for p in group.processes:
-                if p.is_alive():
-                    p.terminate()
-            for p in group.processes:
-                p.join(timeout=5)
-                if p.is_alive():
-                    p.kill()
-                    p.join(timeout=2)
-            group.close_control_channels()
-        self._groups.clear()
-
-        if self._mps is not None:
-            await asyncio.to_thread(self._mps.stop_best_effort)
-            self._mps = None
-
-        await self._cancel_completion_task()
+        try:
+            await self._cancel_completion_task()
+        except Exception as exc:
+            logger.error("Completion task teardown incomplete: %s", exc)
+            cleanup_errors.append(exc)
 
         if self._coordinator is not None:
             try:
                 await self._coordinator.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.error("Coordinator teardown incomplete: %s", exc)
+                cleanup_errors.append(exc)
             self._coordinator = None
 
+        if not any(group.processes for group in self._groups):
+            self._groups.clear()
         self._close_runtime_dir()
+
+        if cleanup_errors:
+            if self.has_retained_mps_leases:
+                retained = next(
+                    (
+                        exc
+                        for exc in cleanup_errors
+                        if isinstance(exc, MpsLeaseRetainedError)
+                    ),
+                    None,
+                )
+                if len(cleanup_errors) == 1 and retained is not None:
+                    raise retained
+                details = "; ".join(
+                    f"{type(exc).__name__}: {exc}" for exc in cleanup_errors
+                )
+                raise MpsLeaseRetainedError(
+                    f"Pipeline cleanup is incomplete while MPS owner leases remain "
+                    f"held: {details}"
+                ) from retained
+            if len(cleanup_errors) == 1:
+                raise cleanup_errors[0]
+            details = "; ".join(
+                f"{type(exc).__name__}: {exc}" for exc in cleanup_errors
+            )
+            raise RuntimeError(f"Pipeline cleanup incomplete: {details}")

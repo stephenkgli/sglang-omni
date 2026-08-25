@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import threading
 from pathlib import Path
 from types import FrameType, SimpleNamespace
 from unittest.mock import AsyncMock
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 import sglang_omni.pipeline.mp_runner as mp_runner
 import sglang_omni.pipeline.runtime_config as runtime_config
 from sglang_omni.config.schema import EndpointsConfig, PipelineConfig, StageConfig
+from sglang_omni.mps.manager import MpsLeaseRetainedError
 from sglang_omni.profiler.event_recorder import get_recorder
 from tests.unit_test.fixtures.pipeline_fakes import FakeMpContext, FakeRelay
 
@@ -47,12 +49,19 @@ class _FakeCoordinator:
         del args, kwargs
         self.started = False
         self.stopped = False
+        self.registered: dict[str, str] = {}
 
     async def start(self) -> None:
         self.started = True
 
     async def run_completion_loop(self) -> None:
         await asyncio.Event().wait()
+
+    def register_stage(self, name: str, endpoint: str) -> None:
+        self.registered[name] = endpoint
+
+    async def shutdown_stages(self) -> None:
+        return None
 
     async def stop(self) -> None:
         self.stopped = True
@@ -241,6 +250,9 @@ async def test_mp_runner_cleans_spawned_groups_when_later_spawn_fails(
             self.fail_spawn = fail_spawn
             self.process = FakeProcess() if not fail_spawn else None
             self.channels_closed = False
+            self.stage_control_endpoints = {
+                stage_name: f"ipc://{stage_name}.sock"
+            }
 
         @property
         def processes(self) -> list[FakeProcess]:
@@ -254,8 +266,25 @@ async def test_mp_runner_cleans_spawned_groups_when_later_spawn_fails(
         async def wait_ready(self, timeout: float) -> None:
             del timeout
 
+        def alive_process_pids(self) -> dict[str, int]:
+            return {}
+
+        def dead_process_names(self) -> set[str]:
+            return set()
+
         def close_control_channels(self) -> None:
             self.channels_closed = True
+
+        async def shutdown(
+            self,
+            join_timeout: float = 30.0,
+            preserve_process_names=(),
+        ) -> None:
+            del join_timeout, preserve_process_names
+            if self.process is not None and self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout=5)
+            self.close_control_channels()
 
     first_group = FakeGroup("preprocessing")
     second_group = FakeGroup("thinker", fail_spawn=True)
@@ -373,7 +402,18 @@ async def test_mp_runner_stop_cleans_runtime_dir(
         def dead_summary(self) -> str:
             return "(none)"
 
-        async def shutdown(self) -> None:
+        def alive_process_pids(self) -> dict[str, int]:
+            return {}
+
+        def dead_process_names(self) -> set[str]:
+            return set()
+
+        async def shutdown(
+            self,
+            join_timeout: float = 30.0,
+            preserve_process_names=(),
+        ) -> None:
+            del join_timeout, preserve_process_names
             self.shutdown_called = True
 
     group = FakeGroup()
@@ -395,6 +435,10 @@ async def _run_launcher_with_fake_runner(
     config: PipelineConfig,
     serve_mock: AsyncMock | None,
     monkeypatch: pytest.MonkeyPatch,
+    stop_error: BaseException | None = None,
+    wait_error: Exception | None = None,
+    retained_leases: bool = False,
+    retained_lease_handler=None,
 ) -> tuple[object, FastAPI, SimpleNamespace]:
     app = FastAPI()
     profiler_calls = SimpleNamespace(starts=[], stops=[])
@@ -413,6 +457,7 @@ async def _run_launcher_with_fake_runner(
             }
             self.started = False
             self.stopped = False
+            self.has_retained_mps_leases = retained_leases
             # launcher._run_server reads .prep.placement_plan / .process_plan
             # after start() to log the resolved topology. Provide empty stubs
             # that satisfy _placement_log_summary's attribute access.
@@ -431,8 +476,15 @@ async def _run_launcher_with_fake_runner(
 
         async def stop(self) -> None:
             self.stopped = True
+            if stop_error is not None:
+                raise stop_error
+
+        def retry_retained_mps_cleanup(self) -> None:
+            self.has_retained_mps_leases = False
 
         async def wait_failed(self) -> None:
+            if wait_error is not None:
+                raise wait_error
             await asyncio.Future()
 
     class FakeProfilerControl:
@@ -452,7 +504,11 @@ async def _run_launcher_with_fake_runner(
     if serve_mock is not None:
         monkeypatch.setattr(launcher.uvicorn.Server, "serve", serve_mock)
 
-    await launcher._run_server(config, port=8000)
+    await launcher._run_server(
+        config,
+        port=8000,
+        _retained_lease_handler=retained_lease_handler,
+    )
     assert runner_ref is not None
     return runner_ref, app, profiler_calls
 
@@ -464,15 +520,18 @@ async def test_launcher_uses_runner_and_mounts_profiler_routes(
 ) -> None:
     config = _make_config(tmp_path)
     server_serve = AsyncMock(return_value=None)
+    retained_errors: list[MpsLeaseRetainedError] = []
 
     runner, app, profiler_calls = await _run_launcher_with_fake_runner(
         config=config,
         serve_mock=server_serve,
         monkeypatch=monkeypatch,
+        retained_lease_handler=retained_errors.append,
     )
 
     assert runner.started
     assert runner.stopped
+    assert retained_errors == []
     server_serve.assert_awaited_once()
     try:
         with TestClient(app) as client:
@@ -569,6 +628,70 @@ async def test_launcher_stops_runner_when_server_raises(
 
 
 @pytest.mark.asyncio
+async def test_launcher_preserves_runtime_failure_when_cleanup_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _make_config(tmp_path)
+
+    async def serve_until_failure_is_observed():
+        await asyncio.sleep(0.05)
+
+    server_serve = AsyncMock(side_effect=serve_until_failure_is_observed)
+    retained_errors: list[MpsLeaseRetainedError] = []
+
+    with pytest.raises(RuntimeError, match="stage died") as exc_info:
+        await _run_launcher_with_fake_runner(
+            config=config,
+            serve_mock=server_serve,
+            monkeypatch=monkeypatch,
+            stop_error=RuntimeError("cleanup failed"),
+            wait_error=RuntimeError("stage died"),
+            retained_lease_handler=retained_errors.append,
+        )
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert str(exc_info.value.__cause__) == "cleanup failed"
+    assert retained_errors == []
+    server_serve.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cli_holds_owner_when_cleanup_retains_an_mps_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _make_config(tmp_path)
+    server_serve = AsyncMock(side_effect=RuntimeError("stage died"))
+    retained = MpsLeaseRetainedError(
+        "owner PID 123 holds /tmp/state; current client refs: "
+        "[MpsClientRef(server_pid=7, client_pid=9)]; terminate_client 7 9"
+    )
+
+    class OwnerHeld(RuntimeError):
+        pass
+
+    handled: list[MpsLeaseRetainedError] = []
+
+    def hold_owner(error, retry, retry_requested) -> None:
+        del retry, retry_requested
+        handled.append(error)
+        raise OwnerHeld("test stopped the otherwise non-returning CLI hold")
+
+    with pytest.raises(OwnerHeld, match="non-returning CLI hold"):
+        await _run_launcher_with_fake_runner(
+            config=config,
+            serve_mock=server_serve,
+            monkeypatch=monkeypatch,
+            stop_error=retained,
+            retained_leases=True,
+            retained_lease_handler=hold_owner,
+        )
+
+    assert handled == [retained]
+
+
+@pytest.mark.asyncio
 async def test_pipeline_uvicorn_server_consumes_handled_sigterm(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -613,6 +736,96 @@ async def test_pipeline_uvicorn_server_consumes_handled_sigterm(
     assert server_ref._captured_signals == []
 
 
+def test_cli_cleanup_defers_repeated_sigterm_until_lease_disposition() -> None:
+    from sglang_omni.serve import launcher
+
+    delivered: list[int] = []
+    original_handler = signal.getsignal(signal.SIGTERM)
+
+    def record(sig: int, frame: FrameType | None) -> None:
+        del frame
+        delivered.append(sig)
+
+    signal.signal(signal.SIGTERM, record)
+    try:
+        with launcher._defer_cleanup_signals(True) as retry_requested:
+            signal.raise_signal(signal.SIGTERM)
+            signal.raise_signal(signal.SIGTERM)
+            assert delivered == []
+            assert retry_requested.is_set()
+        signal.raise_signal(signal.SIGTERM)
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+
+    assert delivered == [signal.SIGTERM]
+
+
+def test_second_sigterm_triggers_one_explicit_retained_release_recheck() -> None:
+    from sglang_omni.serve import launcher
+
+    retained = MpsLeaseRetainedError("owner retained with exact cleanup guidance")
+    retries: list[None] = []
+
+    with launcher._defer_cleanup_signals(True) as retry_requested:
+        signal.raise_signal(signal.SIGTERM)
+        launcher._hold_retained_mps_owner(
+            retained,
+            lambda: retries.append(None),
+            retry_requested,
+        )
+
+    assert retries == [None]
+
+
+def test_launch_server_rejects_non_main_thread_mps_before_acquire(
+    tmp_path: Path,
+) -> None:
+    from sglang_omni.serve import launcher
+
+    config = _make_config(tmp_path).model_copy(update={"mps": "auto"})
+    errors: list[BaseException] = []
+
+    def launch() -> None:
+        try:
+            launcher.launch_server(config)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=launch)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "main thread" in str(errors[0])
+    assert "retained-lease cleanup" in str(errors[0])
+
+
+def test_retained_owner_hold_uses_injected_wait(caplog) -> None:
+    from sglang_omni.serve import launcher
+
+    retained = MpsLeaseRetainedError(
+        "owner PID 123; state /tmp/state; current client refs []; cleanup steps"
+    )
+
+    class StopHold(RuntimeError):
+        pass
+
+    def stop_wait() -> None:
+        raise StopHold("test release")
+
+    with pytest.raises(StopHold, match="test release"):
+        launcher._hold_retained_mps_owner(
+            retained,
+            lambda: None,
+            threading.Event(),
+            wait=stop_wait,
+        )
+
+    assert "owner PID 123" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_launcher_preserves_runner_start_error(
     tmp_path: Path,
@@ -621,8 +834,11 @@ async def test_launcher_preserves_runner_start_error(
     config = _make_config(tmp_path)
 
     from sglang_omni.serve import launcher
+    stopped: list[None] = []
 
     class FakeRunner:
+        has_retained_mps_leases = False
+
         def __init__(self, pipeline_config: PipelineConfig) -> None:
             del pipeline_config
 
@@ -631,10 +847,255 @@ async def test_launcher_preserves_runner_start_error(
             raise RuntimeError("start failed")
 
         async def stop(self) -> None:
-            raise AssertionError("launcher should not stop a runner that failed start")
+            stopped.append(None)
 
     monkeypatch.setattr(launcher, "_find_available_port", lambda host, port: port)
     monkeypatch.setattr(launcher, "MultiProcessPipelineRunner", FakeRunner)
 
     with pytest.raises(RuntimeError, match="start failed"):
         await launcher._run_server(config, port=8000)
+
+    assert stopped == [None]
+
+
+@pytest.mark.asyncio
+async def test_startup_retained_lease_enters_the_same_cli_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    config = _make_config(tmp_path)
+    from sglang_omni.serve import launcher
+
+    retained = MpsLeaseRetainedError(
+        "owner PID 123 holds /tmp/state; current client refs: "
+        "[MpsClientRef(server_pid=7, client_pid=9)]; terminate_client 7 9"
+    )
+
+    class FakeRunner:
+        has_retained_mps_leases = True
+
+        def __init__(self, pipeline_config: PipelineConfig) -> None:
+            del pipeline_config
+
+        async def start(self, timeout: float) -> None:
+            del timeout
+            raise RuntimeError("verify failed") from retained
+
+        async def stop(self) -> None:
+            raise retained
+
+        def retry_retained_mps_cleanup(self) -> None:
+            self.has_retained_mps_leases = False
+
+    class OwnerHeld(RuntimeError):
+        pass
+
+    handled: list[MpsLeaseRetainedError] = []
+
+    def hold_owner(error, retry, retry_requested) -> None:
+        del retry, retry_requested
+        handled.append(error)
+        raise OwnerHeld("startup entered CLI hold")
+
+    monkeypatch.setattr(launcher, "_find_available_port", lambda host, port: port)
+    monkeypatch.setattr(launcher, "MultiProcessPipelineRunner", FakeRunner)
+
+    with pytest.raises(OwnerHeld, match="startup entered CLI hold"):
+        await launcher._run_server(
+            config,
+            port=8000,
+            _retained_lease_handler=hold_owner,
+        )
+
+    assert handled == [retained]
+    assert "verify failed" in caplog.text
+    assert "terminate_client 7 9" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_startup_sigterm_cancels_and_cleans_up_without_a_retained_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _make_config(tmp_path)
+    from sglang_omni.serve import launcher
+
+    class FakeRunner:
+        has_retained_mps_leases = False
+        cancelled = False
+        stopped = False
+
+        def __init__(self, pipeline_config: PipelineConfig) -> None:
+            del pipeline_config
+
+        async def start(self, timeout: float) -> None:
+            del timeout
+            signal.raise_signal(signal.SIGTERM)
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                type(self).cancelled = True
+                raise
+
+        async def stop(self) -> None:
+            type(self).stopped = True
+
+    retained_errors: list[MpsLeaseRetainedError] = []
+    monkeypatch.setattr(launcher, "_find_available_port", lambda host, port: port)
+    monkeypatch.setattr(launcher, "MultiProcessPipelineRunner", FakeRunner)
+
+    with pytest.raises(SystemExit) as exc_info:
+        await launcher._run_server(
+            config,
+            port=8000,
+            _retained_lease_handler=retained_errors.append,
+        )
+
+    assert exc_info.value.code == 128 + signal.SIGTERM
+    assert FakeRunner.cancelled
+    assert FakeRunner.stopped
+    assert retained_errors == []
+
+
+@pytest.mark.asyncio
+async def test_startup_sigterm_holds_a_retained_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _make_config(tmp_path)
+    from sglang_omni.serve import launcher
+
+    retained = MpsLeaseRetainedError(
+        "owner PID 123 holds /tmp/state; current client refs: "
+        "[MpsClientRef(server_pid=7, client_pid=9)]; terminate_client 7 9"
+    )
+
+    class FakeRunner:
+        has_retained_mps_leases = False
+
+        def __init__(self, pipeline_config: PipelineConfig) -> None:
+            del pipeline_config
+
+        async def start(self, timeout: float) -> None:
+            del timeout
+            signal.raise_signal(signal.SIGTERM)
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError as exc:
+                self.has_retained_mps_leases = True
+                raise exc from retained
+
+        async def stop(self) -> None:
+            raise retained
+
+        def retry_retained_mps_cleanup(self) -> None:
+            self.has_retained_mps_leases = False
+
+    class OwnerHeld(RuntimeError):
+        pass
+
+    handled: list[MpsLeaseRetainedError] = []
+
+    def hold_owner(error, retry, retry_requested) -> None:
+        del retry, retry_requested
+        handled.append(error)
+        raise OwnerHeld("SIGTERM entered retained-owner hold")
+
+    monkeypatch.setattr(launcher, "_find_available_port", lambda host, port: port)
+    monkeypatch.setattr(launcher, "MultiProcessPipelineRunner", FakeRunner)
+
+    with pytest.raises(OwnerHeld, match="retained-owner hold"):
+        await launcher._run_server(
+            config,
+            port=8000,
+            _retained_lease_handler=hold_owner,
+        )
+
+    assert handled == [retained]
+
+
+@pytest.mark.asyncio
+async def test_sigterm_after_start_before_uvicorn_capture_cleans_and_holds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _make_config(tmp_path)
+    from sglang_omni.serve import launcher
+
+    retained = MpsLeaseRetainedError(
+        "owner PID 123 holds /tmp/state; terminate_client 7 9"
+    )
+
+    class FakeRunner:
+        started = False
+        stopped = False
+        has_retained_mps_leases = True
+
+        def __init__(self, pipeline_config: PipelineConfig) -> None:
+            del pipeline_config
+            self.coordinator = _FakeCoordinator()
+            self.stage_control_endpoints = {}
+            self.prep = SimpleNamespace(
+                placement_plan=SimpleNamespace(gpus={}),
+                process_plan=SimpleNamespace(
+                    groups=(),
+                    tp_stage_to_processes={},
+                ),
+            )
+
+        async def start(self, timeout: float) -> None:
+            del timeout
+            type(self).started = True
+
+        async def stop(self) -> None:
+            type(self).stopped = True
+            raise retained
+
+        def retry_retained_mps_cleanup(self) -> None:
+            self.has_retained_mps_leases = False
+
+        async def wait_failed(self) -> None:
+            await asyncio.Future()
+
+    def create_app_then_signal(*args, **kwargs):
+        del args, kwargs
+        signal.raise_signal(signal.SIGTERM)
+        return FastAPI()
+
+    async def before_uvicorn_capture(server, runtime_watchers) -> None:
+        del server
+        for watcher in runtime_watchers:
+            watcher.close()
+        await asyncio.sleep(0)
+
+    class OwnerHeld(RuntimeError):
+        pass
+
+    handled: list[MpsLeaseRetainedError] = []
+
+    def hold_owner(error, retry, retry_requested) -> None:
+        del retry, retry_requested
+        handled.append(error)
+        raise OwnerHeld("post-start SIGTERM entered retained-owner hold")
+
+    monkeypatch.setattr(launcher, "_find_available_port", lambda host, port: port)
+    monkeypatch.setattr(launcher, "MultiProcessPipelineRunner", FakeRunner)
+    monkeypatch.setattr(launcher, "create_app", create_app_then_signal)
+    monkeypatch.setattr(launcher, "_mount_profiler_routes", lambda *args: None)
+    monkeypatch.setattr(
+        launcher,
+        "_serve_with_failure_watch",
+        before_uvicorn_capture,
+    )
+
+    with pytest.raises(OwnerHeld, match="post-start SIGTERM"):
+        await launcher._run_server(
+            config,
+            port=8000,
+            _retained_lease_handler=hold_owner,
+        )
+
+    assert FakeRunner.started
+    assert FakeRunner.stopped
+    assert handled == [retained]

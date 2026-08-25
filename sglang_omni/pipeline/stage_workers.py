@@ -10,7 +10,7 @@ import os
 import queue
 import sys
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
@@ -32,6 +32,32 @@ from sglang_omni.utils.imports import import_string
 from sglang_omni.utils.ipc_weights import prepare_weight_share_process_compat
 
 logger = logging.getLogger(__name__)
+
+
+class StageProcessTeardownError(RuntimeError):
+    """One or more stage processes remain alive after shutdown."""
+
+    def __init__(self, process_names: Iterable[str], message: str):
+        self.process_names = frozenset(process_names)
+        super().__init__(message)
+
+
+def _terminate_process(process: multiprocessing.Process) -> None:
+    """Terminate one worker and report an unkillable survivor."""
+
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    process.join(timeout=5)
+    if process.is_alive():
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        process.join(timeout=2)
+    if process.is_alive():
+        raise RuntimeError(f"process {process.pid} survived SIGKILL")
 
 
 @dataclass
@@ -257,12 +283,32 @@ class StageGroup:
             if proc.pid is not None
         }
 
+    def alive_process_pids(self) -> dict[str, int]:
+        """Map names to PIDs for children that are still alive."""
+
+        return {
+            spec.process_name: proc.pid
+            for spec, proc in zip(self.process_specs, self._processes)
+            if proc.pid is not None and proc.is_alive()
+        }
+
+    def dead_process_names(self) -> set[str]:
+        """Return spawned child names that have exited."""
+
+        return {
+            spec.process_name
+            for spec, proc in zip(self.process_specs, self._processes)
+            if not proc.is_alive()
+        }
+
     def spawn(
         self,
         ctx: multiprocessing.context.SpawnContext,
         extra_env_for: Callable[[StageWorkerProcessSpec], dict[str, str]] | None = None,
+        protected_process_names: Collection[str] = (),
     ) -> None:
         """Spawn the OS process(es) owned by this group."""
+        protected = set(protected_process_names)
         for spec in self.process_specs:
             event = ctx.Event()
             startup_error_channel = ctx.Queue()
@@ -271,7 +317,10 @@ class StageGroup:
                 target=stage_process_main,
                 args=(spec, event, startup_error_channel),
                 name=proc_name,
-                daemon=True,
+                # multiprocessing terminates daemon children at interpreter exit.
+                # A protected survivor must instead keep the parent (and its
+                # external ownership lease) alive for operator cleanup.
+                daemon=spec.process_name not in protected,
             )
             try:
                 extra_env = extra_env_for(spec) if extra_env_for else None
@@ -358,26 +407,55 @@ class StageGroup:
             ):
                 _close_queue(q)
 
-    async def shutdown(self, join_timeout: float = 30.0) -> None:
+    async def shutdown(
+        self,
+        join_timeout: float = 30.0,
+        preserve_process_names: Collection[str] = (),
+    ) -> None:
+        errors: list[Exception] = []
+        preserved = set(preserve_process_names)
         try:
-            for p in self._processes:
+            for spec, p in zip(self.process_specs, self._processes):
                 p.join(timeout=join_timeout)
-                if p.is_alive():
-                    logger.warning(
-                        "Terminating stuck process %s (pid=%s)",
-                        p.name,
+                if not p.is_alive():
+                    continue
+                if spec.process_name in preserved:
+                    logger.error(
+                        "Process %s (pid=%s) did not exit; preserving it because "
+                        "automatic termination is disabled",
+                        spec.process_name,
                         p.pid,
                     )
-                    p.terminate()
-                    p.join(timeout=5)
-                    if p.is_alive():
-                        p.kill()
-                        p.join(timeout=2)
+                    continue
+                logger.warning(
+                    "Terminating stuck process %s (pid=%s)",
+                    p.name,
+                    p.pid,
+                )
+                try:
+                    _terminate_process(p)
+                except Exception as exc:
+                    errors.append(exc)
+
+            alive = {
+                spec.process_name
+                for spec, p in zip(self.process_specs, self._processes)
+                if p.is_alive()
+            }
+            if alive or errors:
+                details = "; ".join(str(exc) for exc in errors)
+                if alive:
+                    message = f"stage process(es) still alive: {sorted(alive)}"
+                    if details:
+                        message += f"; {details}"
+                    raise StageProcessTeardownError(alive, message)
+                raise RuntimeError(f"stage process teardown is incomplete: {details}")
         finally:
             self.close_control_channels()
-            self._processes.clear()
-            self._ready_events.clear()
-            self._startup_error_channels.clear()
+            if not any(p.is_alive() for p in self._processes):
+                self._processes.clear()
+                self._ready_events.clear()
+                self._startup_error_channels.clear()
 
 
 def stage_process_main(

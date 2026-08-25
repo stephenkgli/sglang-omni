@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Layout of the per-run MPS launcher state directory.
-
-Mirrors the directory structure created by examples/mps_dp/launch.sh:
-``<state_root>/gpu-<gpu_id>/<run_id>/`` containing the launch manifest,
-replica table, attach report, and the private MPS pipe and log directories.
-"""
+"""Filesystem layouts and locking primitives for CUDA MPS runtimes."""
 
 from __future__ import annotations
 
@@ -113,12 +108,12 @@ class MpsGpuPaths:
         return self.state_dir / "owners"
 
     @property
-    def manifest(self) -> Path:
-        return self.state_dir / "manifest"
-
-    @property
     def control_socket(self) -> Path:
         return self.pipe_dir / "control"
+
+    @property
+    def daemon_pid_file(self) -> Path:
+        return self.pipe_dir / "nvidia-cuda-mps-control.pid"
 
 
 @contextmanager

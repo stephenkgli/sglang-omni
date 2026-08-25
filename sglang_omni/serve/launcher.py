@@ -33,7 +33,7 @@ import socket
 import threading
 import time
 from contextlib import contextmanager, suppress
-from typing import Any
+from typing import Any, Callable
 
 import uvicorn
 from fastapi import APIRouter, HTTPException
@@ -42,6 +42,7 @@ from pydantic import BaseModel
 from sglang_omni.client import Client
 from sglang_omni.config import PipelineConfig
 from sglang_omni.models.model_capabilities import get_model_capabilities
+from sglang_omni.mps.manager import MpsLeaseRetainedError
 from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
@@ -57,6 +58,124 @@ from sglang_omni.utils.gpu_memory import (
 logger = logging.getLogger(__name__)
 
 _HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+_RetainedLeaseHandler = Callable[
+    [MpsLeaseRetainedError, Callable[[], None], threading.Event],
+    None,
+]
+
+
+class _StartupSignalState:
+    signum: int | None = None
+
+
+@contextmanager
+def _cancel_startup_on_signal(enabled: bool):
+    """Turn the first CLI startup signal into task cancellation, then defer."""
+
+    state = _StartupSignalState()
+    task = asyncio.current_task()
+    if (
+        not enabled
+        or task is None
+        or threading.current_thread() is not threading.main_thread()
+    ):
+        yield state
+        return
+
+    def cancel_startup(sig: int, frame) -> None:
+        del frame
+        if state.signum is None:
+            state.signum = sig
+            logger.info(
+                "Received %s during pipeline startup; beginning controlled cleanup",
+                signal.Signals(sig).name,
+            )
+            task.cancel()
+            return
+        logger.error(
+            "Deferring repeated %s while pipeline startup cleanup is in progress",
+            signal.Signals(sig).name,
+        )
+
+    original_handlers = {
+        sig: signal.signal(sig, cancel_startup) for sig in _HANDLED_SIGNALS
+    }
+    try:
+        yield state
+    finally:
+        for sig, handler in original_handlers.items():
+            signal.signal(sig, handler)
+
+
+@contextmanager
+def _defer_cleanup_signals(enabled: bool):
+    """Keep repeated CLI termination signals from cutting cleanup short."""
+
+    retry_requested = threading.Event()
+    if not enabled or threading.current_thread() is not threading.main_thread():
+        yield retry_requested
+        return
+
+    def defer(sig: int, frame) -> None:
+        del frame
+        logger.error(
+            "Signal %s requested an explicit retained-lease cleanup recheck; "
+            "the signal will not terminate the owner directly",
+            signal.Signals(sig).name,
+        )
+        retry_requested.set()
+
+    original_handlers = {sig: signal.signal(sig, defer) for sig in _HANDLED_SIGNALS}
+    try:
+        yield retry_requested
+    finally:
+        for sig, handler in original_handlers.items():
+            signal.signal(sig, handler)
+
+
+def _find_retained_lease_error(
+    error: BaseException,
+) -> MpsLeaseRetainedError | None:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if isinstance(current, MpsLeaseRetainedError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _hold_retained_mps_owner(
+    error: MpsLeaseRetainedError,
+    retry: Callable[[], None],
+    retry_requested: threading.Event,
+    *,
+    wait: Callable[[], None] | None = None,
+) -> None:
+    """Hold the CLI owner and recheck only after an explicit operator signal."""
+
+    logger.critical(
+        "%s\nThe CLI owner process will remain alive to keep its MPS lease held. "
+        "Follow the cleanup steps above, then send SIGINT or SIGTERM again to "
+        "request a safe lease-release recheck.",
+        error,
+    )
+    wait_once = wait or retry_requested.wait
+    while True:
+        wait_once()
+        retry_requested.clear()
+        try:
+            retry()
+        except MpsLeaseRetainedError as retry_error:
+            logger.critical(
+                "Retained MPS lease is still unsafe to release after the explicit "
+                "recheck:\n%s",
+                retry_error,
+            )
+            continue
+        logger.info("Retained MPS owner lease was released safely.")
+        return
 
 
 class _PipelineUvicornServer(uvicorn.Server):
@@ -363,6 +482,63 @@ def _mount_profiler_routes(
     app.include_router(router)
 
 
+async def _stop_pipeline_runner(
+    mp_runner: MultiProcessPipelineRunner,
+    *,
+    primary_error: BaseException | None,
+    retained_lease_handler: _RetainedLeaseHandler | None,
+) -> None:
+    """Stop one runner and enter the CLI hold only for a live retained lease."""
+
+    logger.info("Shutting down pipeline …")
+    cleanup_error: BaseException | None = None
+    with _defer_cleanup_signals(
+        retained_lease_handler is not None
+    ) as retry_requested:
+        try:
+            await mp_runner.stop()
+        except BaseException as exc:
+            cleanup_error = exc
+
+        if getattr(mp_runner, "has_retained_mps_leases", False):
+            retained_error = (
+                _find_retained_lease_error(cleanup_error)
+                if cleanup_error is not None
+                else None
+            )
+            if retained_error is None:
+                retained_error = MpsLeaseRetainedError(
+                    f"MPS owner PID {os.getpid()} still holds a lease after "
+                    "pipeline cleanup; inspect the preceding MPS error for its "
+                    "state directory, client refs, and operator cleanup steps"
+            )
+            if retained_lease_handler is not None:
+                logger.critical(
+                    "MPS cleanup retained its owner lease: %s", retained_error
+                )
+                if primary_error is not None:
+                    logger.error(
+                        "Pipeline failed before MPS cleanup entered retained-owner "
+                        "hold",
+                        exc_info=(
+                            type(primary_error),
+                            primary_error,
+                            primary_error.__traceback__,
+                        ),
+                    )
+                retained_lease_handler(
+                    retained_error,
+                    mp_runner.retry_retained_mps_cleanup,
+                    retry_requested,
+                )
+
+        if cleanup_error is not None:
+            if primary_error is not None:
+                raise primary_error from cleanup_error
+            raise cleanup_error
+    logger.info("Pipeline stopped.")
+
+
 async def _run_server(
     pipeline_config: PipelineConfig,
     *,
@@ -375,6 +551,7 @@ async def _run_server(
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
+    _retained_lease_handler: _RetainedLeaseHandler | None = None,
 ) -> None:
     """Start the pipeline and run the OpenAI server.
 
@@ -385,80 +562,105 @@ async def _run_server(
 
     mp_runner = MultiProcessPipelineRunner(pipeline_config)
     startup_timeout = float(os.environ.get("SGLANG_OMNI_STARTUP_TIMEOUT", "600"))
-    await mp_runner.start(timeout=startup_timeout)
-    coordinator = mp_runner.coordinator
+    with _cancel_startup_on_signal(_retained_lease_handler is not None) as signal_state:
+        primary_error: BaseException | None = None
+        try:
+            try:
+                await mp_runner.start(timeout=startup_timeout)
+                coordinator = mp_runner.coordinator
 
-    # Plans are resolved once inside ``mp_runner.start()`` (which applies
-    # stage fusion); read them back from the runner for logging rather than
-    # recomputing on the un-fused config.
-    placement_plan = mp_runner.prep.placement_plan
-    process_plan = mp_runner.prep.process_plan
-    gpu_ids = set(placement_plan.gpus)
-    placement_summary = _placement_log_summary(
-        placement_plan,
-        process_plan,
-        pipeline_config,
-    )
-    logger.info(
-        f"Resolved placement/topology plan: placement={placement_summary}",
-    )
-    _log_model_capabilities(pipeline_config)
-    logger.info(
-        "Pipeline '%s' started (%d GPU(s))",
-        pipeline_config.name,
-        len(gpu_ids),
-    )
+                # Plans are resolved once inside ``mp_runner.start()`` (which
+                # applies stage fusion); log that exact runtime plan.
+                placement_plan = mp_runner.prep.placement_plan
+                process_plan = mp_runner.prep.process_plan
+                gpu_ids = set(placement_plan.gpus)
+                placement_summary = _placement_log_summary(
+                    placement_plan,
+                    process_plan,
+                    pipeline_config,
+                )
+                logger.info(
+                    "Resolved placement/topology plan: placement=%s",
+                    placement_summary,
+                )
+                _log_model_capabilities(pipeline_config)
+                logger.info(
+                    "Pipeline '%s' started (%d GPU(s))",
+                    pipeline_config.name,
+                    len(gpu_ids),
+                )
 
-    try:
-        cl_kwargs = client_kwargs or {}
-        client = Client(coordinator, **cl_kwargs)
-        app = create_app(
-            client,
-            model_name=model_name or pipeline_config.name,
-            requires_uploaded_voice_for_named_voice=(
-                pipeline_config.requires_uploaded_voice_for_named_voice()
-            ),
-            supports_uploaded_voice_references=(
-                pipeline_config.supports_uploaded_voice_references()
-            ),
-            supports_audio_translation=(pipeline_config.supports_audio_translation()),
-            required_speech_reference_count=(
-                pipeline_config.required_speech_reference_count
-            ),
-            speech_reference_text_required=(
-                pipeline_config.speech_reference_text_required
-            ),
-            speech_reference_text_excludes_instructions=(
-                pipeline_config.speech_reference_text_excludes_instructions
-            ),
-            additional_speech_languages=pipeline_config.additional_speech_languages,
-            enable_realtime=enable_realtime,
-            supports_realtime_audio_output=(
-                type(pipeline_config).code2wav_stage() is not None
-            ),
-            allowed_local_media_path=allowed_local_media_path,
-            allowed_media_domains=allowed_media_domains,
-            tts_batch_max_items=tts_batch_max_items,
-            architectures=[pipeline_config.architecture],
-            audio_chunking=pipeline_config.audio_chunking,
-        )
-        profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
-        profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
-        _mount_profiler_routes(app, profiler_ctl, profiler_dir)
+                cl_kwargs = client_kwargs or {}
+                client = Client(coordinator, **cl_kwargs)
+                app = create_app(
+                    client,
+                    model_name=model_name or pipeline_config.name,
+                    requires_uploaded_voice_for_named_voice=(
+                        pipeline_config.requires_uploaded_voice_for_named_voice()
+                    ),
+                    supports_uploaded_voice_references=(
+                        pipeline_config.supports_uploaded_voice_references()
+                    ),
+                    supports_audio_translation=(
+                        pipeline_config.supports_audio_translation()
+                    ),
+                    required_speech_reference_count=(
+                        pipeline_config.required_speech_reference_count
+                    ),
+                    speech_reference_text_required=(
+                        pipeline_config.speech_reference_text_required
+                    ),
+                    speech_reference_text_excludes_instructions=(
+                        pipeline_config.speech_reference_text_excludes_instructions
+                    ),
+                    additional_speech_languages=(
+                        pipeline_config.additional_speech_languages
+                    ),
+                    enable_realtime=enable_realtime,
+                    supports_realtime_audio_output=(
+                        type(pipeline_config).code2wav_stage() is not None
+                    ),
+                    allowed_local_media_path=allowed_local_media_path,
+                    allowed_media_domains=allowed_media_domains,
+                    tts_batch_max_items=tts_batch_max_items,
+                    architectures=[pipeline_config.architecture],
+                    audio_chunking=pipeline_config.audio_chunking,
+                )
+                profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
+                profiler_ctl = ProfilerControlClient(
+                    mp_runner.stage_control_endpoints
+                )
+                _mount_profiler_routes(app, profiler_ctl, profiler_dir)
 
-        config = uvicorn.Config(
-            app,
-            host=host,
-            port=port,
-            log_level=log_level,
-            timeout_keep_alive=120,
-        )
-        server = _PipelineUvicornServer(config)
-        await _serve_with_failure_watch(server, [mp_runner.wait_failed()])
-    finally:
-        logger.info("Shutting down pipeline …")
-        await mp_runner.stop()
-        logger.info("Pipeline stopped.")
+                config = uvicorn.Config(
+                    app,
+                    host=host,
+                    port=port,
+                    log_level=log_level,
+                    timeout_keep_alive=120,
+                )
+                server = _PipelineUvicornServer(config)
+                await _serve_with_failure_watch(
+                    server, [mp_runner.wait_failed()]
+                )
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                await _stop_pipeline_runner(
+                    mp_runner,
+                    primary_error=primary_error,
+                    retained_lease_handler=_retained_lease_handler,
+                )
+        except BaseException as final_error:
+            if (
+                signal_state.signum is not None
+                and not getattr(mp_runner, "has_retained_mps_leases", False)
+            ):
+                raise SystemExit(128 + signal_state.signum) from final_error
+            raise
+        if signal_state.signum is not None:
+            raise SystemExit(128 + signal_state.signum)
 
 
 async def _serve_with_failure_watch(
@@ -497,6 +699,10 @@ async def _serve_with_failure_watch(
         for task in watcher_tasks:
             if not task.done():
                 task.cancel()
+        if not server_task.done():
+            server_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await server_task
 
 
 def launch_server(
@@ -531,6 +737,14 @@ def launch_server(
         tts_batch_max_items: Maximum items accepted by
             ``/v1/audio/speech/batch``.
     """
+    if (
+        pipeline_config.mps != "off"
+        and threading.current_thread() is not threading.main_thread()
+    ):
+        raise RuntimeError(
+            "launch_server with native MPS must run in the main thread because "
+            "retained-lease cleanup relies on main-thread SIGINT/SIGTERM handling"
+        )
     apply_gpu_compat_env_defaults()
     asyncio.run(
         _run_server(
@@ -544,5 +758,6 @@ def launch_server(
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
             tts_batch_max_items=tts_batch_max_items,
+            _retained_lease_handler=_hold_retained_mps_owner,
         )
     )
