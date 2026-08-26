@@ -3,15 +3,20 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 
 from sglang_omni.pipeline.stage_workers import (
     StageGroup,
     StageLaunchConfig,
-    StageProcessTeardownError,
     StageWorkerProcessSpec,
     _patched_spawn_env,
 )
@@ -72,7 +77,7 @@ def test_cpu_stage_keeps_none_gpu_id_under_single_device_marker(monkeypatch):
     assert spec.gpu_id is None
 
 
-def test_protected_process_is_not_a_multiprocessing_daemon():
+def test_spawned_processes_share_one_explicitly_owned_lifecycle():
     class Queue:
         def close(self):
             return None
@@ -116,19 +121,20 @@ def test_protected_process_is_not_a_multiprocessing_daemon():
         ],
     )
 
-    group.spawn(context, protected_process_names={"protected"})
+    group.spawn(context)
 
-    assert [process.daemon for process in context.processes] == [False, True]
+    assert [process.daemon for process in context.processes] == [True, True]
 
 
 @pytest.mark.asyncio
-async def test_shutdown_preserves_selected_stuck_process():
+async def test_shutdown_terminates_and_reaps_every_direct_survivor():
+    events: list[int] = []
+
     class Process:
-        def __init__(self, name, *, protected):
-            self.pid = 123 if protected else 456
+        def __init__(self, name, pid):
+            self.pid = pid
             self.name = name
             self.alive = True
-            self.protected = protected
 
         def join(self, timeout):
             del timeout
@@ -137,29 +143,120 @@ async def test_shutdown_preserves_selected_stuck_process():
             return self.alive
 
         def terminate(self):
-            if self.protected:
-                raise AssertionError("preserved process was signaled")
-
-        def kill(self):
-            if self.protected:
-                raise AssertionError("preserved process was signaled")
+            events.append(self.pid)
             self.alive = False
 
-    protected = Process("protected", protected=True)
-    ordinary = Process("ordinary", protected=False)
+        def kill(self):
+            raise AssertionError("terminate should have stopped the process")
+
+    first = Process("first", 123)
+    second = Process("second", 456)
     group = StageGroup(
         "group",
         [
-            StageWorkerProcessSpec("protected", []),
-            StageWorkerProcessSpec("ordinary", []),
+            StageWorkerProcessSpec("first", []),
+            StageWorkerProcessSpec("second", []),
         ],
     )
-    group._processes = [protected, ordinary]
+    group._processes = [first, second]
 
-    with pytest.raises(StageProcessTeardownError, match="still alive") as exc_info:
-        await group.shutdown(join_timeout=0, preserve_process_names={"protected"})
+    await group.shutdown(join_timeout=0)
 
-    assert exc_info.value.process_names == {"protected"}
-    assert protected.is_alive()
-    assert not ordinary.is_alive()
-    assert group.processes == [protected, ordinary]
+    assert events == [123, 456]
+    assert group.processes == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_continues_after_one_direct_process_cleanup_fails():
+    terminated: list[int] = []
+
+    class Process:
+        def __init__(self, pid, fail=False):
+            self.pid = pid
+            self.name = str(pid)
+            self.fail = fail
+            self.alive = True
+
+        def join(self, timeout):
+            del timeout
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            terminated.append(self.pid)
+            if self.fail:
+                raise RuntimeError("cannot terminate")
+            self.alive = False
+
+        def kill(self):
+            raise AssertionError("terminate should have stopped the process")
+
+    first = Process(123, fail=True)
+    second = Process(456)
+    group = StageGroup(
+        "group",
+        [
+            StageWorkerProcessSpec("first", []),
+            StageWorkerProcessSpec("second", []),
+        ],
+    )
+    group._processes = [first, second]
+
+    with pytest.raises(RuntimeError, match="cannot terminate"):
+        await group.shutdown(join_timeout=0)
+
+    assert terminated == [123, 456]
+    assert first.is_alive()
+    assert not second.is_alive()
+
+
+def test_dirty_parent_exits_nonzero_after_reaping_its_direct_worker():
+    script = """
+import multiprocessing
+import sys
+import time
+from pathlib import Path
+
+from sglang_omni.pipeline.stage_workers import _terminate_process
+from tests.unit_test.mps.test_mps_manager import FakeControlClient, make_manager
+
+root = Path(sys.argv[1])
+client = FakeControlClient()
+manager = make_manager(root, client)
+lease = manager.acquire()
+client.set_clients(manager.paths.pipe_dir, {7000: [101]})
+manager.verify(lease, {101})
+ctx = multiprocessing.get_context("spawn")
+worker = ctx.Process(target=time.sleep, args=(60,), daemon=True)
+worker.start()
+_terminate_process(worker)
+assert not worker.is_alive()
+print("worker-reaped", flush=True)
+manager.release(lease)
+"""
+
+    root = Path(tempfile.mkdtemp(prefix="mps-sub-", dir="/tmp"))
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(root)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+        assert result.returncode != 0
+        assert "worker-reaped" in result.stdout, result.stderr
+        assert "MpsDirtyStateError" in result.stderr
+        assert "lock is released" in result.stderr
+
+        owner_file = next(root.glob("*/owners/*"))
+        assert owner_file.read_text() == "retained\n"
+        owner_fd = os.open(owner_file, os.O_RDWR)
+        try:
+            fcntl.flock(owner_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(owner_fd)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import fcntl
 import os
-import signal
 import subprocess
 from pathlib import Path
 
@@ -151,14 +150,6 @@ class SubprocessMpsControlClient:
             return False
         except (OSError, IndexError) as exc:
             raise MpsControlError(f"cannot inspect daemon pid {pid}: {exc}") from exc
-
-    def terminate_daemon_process(self, pid: int, force: bool = False) -> None:
-        try:
-            os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        except PermissionError as exc:
-            raise MpsControlError(f"cannot signal daemon pid {pid}: {exc}") from exc
 
     def parent_of(self, pid: int) -> int | None:
         try:

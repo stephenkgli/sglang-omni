@@ -11,7 +11,12 @@ from pathlib import Path
 import pytest
 
 from sglang_omni.mps.devices import MpsPhysicalDevice
-from sglang_omni.mps.manager import MpsClientRef, MpsError, MpsLeaseRetainedError
+from sglang_omni.mps.manager import (
+    MpsClientRef,
+    MpsDirtyStateError,
+    MpsError,
+    MpsLease,
+)
 from sglang_omni.mps.runtime import MpsPipelineRuntime
 from tests.unit_test.mps.test_mps_manager import FakeControlClient
 
@@ -64,13 +69,19 @@ def colocated():
 
 
 def create(short_root, mode="auto", procs=None, unsupported=None, client=None):
-    return MpsPipelineRuntime.create(
+    runtime = MpsPipelineRuntime.create(
         mode=mode,
         process_specs=procs if procs is not None else colocated(),
         device_info=FakeDeviceInfo(unsupported),
         client=client or FakeControlClient(),
         state_root=short_root,
     )
+    if runtime is not None:
+        for manager in runtime.managers.values():
+            manager.poll_interval = 0.0
+            manager.drain_timeout = 0.02
+            manager.stop_timeout = 0.02
+    return runtime
 
 
 def detach_all(runtime, client):
@@ -171,70 +182,71 @@ def test_multi_gpu_start_rolls_back_only_successful_acquisitions(short_root):
     assert (dirty.owners_dir / "777").exists()
 
 
-def test_runtime_stop_attempts_every_acquired_manager(short_root, monkeypatch):
-    client = FakeControlClient()
+def test_multi_gpu_start_preserves_acquire_and_rollback_dirty_diagnostics(
+    short_root,
+    monkeypatch,
+):
     runtime = create(
         short_root,
-        procs=[proc("a", 0), proc("b", 0), proc("c", 1), proc("d", 1)],
-        client=client,
+        mode="on",
+        procs=[proc("a", 0), proc("b", 1)],
     )
-    runtime.start()
-    detach_all(runtime, client)
-    released: list[int] = []
+    acquired = MpsLease(daemon_pid=100, owner_fd=10)
+    acquire_dirty = MpsDirtyStateError("GPU 1 acquire retained at /state/gpu1")
 
-    def fail_release(lease):
-        del lease
-        released.append(1)
-        raise MpsError("boom")
+    monkeypatch.setattr(runtime.managers[0], "acquire", lambda: acquired)
 
-    original_release_zero = runtime.managers[0].release
-    original_release_one = runtime.managers[1].release
+    def fail_acquire():
+        raise MpsError("GPU 1 startup failed") from acquire_dirty
 
-    def release_zero(lease):
-        released.append(0)
-        original_release_zero(lease)
+    def dirty_rollback(lease, *, ownership_complete=True):
+        del ownership_complete
+        lease.owner_fd = -1
+        raise MpsDirtyStateError("GPU 0 rollback retained at /state/gpu0")
 
-    monkeypatch.setattr(runtime.managers[1], "release", fail_release)
-    monkeypatch.setattr(runtime.managers[0], "release", release_zero)
+    monkeypatch.setattr(runtime.managers[1], "acquire", fail_acquire)
+    monkeypatch.setattr(runtime.managers[0], "release", dirty_rollback)
 
-    with pytest.raises(MpsError, match="boom"):
-        runtime.stop()
-    assert released == [1, 0]
+    with pytest.raises(MpsError, match="GPU 1 startup failed") as exc_info:
+        runtime.start()
 
-    monkeypatch.setattr(runtime.managers[1], "release", original_release_one)
-    runtime.stop()
-
-
-def test_runtime_preserves_only_the_gpu_with_unsafe_processes(short_root):
-    client = FakeControlClient()
-    runtime = create(
-        short_root,
-        procs=[proc("a", 0), proc("b", 0), proc("c", 1), proc("d", 1)],
-        client=client,
-    )
-    runtime.start()
-    detach_all(runtime, client)
-    client.set_clients(runtime.managers[0].paths.pipe_dir, {7000: [10]})
-    runtime.verify({"a": 10})
-
-    with pytest.raises(
-        MpsLeaseRetainedError,
-        match="automatic process signals are disabled",
-    ) as exc:
-        runtime.stop({"a"})
-
-    assert set(runtime._leases) == {0}
-    assert runtime.managers[0].paths.state_dir.exists()
-    assert not runtime.managers[1].paths.state_dir.exists()
-    assert "terminate_client" in str(exc.value)
-    assert "kill -TERM" in str(exc.value)
-
-    client.set_clients(runtime.managers[0].paths.pipe_dir, {})
-    runtime.stop()
+    messages: list[str] = []
+    error: BaseException | None = exc_info.value
+    while error is not None:
+        messages.append(str(error))
+        error = error.__cause__
+    report = "\n".join(messages)
+    assert "GPU 1 acquire retained at /state/gpu1" in report
+    assert "GPU 0 rollback retained at /state/gpu0" in report
     assert not runtime.has_leases
 
 
-def test_preverify_live_root_captures_only_proven_descendant_refs(short_root):
+def test_multi_gpu_stop_persists_dirty_gpu_and_releases_clean_gpu(short_root):
+    client = FakeControlClient()
+    runtime = create(
+        short_root,
+        procs=[proc("a", 0), proc("b", 0), proc("c", 1), proc("d", 1)],
+        client=client,
+    )
+    runtime.start()
+    detach_all(runtime, client)
+    dirty_manager = runtime.managers[1]
+    clean_manager = runtime.managers[0]
+    client.set_clients(dirty_manager.paths.pipe_dir, {7000: [30]})
+    runtime.verify({"c": 30})
+
+    with pytest.raises(MpsDirtyStateError, match="still attached"):
+        runtime.stop()
+
+    assert not runtime.has_leases
+    assert dirty_manager.paths.state_dir.is_dir()
+    assert dirty_manager._owner_file.read_text() == "retained\n"
+    assert not clean_manager.paths.state_dir.exists()
+    assert client.terminated_clients == []
+    assert client.daemon_signals == []
+
+
+def test_preverify_clients_are_preserved_without_guessing_ownership(short_root):
     client = FakeControlClient()
     runtime = create(short_root, client=client)
     runtime.start()
@@ -242,16 +254,13 @@ def test_preverify_live_root_captures_only_proven_descendant_refs(short_root):
     client.set_clients(manager.paths.pipe_dir, {7000: [200], 8000: [909]})
     client.parents[200] = 100
 
-    with pytest.raises(MpsLeaseRetainedError) as exc_info:
-        runtime.stop({"a"}, {"a": 100})
+    with pytest.raises(MpsDirtyStateError) as exc_info:
+        runtime.stop()
 
     message = str(exc_info.value)
-    assert runtime._leases[0].attached_clients == {MpsClientRef(7000, 200)}
-    # A teardown-time snapshot makes the proven client actionable, but it is
-    # not equivalent to startup verification of the complete attachment set.
-    assert not runtime._leases[0].attachment_verified
-    assert "terminate_client 7000 200" in message
+    assert not runtime.has_leases
+    assert "terminate_client 7000 200" not in message
     assert "terminate_client 8000 909" not in message
-
-    client.set_clients(manager.paths.pipe_dir, {})
-    runtime.stop()
+    assert client.terminated_clients == []
+    assert client.daemon_signals == []
+    assert manager._owner_file.read_text() == "retained\n"

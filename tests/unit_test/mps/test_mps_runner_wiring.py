@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from sglang_omni.config import EndpointsConfig, PipelineConfig, StageConfig
-from sglang_omni.mps.manager import MpsError, MpsLeaseRetainedError
+from sglang_omni.mps.manager import MpsDirtyStateError, MpsError
 from sglang_omni.pipeline import mp_runner
 from sglang_omni.pipeline.stage_workers import StageProcessTeardownError
 
@@ -89,8 +89,7 @@ class _FakeMps:
         self._stop_gate = stop_gate
         self.started = False
         self.stop_calls = 0
-        self.preserved_processes: set[str] = set()
-        self.preserved_live_pids: dict[str, int] = {}
+        self.incomplete_processes: set[str] = set()
         self.events: list[str] | None = None
 
     @property
@@ -114,23 +113,18 @@ class _FakeMps:
         del process_name
         return {}
 
-    def stop(self, preserve_process_names=(), live_pids_by_process_name=None) -> None:
+    def stop(self, ownership_incomplete_process_names=()) -> None:
         if self.events is not None:
             self.events.append("MPS release")
         self.stop_calls += 1
-        self.preserved_processes = set(preserve_process_names)
-        self.preserved_live_pids = dict(live_pids_by_process_name or {})
+        self.incomplete_processes = set(ownership_incomplete_process_names)
         if self._stop_gate is not None:
             entered, release = self._stop_gate
             entered.set()
             assert release.wait(timeout=5)
-        if self._stop_fails:
-            raise MpsError("cleanup is ambiguous")
-        if self.preserved_processes:
-            raise MpsLeaseRetainedError(
-                "lease preserved; follow operator cleanup guidance"
-            )
         self.started = False
+        if self._stop_fails:
+            raise MpsDirtyStateError("dirty state persisted and owner lock released")
 
 
 class _FailingGroup:
@@ -146,9 +140,8 @@ class _FailingGroup:
         self,
         ctx,
         extra_env_for=None,
-        protected_process_names=(),
     ) -> None:
-        del ctx, extra_env_for, protected_process_names
+        del ctx, extra_env_for
         raise self._exc
 
     def alive_process_pids(self) -> dict[str, int]:
@@ -160,9 +153,8 @@ class _FailingGroup:
     async def shutdown(
         self,
         join_timeout=30.0,
-        preserve_process_names=(),
     ) -> None:
-        del join_timeout, preserve_process_names
+        del join_timeout
         self.shutdown_calls += 1
 
 
@@ -172,20 +164,29 @@ class _ReadyGroup:
     stage_control_endpoints: dict[str, str] = {}
     process_count = 0
 
-    def __init__(self, shutdown_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        shutdown_error: Exception | None = None,
+        *,
+        forced_process_names=(),
+    ) -> None:
         self.spawn_calls = 0
         self.shutdown_calls = 0
         self.shutdown_error = shutdown_error
-        self.preserve_process_names: set[str] = set()
+        self.forced_process_names = set(forced_process_names)
+        self._alive_pids = (
+            {name: 101 for name in shutdown_error.process_names}
+            if isinstance(shutdown_error, StageProcessTeardownError)
+            else {}
+        )
         self.events: list[str] | None = None
 
     def spawn(
         self,
         ctx,
         extra_env_for=None,
-        protected_process_names=(),
     ) -> None:
-        del ctx, extra_env_for, protected_process_names
+        del ctx, extra_env_for
         self.spawn_calls += 1
 
     async def wait_ready(self, timeout) -> None:
@@ -198,9 +199,7 @@ class _ReadyGroup:
         return {}
 
     def alive_process_pids(self) -> dict[str, int]:
-        if isinstance(self.shutdown_error, StageProcessTeardownError):
-            return {name: 101 for name in self.shutdown_error.process_names}
-        return {}
+        return dict(self._alive_pids)
 
     def dead_process_names(self) -> set[str]:
         return set()
@@ -208,15 +207,14 @@ class _ReadyGroup:
     async def shutdown(
         self,
         join_timeout=30.0,
-        preserve_process_names=(),
     ) -> None:
         del join_timeout
         if self.events is not None:
             self.events.append("process shutdown")
         self.shutdown_calls += 1
-        self.preserve_process_names = set(preserve_process_names)
         if self.shutdown_error is not None:
             raise self.shutdown_error
+        return set(self.forced_process_names)
 
 
 def _patch_runner(monkeypatch, fake_mps, group):
@@ -287,14 +285,13 @@ async def test_later_spawn_failure_gracefully_stops_registered_mps_group(
         async def shutdown(
             self,
             join_timeout=30.0,
-            preserve_process_names=(),
         ) -> None:
-            del join_timeout, preserve_process_names
+            del join_timeout
             self.shutdown_calls += 1
             if "a" not in coordinator.shutdown_targets:
                 raise StageProcessTeardownError(
                     {"a"},
-                    "protected process did not receive graceful shutdown",
+                    "process did not receive graceful shutdown",
                 )
 
     started = StartedGroup()
@@ -314,7 +311,6 @@ async def test_later_spawn_failure_gracefully_stops_registered_mps_group(
     assert coordinator.registered == {"a": "ipc://a"}
     assert started.shutdown_calls == 1
     assert fake_mps.stop_calls == 1
-    assert fake_mps.preserved_processes == set()
     assert not fake_mps.has_leases
 
 
@@ -358,7 +354,9 @@ async def test_concurrent_stop_runs_cleanup_once(short_base, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_alive_mps_process_preserves_its_lease(short_base, monkeypatch):
+async def test_direct_process_cleanup_error_does_not_skip_mps_release(
+    short_base, monkeypatch
+):
     fake_mps = _FakeMps()
     error = StageProcessTeardownError({"a"}, "stage process is still alive")
     group = _ReadyGroup(error)
@@ -366,60 +364,54 @@ async def test_alive_mps_process_preserves_its_lease(short_base, monkeypatch):
     runner = mp_runner.MultiProcessPipelineRunner(_make_config(short_base))
     await runner.start()
 
-    with pytest.raises(MpsLeaseRetainedError, match="operator cleanup guidance"):
+    with pytest.raises(StageProcessTeardownError, match="still alive"):
         await runner.stop()
 
-    assert group.preserve_process_names == {"a"}
-    assert fake_mps.preserved_processes == {"a"}
-    assert fake_mps.preserved_live_pids == {"a": 101}
-    assert fake_mps.has_leases
-    assert runner.has_retained_mps_leases
-
-    group.shutdown_error = None
-    runner.retry_retained_mps_cleanup()
-
-    assert fake_mps.stop_calls == 2
-    assert not runner.has_retained_mps_leases
+    assert group.shutdown_calls == 1
+    assert fake_mps.stop_calls == 1
+    assert not fake_mps.has_leases
+    assert not hasattr(runner, "has_retained_mps_leases")
 
 
 @pytest.mark.asyncio
-async def test_dead_mps_root_is_an_unsafe_gpu_disposition(short_base, monkeypatch):
+async def test_forced_mps_worker_exit_marks_ownership_incomplete(
+    short_base, monkeypatch
+):
     fake_mps = _FakeMps()
-
-    class DeadGroup(_ReadyGroup):
-        dead = False
-
-        def any_dead(self) -> bool:
-            return self.dead
-
-        def dead_process_names(self) -> set[str]:
-            return {"a"} if self.dead else set()
-
-    group = DeadGroup()
+    group = _ReadyGroup(forced_process_names={"a", "ordinary"})
     _patch_runner(monkeypatch, fake_mps, group)
     runner = mp_runner.MultiProcessPipelineRunner(_make_config(short_base))
     await runner.start()
-    group.dead = True
 
-    with pytest.raises(MpsLeaseRetainedError):
-        await runner.stop()
+    await runner.stop()
 
-    assert fake_mps.preserved_processes == {"a"}
-    assert fake_mps.preserved_live_pids == {}
-    assert runner.has_retained_mps_leases
+    assert fake_mps.incomplete_processes == {"a"}
 
 
 @pytest.mark.asyncio
-async def test_cancelled_stop_keeps_retained_lease_error_as_cause(
+async def test_dirty_mps_stop_is_terminal_without_a_runner_hold(short_base, monkeypatch):
+    fake_mps = _FakeMps(stop_fails=True)
+    group = _ReadyGroup()
+    _patch_runner(monkeypatch, fake_mps, group)
+    runner = mp_runner.MultiProcessPipelineRunner(_make_config(short_base))
+    await runner.start()
+
+    with pytest.raises(MpsDirtyStateError, match="owner lock released"):
+        await runner.stop()
+
+    assert fake_mps.stop_calls == 1
+    assert not fake_mps.has_leases
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stop_keeps_dirty_state_error_as_cause(
     short_base,
     monkeypatch,
 ):
     entered = threading.Event()
     release = threading.Event()
-    fake_mps = _FakeMps(stop_gate=(entered, release))
-    group = _ReadyGroup(
-        StageProcessTeardownError({"a"}, "stage process is still alive")
-    )
+    fake_mps = _FakeMps(stop_fails=True, stop_gate=(entered, release))
+    group = _ReadyGroup()
     _patch_runner(monkeypatch, fake_mps, group)
     runner = mp_runner.MultiProcessPipelineRunner(_make_config(short_base))
     await runner.start()
@@ -433,5 +425,5 @@ async def test_cancelled_stop_keeps_retained_lease_error_as_cause(
     with pytest.raises(asyncio.CancelledError) as exc_info:
         await stop_task
 
-    assert isinstance(exc_info.value.__cause__, MpsLeaseRetainedError)
-    assert runner.has_retained_mps_leases
+    assert isinstance(exc_info.value.__cause__, MpsDirtyStateError)
+    assert not fake_mps.has_leases

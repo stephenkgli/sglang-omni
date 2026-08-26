@@ -25,7 +25,6 @@ from sglang_omni.config.runtime import (
 )
 from sglang_omni.config.schema import PipelineConfig, StageConfig
 from sglang_omni.config.topology import LogicalProcessPlan, ProcessTopologyPlan
-from sglang_omni.mps.manager import MpsLeaseRetainedError
 from sglang_omni.mps.runtime import MpsPipelineRuntime, create_for_pipeline
 from sglang_omni.pipeline import Coordinator
 from sglang_omni.pipeline.replicas import ReplicaTopology
@@ -458,12 +457,6 @@ class MultiProcessPipelineRunner:
             endpoints.update(group.stage_control_endpoints)
         return endpoints
 
-    @property
-    def has_retained_mps_leases(self) -> bool:
-        """Whether process exit would drop an intentionally retained MPS lease."""
-
-        return self._mps is not None and self._mps.has_leases
-
     async def start(self, timeout: float = 120.0) -> None:
         if self._started:
             raise RuntimeError("Already started")
@@ -558,7 +551,6 @@ class MultiProcessPipelineRunner:
                     group.spawn(
                         ctx,
                         extra_env_for=extra_env_for,
-                        protected_process_names=self._mps.process_names,
                     )
 
             await asyncio.gather(*(g.wait_ready(timeout) for g in self._groups))
@@ -590,8 +582,8 @@ class MultiProcessPipelineRunner:
             )
 
         except BaseException as startup_error:
-            # Cancellation waits for any retained MPS worker before this one
-            # single-flight teardown rolls back acquired leases.
+            # Cancellation waits for this single-flight teardown to make every
+            # acquired MPS lease terminal (clean or persistently dirty).
             try:
                 await self._stop_once()
             except BaseException as cleanup_exc:
@@ -721,23 +713,6 @@ class MultiProcessPipelineRunner:
     async def stop(self) -> None:
         await self._stop_once()
 
-    def retry_retained_mps_cleanup(self) -> None:
-        """Recheck retained MPS leases after explicit operator cleanup."""
-
-        if self._mps is None or not self._mps.has_leases:
-            return
-        live_pids = {
-            name: pid
-            for group in self._groups
-            for name, pid in group.alive_process_pids().items()
-            if name in self._mps.process_names
-        }
-        try:
-            self._mps.stop(set(live_pids), live_pids)
-        finally:
-            if not self._mps.has_leases:
-                self._mps = None
-
     async def _stop_once(self) -> None:
         self._started = False
         if self._stop_task is None:
@@ -753,16 +728,14 @@ class MultiProcessPipelineRunner:
         initiator: asyncio.Task | None,
     ) -> None:
         cleanup_errors: list[BaseException] = []
-        unsafe_mps_processes = (
-            {
+        ownership_incomplete: set[str] = set()
+        if self._mps is not None:
+            ownership_incomplete.update(
                 name
                 for group in self._groups
                 for name in group.dead_process_names()
                 if name in self._mps.process_names
-            }
-            if self._mps is not None
-            else set()
-        )
+            )
         monitor = self._monitor_task
         if monitor is not None and monitor is not initiator:
             monitor.cancel()
@@ -778,39 +751,31 @@ class MultiProcessPipelineRunner:
             except Exception as exc:
                 logger.warning("shutdown_stages error: %s", exc)
 
-        preserve_process_names = self._mps.process_names if self._mps else ()
-
         shutdown_results = await asyncio.gather(
             *(
-                group.shutdown(
-                    join_timeout=30.0,
-                    preserve_process_names=preserve_process_names,
-                )
+                group.shutdown(join_timeout=30.0)
                 for group in self._groups
             ),
             return_exceptions=True,
         )
-        alive_processes: set[str] = set()
         for result in shutdown_results:
             if isinstance(result, BaseException):
                 logger.error("Stage process teardown incomplete: %s", result)
                 cleanup_errors.append(result)
                 if isinstance(result, StageProcessTeardownError):
-                    alive_processes.update(result.process_names)
+                    ownership_incomplete.update(
+                        result.process_names & self._mps.process_names
+                        if self._mps is not None
+                        else ()
+                    )
+            elif self._mps is not None and result:
+                ownership_incomplete.update(result & self._mps.process_names)
 
         if self._mps is not None:
-            preserve_processes = unsafe_mps_processes | alive_processes
-            live_pids = {
-                name: pid
-                for group in self._groups
-                for name, pid in group.alive_process_pids().items()
-                if name in preserve_processes
-            }
             try:
                 await self._run_mps_call(
                     self._mps.stop,
-                    preserve_processes,
-                    live_pids,
+                    ownership_incomplete,
                 )
             except Exception as exc:
                 logger.error("MPS teardown incomplete: %s", exc)
@@ -837,24 +802,6 @@ class MultiProcessPipelineRunner:
         self._close_runtime_dir()
 
         if cleanup_errors:
-            if self.has_retained_mps_leases:
-                retained = next(
-                    (
-                        exc
-                        for exc in cleanup_errors
-                        if isinstance(exc, MpsLeaseRetainedError)
-                    ),
-                    None,
-                )
-                if len(cleanup_errors) == 1 and retained is not None:
-                    raise retained
-                details = "; ".join(
-                    f"{type(exc).__name__}: {exc}" for exc in cleanup_errors
-                )
-                raise MpsLeaseRetainedError(
-                    f"Pipeline cleanup is incomplete while MPS owner leases remain "
-                    f"held: {details}"
-                ) from retained
             if len(cleanup_errors) == 1:
                 raise cleanup_errors[0]
             details = "; ".join(

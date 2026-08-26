@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+from collections.abc import Collection
 from pathlib import Path
 from typing import Protocol
 
@@ -16,9 +17,9 @@ from sglang_omni.mps.decision import MpsGpuPlan, plan_mps_gpus
 from sglang_omni.mps.devices import MpsPhysicalDevice
 from sglang_omni.mps.manager import (
     MpsControlClient,
+    MpsDirtyStateError,
     MpsError,
     MpsLease,
-    MpsLeaseRetainedError,
     MpsManager,
 )
 from sglang_omni.mps.state import MpsGpuPaths
@@ -140,9 +141,30 @@ class MpsPipelineRuntime:
                     gpu_id,
                     manager.paths.pipe_dir,
                 )
-        except BaseException:
+        except BaseException as startup_error:
+            rollback_errors: list[tuple[int, MpsError]] = []
             for gpu_id in reversed(acquired):
-                self._release_one(gpu_id, suppress_errors=True)
+                error = self._release_one(gpu_id, suppress_errors=True)
+                if error is not None:
+                    rollback_errors.append((gpu_id, error))
+            if rollback_errors:
+                details = "; ".join(
+                    f"GPU {gpu_id}: {error}"
+                    for gpu_id, error in rollback_errors
+                )
+                error_type = (
+                    MpsDirtyStateError
+                    if any(
+                        isinstance(error, MpsDirtyStateError)
+                        for _, error in rollback_errors
+                    )
+                    else MpsError
+                )
+                rollback_error = error_type(details)
+                prior_cause = startup_error.__cause__ or startup_error.__context__
+                if prior_cause is not None:
+                    rollback_error.__cause__ = prior_cause
+                raise startup_error from rollback_error
             raise
         logger.info(
             "MPS summary: mode=%s %s",
@@ -194,52 +216,47 @@ class MpsPipelineRuntime:
 
     def stop(
         self,
-        preserve_process_names: set[str] | None = None,
-        live_pids_by_process_name: dict[str, int] | None = None,
+        ownership_incomplete_process_names: Collection[str] = (),
     ) -> None:
-        live_pids = live_pids_by_process_name or {}
-        preserve_gpus = {
+        incomplete_gpus = {
             self._client_gpu[name]
-            for name in preserve_process_names or ()
+            for name in ownership_incomplete_process_names
             if name in self._client_gpu
         }
-        errors: list[str] = []
+        errors: list[tuple[int, MpsError]] = []
         for gpu_id in reversed(list(self._leases)):
-            if gpu_id in preserve_gpus:
-                process_names = {
-                    name
-                    for name in preserve_process_names or ()
-                    if self._client_gpu.get(name) == gpu_id
-                }
-                try:
-                    report = self.managers[gpu_id].preservation_report(
-                        self._leases[gpu_id],
-                        process_names,
-                        {
-                            live_pids[name]
-                            for name in process_names
-                            if name in live_pids
-                        },
-                    )
-                except MpsError as exc:
-                    report = f"could not inspect preserved MPS lease: {exc}"
-                logger.error("GPU %d: %s", gpu_id, report)
-                errors.append(f"GPU {gpu_id}: {report}")
-                continue
-            error = self._release_one(gpu_id, suppress_errors=False)
+            error = self._release_one(
+                gpu_id,
+                suppress_errors=False,
+                ownership_complete=gpu_id not in incomplete_gpus,
+            )
             if error is not None:
-                errors.append(f"GPU {gpu_id}: {error}")
+                errors.append((gpu_id, error))
         if errors:
-            error_type = MpsLeaseRetainedError if self._leases else MpsError
-            raise error_type("; ".join(errors))
+            details = "; ".join(f"GPU {gpu_id}: {error}" for gpu_id, error in errors)
+            error_type = (
+                MpsDirtyStateError
+                if any(isinstance(error, MpsDirtyStateError) for _, error in errors)
+                else MpsError
+            )
+            raise error_type(details)
 
-    def _release_one(self, gpu_id: int, *, suppress_errors: bool) -> str | None:
+    def _release_one(
+        self,
+        gpu_id: int,
+        *,
+        suppress_errors: bool,
+        ownership_complete: bool = True,
+    ) -> MpsError | None:
         lease = self._leases[gpu_id]
-        error: str | None = None
+        error: MpsError | None = None
         try:
-            self.managers[gpu_id].release(lease)
+            self.managers[gpu_id].release(
+                lease,
+                ownership_complete=ownership_complete,
+            )
         except MpsError as exc:
-            error = str(exc)
+            error = exc
             if suppress_errors:
                 logger.error("MPS rollback incomplete on GPU %d: %s", gpu_id, exc)
         finally:

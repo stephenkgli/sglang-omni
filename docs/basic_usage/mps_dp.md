@@ -56,26 +56,24 @@ pipeline if the daemon dies mid-serving. Shutdown drains this serve's clients
 and quits the daemon only when no other serve still owns it.
 
 If a managed worker does not exit before the shutdown timeout, the runtime
-does not send `SIGTERM` or `SIGKILL`. It keeps that worker, its owner lease, and
-the state directory intact, then reports the exact operator cleanup commands.
-The serve parent also remains alive so Python cannot terminate the worker at
-interpreter exit and the kernel-held owner lease stays valid during cleanup.
-This also applies when the managed root process has died but an MPS descendant
-recorded during startup is still attached. While a lease is retained, repeated
-`SIGINT`/`SIGTERM` never terminate the owner directly. Follow the reported
-client-specific `terminate_client` commands and stop that serve's workload
-processes, then send either signal again to request a safe recheck. If another
-healthy owner remains, the recheck releases only this serve's owner lease and
-leaves the shared daemon running. The last owner quits the daemon and removes
-the state directory only after its client snapshot is empty. A retained owner
-also blocks new serves from joining until this recheck succeeds.
+terminates that directly owned child process and reaps it before the launcher
+exits. It does not automatically signal an MPS client, daemon, unknown
+descendant, or GPU-wide process set. Process ownership and shared MPS state are
+handled independently: if daemon identity, client ownership, or control state
+cannot be proved after the workers are gone, the owner file is marked
+`retained`, its lock is released, and the state directory is preserved. The
+current command then exits with a detailed non-zero error instead of keeping a
+CLI owner alive.
 
 Dirty state is never repaired automatically. A join requires the native
 `nvidia-cuda-mps-control.pid` identity, a responsive control socket, and every
 published owner lease to still be held. After a hard kill (SIGKILL, OOM kill,
 node crash), even an idle daemon or one dead co-owner makes the next start
 preserve the state and fail with owner/client details and safe cleanup guidance.
-Clean up and start again. A normal shutdown leaves nothing behind.
+An unlocked or retained owner blocks every later start until an operator has
+inspected and cleaned the state. Existing healthy co-owners keep serving, but
+new owners cannot join and no process retries cleanup automatically. Clean up
+and start again. A normal shutdown leaves nothing behind.
 
 Operator notes: state lives under `/tmp/sglang-omni-mps-<user>/<gpu-uuid>/`
 (`SGLANG_OMNI_MPS_STATE_ROOT` overrides it). Serves that are meant to share

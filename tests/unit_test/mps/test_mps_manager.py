@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
 import tempfile
@@ -14,9 +15,9 @@ import sglang_omni.mps.manager as manager_module
 from sglang_omni.mps.manager import (
     MpsClientRef,
     MpsControlError,
+    MpsDirtyStateError,
     MpsError,
     MpsLease,
-    MpsLeaseRetainedError,
     MpsManager,
 )
 from sglang_omni.mps.state import MpsGpuPaths
@@ -36,11 +37,14 @@ class FakeControlClient:
         self.start_fails = False
         self.snapshot_error: str | None = None
         self.identity_error: str | None = None
+        self.parent_error: str | None = None
         self.quit_error: str | None = None
+        self.terminate_error: str | None = None
         self.quit_works = True
         self.start_calls = 0
         self.quit_calls: list[str] = []
         self.daemon_signals: list[tuple[int, bool]] = []
+        self.terminated_clients: list[MpsClientRef] = []
 
     def start_daemon(self, pipe_dir, log_dir, gpu_uuid):
         del log_dir, gpu_uuid
@@ -92,6 +96,12 @@ class FakeControlClient:
             self.alive_pids.discard(pid)
         self.snapshots.pop(str(pipe_dir), None)
 
+    def terminate_client(self, pipe_dir, client):
+        self.terminated_clients.append(client)
+        if self.terminate_error is not None:
+            raise MpsControlError(self.terminate_error)
+        self.snapshots.setdefault(str(pipe_dir), set()).discard(client)
+
     def daemon_process_alive(self, pid):
         return pid in self.alive_pids
 
@@ -100,6 +110,8 @@ class FakeControlClient:
         self.alive_pids.discard(pid)
 
     def parent_of(self, pid):
+        if self.parent_error is not None:
+            raise MpsControlError(self.parent_error)
         return self.parents.get(pid)
 
     def owner_lease_held(self, lease_file):
@@ -287,7 +299,7 @@ def test_malformed_owner_entry_fails_without_deletion(short_root):
     assert malformed.exists()
 
 
-def test_unresponsive_new_daemon_is_the_only_process_signalled(short_root):
+def test_unresponsive_new_daemon_is_persisted_without_process_signals(short_root):
     client = FakeControlClient()
     client.snapshot_error = "control unavailable"
     manager = make_manager(short_root, client)
@@ -295,8 +307,10 @@ def test_unresponsive_new_daemon_is_the_only_process_signalled(short_root):
     with pytest.raises(MpsError, match="control daemon"):
         manager.acquire()
 
-    assert client.daemon_signals == [(client.daemon_pid, False)]
-    assert not manager.paths.state_dir.exists()
+    assert client.daemon_signals == []
+    assert client.terminated_clients == []
+    assert manager.paths.state_dir.is_dir()
+    assert manager._owner_file.read_text() == "retained\n"
 
 
 def test_spawn_failure_without_native_identity_preserves_state(short_root):
@@ -304,11 +318,14 @@ def test_spawn_failure_without_native_identity_preserves_state(short_root):
     client.start_fails = True
     manager = make_manager(short_root, client)
 
-    with pytest.raises(MpsError, match="spawn failed"):
+    with pytest.raises(MpsError, match="spawn failed") as exc_info:
         manager.acquire()
 
     assert manager.paths.state_dir.is_dir()
     assert client.daemon_signals == []
+    assert manager._owner_file.read_text() == "retained\n"
+    assert isinstance(exc_info.value.__cause__, MpsDirtyStateError)
+    assert "lock is released" in str(exc_info.value.__cause__)
 
 
 def test_startup_rollback_never_signals_an_unverified_pid(short_root):
@@ -327,6 +344,7 @@ def test_startup_rollback_never_signals_an_unverified_pid(short_root):
 
     assert manager.paths.state_dir.is_dir()
     assert client.daemon_signals == []
+    assert manager._owner_file.read_text() == "retained\n"
 
 
 def test_unexpected_clients_on_fresh_daemon_are_preserved(short_root):
@@ -345,6 +363,8 @@ def test_unexpected_clients_on_fresh_daemon_are_preserved(short_root):
 
     assert manager.paths.state_dir.is_dir()
     assert client.daemon_signals == []
+    assert client.terminated_clients == []
+    assert manager._owner_file.read_text() == "retained\n"
 
 
 def test_verify_returns_and_retains_exact_client_refs(short_root):
@@ -391,7 +411,9 @@ def test_probe_checks_daemon_and_retained_clients(short_root):
     assert not manager.probe(lease)
 
 
-def test_dead_root_with_live_descendant_keeps_lease_and_reports_cleanup(short_root):
+def test_dead_root_with_live_descendant_persists_dirty_and_reports_cleanup(
+    short_root,
+):
     client = FakeControlClient()
     manager = make_manager(short_root, client)
     lease = manager.acquire()
@@ -400,19 +422,31 @@ def test_dead_root_with_live_descendant_keeps_lease_and_reports_cleanup(short_ro
     manager.verify(lease, {100})
     client.parents[200] = 1
 
-    with pytest.raises(MpsLeaseRetainedError, match="still attached") as exc_info:
+    with pytest.raises(MpsDirtyStateError, match="still attached") as exc_info:
         manager.release(lease)
 
-    assert lease.owner_fd >= 0
+    assert lease.owner_fd == -1
     assert manager.paths.state_dir.is_dir()
+    assert manager._owner_file.read_text() == "retained\n"
     assert client.quit_calls == []
+    assert client.terminated_clients == []
+    assert client.daemon_signals == []
     assert f"Owner PID {os.getpid()}" in str(exc_info.value)
     assert "Current MPS client refs" in str(exc_info.value)
     assert "terminate_client 7000 200" in str(exc_info.value)
-    assert f"kill -TERM {os.getpid()}" in str(exc_info.value)
+    assert "lock is released" in str(exc_info.value)
+
+    owner_fd = os.open(manager._owner_file, os.O_RDWR)
+    try:
+        fcntl.flock(owner_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(owner_fd)
+
+    with pytest.raises(MpsError, match="dirty state"):
+        make_manager(short_root, client).acquire()
 
 
-def test_retained_owner_guidance_never_targets_a_coowners_clients(short_root):
+def test_dirty_owner_guidance_never_targets_a_coowners_clients(short_root):
     client = FakeControlClient()
     seed_shared_dir(
         short_root,
@@ -427,15 +461,45 @@ def test_retained_owner_guidance_never_targets_a_coowners_clients(short_root):
     client.set_clients(manager.paths.pipe_dir, {7000: [101], 8000: [202]})
     manager.verify(lease, {101})
 
-    report = manager.preservation_report(lease, {"a"})
+    with pytest.raises(MpsDirtyStateError) as exc_info:
+        manager.release(lease)
 
     assert owned in lease.attached_clients
-    assert "terminate_client 7000 101" in report
-    assert "terminate_client 8000 202" not in report
-    assert f"not proven to belong to this lease: [{foreign!r}]" in report
+    message = str(exc_info.value)
+    assert "terminate_client 7000 101" in message
+    assert "terminate_client 8000 202" not in message
+    assert f"not proven to belong to this lease: [{foreign!r}]" in message
+    assert client.terminated_clients == []
+    assert lease.owner_fd == -1
 
 
-def test_unattributable_orphan_marks_owner_retained_and_blocks_join(short_root):
+def test_forced_root_exit_does_not_assign_a_shared_snapshot_to_coowners(
+    short_root,
+):
+    client = FakeControlClient()
+    seed_shared_dir(
+        short_root,
+        client,
+        daemon_pid=999,
+        owners={888: True},
+    )
+    manager = make_manager(short_root, client)
+    lease = manager.acquire()
+    client.set_clients(manager.paths.pipe_dir, {7000: [101], 8000: [202]})
+    manager.verify(lease, {101})
+    client.set_clients(manager.paths.pipe_dir, {8000: [202]})
+
+    with pytest.raises(MpsDirtyStateError, match="ownership is incomplete"):
+        manager.release(lease, ownership_complete=False)
+
+    assert lease.owner_fd == -1
+    assert manager._owner_file.read_text() == "retained\n"
+    assert client.quit_calls == []
+    assert client.terminated_clients == []
+    assert client.snapshot(manager.paths.pipe_dir) == {MpsClientRef(8000, 202)}
+
+
+def test_unattributable_orphan_persists_dirty_and_blocks_join(short_root):
     client = FakeControlClient()
     seed_shared_dir(
         short_root,
@@ -447,15 +511,18 @@ def test_unattributable_orphan_marks_owner_retained_and_blocks_join(short_root):
     manager = make_manager(short_root, client)
     lease = manager.acquire()
 
-    report = manager.preservation_report(lease, {"dead-root"})
+    with pytest.raises(MpsDirtyStateError) as exc_info:
+        manager.release(lease)
 
-    assert "terminate_client 7000 200" not in report
+    assert "terminate_client 7000 200" not in str(exc_info.value)
     assert manager._owner_file.read_text() == "retained\n"
+    assert lease.owner_fd == -1
+    assert client.terminated_clients == []
     with pytest.raises(MpsError, match="retained"):
         make_manager(short_root, client).acquire()
 
 
-def test_retained_owner_blocks_join_then_releases_without_interrupting_coowner(
+def test_dirty_owner_blocks_join_without_interrupting_clean_coowner(
     short_root,
     monkeypatch,
 ):
@@ -479,13 +546,15 @@ def test_retained_owner_blocks_join_then_releases_without_interrupting_coowner(
     manager_b.verify(lease_b, {202})
 
     current_pid = 1001
-    with pytest.raises(MpsLeaseRetainedError) as exc_info:
+    with pytest.raises(MpsDirtyStateError) as exc_info:
         manager_a.release(lease_a)
 
     message = str(exc_info.value)
     assert "terminate_client 7000 101" in message
     assert "terminate_client 8000 202" not in message
     assert manager_a._owner_file.read_text() == "retained\n"
+    assert lease_a.owner_fd == -1
+    assert client.terminated_clients == []
     current_pid = 1002
     assert manager_b.probe(lease_b)
     assert client.quit_calls == []
@@ -496,27 +565,15 @@ def test_retained_owner_blocks_join_then_releases_without_interrupting_coowner(
     assert "terminate_client 7000 101" not in str(join_error.value)
     assert "terminate_client 8000 202" not in str(join_error.value)
 
-    current_pid = 1001
-    with pytest.raises(MpsLeaseRetainedError, match="still attached"):
-        manager_a.release(lease_a)
-    assert manager_a._owner_file.read_text() == "retained\n"
-    assert client.quit_calls == []
-
-    client.set_clients(manager_a.paths.pipe_dir, {8000: [202]})
-    manager_a.release(lease_a)
-
-    assert lease_a.owner_fd == -1
-    assert manager_a.paths.state_dir.is_dir()
-    assert client.quit_calls == []
-    current_pid = 1002
-    assert manager_b.probe(lease_b)
-
     client.set_clients(manager_b.paths.pipe_dir, {})
+    current_pid = 1002
     manager_b.release(lease_b)
 
     assert lease_b.owner_fd == -1
-    assert client.quit_calls == [str(manager_b.paths.pipe_dir)]
-    assert not manager_b.paths.state_dir.exists()
+    assert client.quit_calls == []
+    assert manager_b.paths.state_dir.is_dir()
+    assert (manager_b.paths.owners_dir / "1001").read_text() == "retained\n"
+    assert not (manager_b.paths.owners_dir / "1002").exists()
 
 
 def test_last_owner_preserves_unknown_clients_instead_of_quitting(short_root):
@@ -525,12 +582,14 @@ def test_last_owner_preserves_unknown_clients_instead_of_quitting(short_root):
     lease = manager.acquire()
     client.set_clients(manager.paths.pipe_dir, {7000: [909]})
 
-    with pytest.raises(MpsLeaseRetainedError, match="releasing the last owner"):
+    with pytest.raises(MpsDirtyStateError, match="releasing the last owner"):
         manager.release(lease)
 
-    assert lease.owner_fd >= 0
+    assert lease.owner_fd == -1
+    assert manager._owner_file.read_text() == "retained\n"
     assert manager.paths.state_dir.is_dir()
     assert client.quit_calls == []
+    assert client.terminated_clients == []
 
 
 def test_happy_path_detaches_releases_and_quits_last_owner(short_root):
@@ -551,18 +610,18 @@ def test_dead_daemon_during_service_is_preserved_as_dirty(short_root):
     client.set_clients(manager.paths.pipe_dir, {})
     client.alive_pids.discard(lease.daemon_pid)
 
-    with pytest.raises(MpsLeaseRetainedError, match="unverified daemon") as exc_info:
+    with pytest.raises(MpsDirtyStateError, match="unverified daemon") as exc_info:
         manager.release(lease)
 
-    assert lease.owner_fd >= 0
+    assert lease.owner_fd == -1
     assert manager._owner_file.read_text() == "retained\n"
     assert manager.paths.state_dir.is_dir()
     assert f"Owner PID {os.getpid()}" in str(exc_info.value)
     assert "Current MPS client refs: unavailable" in str(exc_info.value)
-    assert f"kill -TERM {os.getpid()}" in str(exc_info.value)
+    assert "lock is released" in str(exc_info.value)
 
 
-def test_dead_coowner_during_release_keeps_this_owner_lease(short_root):
+def test_dirty_coowner_does_not_block_clean_owner_exit(short_root):
     client = FakeControlClient()
     paths = seed_shared_dir(
         short_root,
@@ -574,56 +633,54 @@ def test_dead_coowner_during_release_keeps_this_owner_lease(short_root):
     lease = manager.acquire()
     client.held_owner_pids.discard(888)
 
-    with pytest.raises(MpsLeaseRetainedError, match="dead owner lease") as exc_info:
-        manager.release(lease)
+    manager.release(lease)
 
-    assert lease.owner_fd >= 0
-    assert manager._owner_file.read_text() == "retained\n"
+    assert lease.owner_fd == -1
+    assert not manager._owner_file.exists()
+    assert (paths.owners_dir / "888").exists()
     assert paths.state_dir.is_dir()
     assert client.quit_calls == []
-    assert f"Owner PID {os.getpid()}" in str(exc_info.value)
-    assert "terminate_client" not in str(exc_info.value)
 
-    with pytest.raises(MpsError, match="retained"):
+    with pytest.raises(MpsError, match="dirty state"):
         make_manager(short_root, client).acquire()
 
 
-def test_daemon_refusing_quit_preserves_state_after_lease_release(short_root):
+def test_daemon_refusing_quit_persists_dirty_state(short_root):
     client = FakeControlClient()
     manager, lease = start_serving(short_root, client)
     client.set_clients(manager.paths.pipe_dir, {})
     client.quit_works = False
 
-    with pytest.raises(MpsLeaseRetainedError, match="did not exit") as exc_info:
+    with pytest.raises(MpsDirtyStateError, match="did not exit") as exc_info:
         manager.release(lease)
 
-    assert lease.owner_fd >= 0
+    assert lease.owner_fd == -1
     assert manager._owner_file.read_text() == "retained\n"
     assert manager.paths.state_dir.is_dir()
     assert f"Owner PID {os.getpid()}" in str(exc_info.value)
+    assert client.daemon_signals == []
 
-    client.quit_works = True
-    manager.release(lease)
-    assert lease.owner_fd == -1
-    assert not manager.paths.state_dir.exists()
+    with pytest.raises(MpsError, match="retained"):
+        make_manager(short_root, client).acquire()
 
 
-def test_quit_control_error_keeps_last_owner_authority(short_root):
+def test_quit_control_error_persists_dirty_and_releases_authority(short_root):
     client = FakeControlClient()
     manager, lease = start_serving(short_root, client)
     client.set_clients(manager.paths.pipe_dir, {})
     client.quit_error = "quit control failed"
 
     with pytest.raises(
-        MpsLeaseRetainedError,
+        MpsDirtyStateError,
         match="quit control failed",
     ) as exc_info:
         manager.release(lease)
 
-    assert lease.owner_fd >= 0
+    assert lease.owner_fd == -1
     assert manager._owner_file.read_text() == "retained\n"
     assert manager.paths.state_dir.is_dir()
-    assert f"kill -TERM {os.getpid()}" in str(exc_info.value)
+    assert "lock is released" in str(exc_info.value)
+    assert client.daemon_signals == []
 
 
 def test_release_requires_the_acquisition_token(short_root, tmp_path):

@@ -10,7 +10,7 @@ import os
 import queue
 import sys
 import time
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
@@ -305,10 +305,8 @@ class StageGroup:
         self,
         ctx: multiprocessing.context.SpawnContext,
         extra_env_for: Callable[[StageWorkerProcessSpec], dict[str, str]] | None = None,
-        protected_process_names: Collection[str] = (),
     ) -> None:
         """Spawn the OS process(es) owned by this group."""
-        protected = set(protected_process_names)
         for spec in self.process_specs:
             event = ctx.Event()
             startup_error_channel = ctx.Queue()
@@ -317,10 +315,7 @@ class StageGroup:
                 target=stage_process_main,
                 args=(spec, event, startup_error_channel),
                 name=proc_name,
-                # multiprocessing terminates daemon children at interpreter exit.
-                # A protected survivor must instead keep the parent (and its
-                # external ownership lease) alive for operator cleanup.
-                daemon=spec.process_name not in protected,
+                daemon=True,
             )
             try:
                 extra_env = extra_env_for(spec) if extra_env_for else None
@@ -410,23 +405,17 @@ class StageGroup:
     async def shutdown(
         self,
         join_timeout: float = 30.0,
-        preserve_process_names: Collection[str] = (),
-    ) -> None:
+    ) -> set[str]:
         errors: list[Exception] = []
-        preserved = set(preserve_process_names)
+        forced: set[str] = set()
         try:
-            for spec, p in zip(self.process_specs, self._processes):
+            for p in self._processes:
                 p.join(timeout=join_timeout)
+
+            for spec, p in zip(self.process_specs, self._processes):
                 if not p.is_alive():
                     continue
-                if spec.process_name in preserved:
-                    logger.error(
-                        "Process %s (pid=%s) did not exit; preserving it because "
-                        "automatic termination is disabled",
-                        spec.process_name,
-                        p.pid,
-                    )
-                    continue
+                forced.add(spec.process_name)
                 logger.warning(
                     "Terminating stuck process %s (pid=%s)",
                     p.name,
@@ -450,6 +439,7 @@ class StageGroup:
                         message += f"; {details}"
                     raise StageProcessTeardownError(alive, message)
                 raise RuntimeError(f"stage process teardown is incomplete: {details}")
+            return forced
         finally:
             self.close_control_channels()
             if not any(p.is_alive() for p in self._processes):

@@ -30,8 +30,8 @@ class MpsError(RuntimeError):
     """Raised when the MPS lifecycle cannot proceed safely."""
 
 
-class MpsLeaseRetainedError(MpsError):
-    """Cleanup stopped while this process must keep its owner lease held."""
+class MpsDirtyStateError(MpsError):
+    """Cleanup persisted dirty state and released its owner lock."""
 
 
 class MpsControlError(MpsError):
@@ -73,8 +73,6 @@ class MpsControlClient(Protocol):
     def quit_daemon(self, pipe_dir: Path) -> None: ...
 
     def daemon_process_alive(self, pid: int) -> bool: ...
-
-    def terminate_daemon_process(self, pid: int, force: bool = False) -> None: ...
 
     def parent_of(self, pid: int) -> int | None: ...
 
@@ -140,7 +138,8 @@ class MpsManager:
                 self.start_timeout,
                 "MPS control daemon did not answer on its control socket",
             )
-        except BaseException:
+        except BaseException as startup_error:
+            cleanup_error: MpsError | None = None
             if lease is None:
                 try:
                     lease = MpsLease(
@@ -149,25 +148,24 @@ class MpsManager:
                         ),
                         owner_fd=owner_fd,
                     )
-                except MpsControlError as exc:
-                    self._discard_owner_fd(owner_fd)
-                    logger.error(
-                        "MPS launch did not yield a provable native daemon; "
-                        "preserving %s: %s",
-                        self.paths.state_dir,
-                        exc,
+                except MpsControlError as identity_error:
+                    cleanup_error = self._persist_unidentified_dirty(
+                        owner_fd,
+                        identity_error,
                     )
             if lease is not None:
-                self._rollback_create(lease)
+                cleanup_error = self._rollback_create(lease)
+            if cleanup_error is not None:
+                raise startup_error from cleanup_error
             raise
         assert lease is not None
         if clients:
-            self._drop_owner(lease)
-            raise MpsError(
+            error = MpsError(
                 "a newly created private MPS daemon already reports clients "
-                f"{sorted(clients)}; refusing ambiguous ownership and preserving "
+                f"{sorted(clients)}; refusing ambiguous ownership and persisting "
                 f"{self.paths.state_dir}"
             )
+            raise self._persist_dirty_locked(lease, error, clients=clients) from error
         return lease
 
     def _join_locked(self) -> MpsLease:
@@ -296,7 +294,6 @@ class MpsManager:
         self,
         clients: set[MpsClientRef] | None,
         *,
-        retained_owner_pid: int | None = None,
         owned_clients: set[MpsClientRef] | None = None,
     ) -> str:
         control = (
@@ -356,21 +353,6 @@ class MpsManager:
             "workload owned by this serve should remain, clean up in this order. "
             f"{client_steps}\n"
         )
-        if retained_owner_pid is not None:
-            return prefix + (
-                "Stop this owner's remaining workload processes and repeat the "
-                "snapshot and owned-client termination if needed. Do not touch "
-                "foreign refs merely because they share the daemon. Once this "
-                "owner's exact refs are gone and its workloads have stopped, "
-                f"run `kill -TERM {retained_owner_pid}` to request a safe recheck. "
-                "That signal does not directly terminate the owner. If another "
-                "valid owner remains, the recheck releases only this owner and "
-                "leaves the shared daemon running; only the last owner with an "
-                "empty client snapshot quits the daemon and removes state. "
-                f"Owner PID {retained_owner_pid} must remain alive while it holds "
-                f"{self._owner_file}."
-            )
-
         return prefix + (
             "Stop every remaining workload process, repeat the snapshot and client "
             "termination if needed, and only after every owner lease is unlocked "
@@ -379,50 +361,23 @@ class MpsManager:
             f"rm -rf {shlex.quote(str(self.paths.state_dir))}"
         )
 
-    def _rollback_create(self, lease: MpsLease) -> None:
-        self._drop_owner(lease)
+    def _rollback_create(self, lease: MpsLease) -> MpsError | None:
         try:
-            if self._created_daemon_alive(lease.daemon_pid):
-                logger.warning(
-                    "Terminating newly spawned MPS daemon pid %d after failed startup",
-                    lease.daemon_pid,
-                )
-                self.client.terminate_daemon_process(lease.daemon_pid)
-                try:
-                    self._wait_for(
-                        lambda: not self._created_daemon_alive(lease.daemon_pid),
-                        self.stop_timeout,
-                        "new MPS daemon survived SIGTERM",
-                    )
-                except MpsError:
-                    if self._created_daemon_alive(lease.daemon_pid):
-                        self.client.terminate_daemon_process(
-                            lease.daemon_pid, force=True
-                        )
-                        self._wait_for(
-                            lambda: not self._created_daemon_alive(
-                                lease.daemon_pid
-                            ),
-                            self.stop_timeout,
-                            "new MPS daemon survived SIGKILL",
-                        )
-            shutil.rmtree(self.paths.state_dir)
-        except (MpsError, OSError) as exc:
+            self._release_locked(lease)
+            return None
+        except BaseException as exc:
+            if lease.owner_fd >= 0:
+                dirty_error: MpsError = self._persist_dirty_locked(lease, exc)
+            elif isinstance(exc, MpsError):
+                dirty_error = exc
+            else:
+                dirty_error = MpsError(f"MPS startup rollback failed: {exc}")
             logger.error(
-                "MPS startup rollback incomplete; preserving %s: %s",
+                "MPS startup rollback persisted dirty state at %s: %s",
                 self.paths.state_dir,
-                exc,
+                dirty_error,
             )
-
-    def _created_daemon_alive(self, daemon_pid: int) -> bool:
-        if not self.client.daemon_process_alive(daemon_pid):
-            return False
-        current_pid = self.client.read_daemon_identity(self.paths.pipe_dir)
-        if current_pid != daemon_pid:
-            raise MpsControlError(
-                f"native daemon identity changed from {daemon_pid} to {current_pid}"
-            )
-        return True
+            return dirty_error
 
     def env_for_stage(self) -> dict[str, str]:
         return {
@@ -482,70 +437,53 @@ class MpsManager:
         except MpsControlError:
             return False
 
-    def preservation_report(
+    def release(
         self,
         lease: MpsLease,
-        process_names: Iterable[str],
-        expected_pids: Iterable[int] = (),
-    ) -> str:
-        """Mark this owner retained and describe its operator-safe cleanup."""
-
-        with state_root_lock(self.paths.state_root, f".lock-{self.gpu_uuid}"):
-            self._require_live_lease(lease)
-            self._mark_retained_locked(lease)
-            clients: set[MpsClientRef] | None = None
-            query_error: MpsControlError | None = None
-            try:
-                daemon_pid = self.client.read_daemon_identity(self.paths.pipe_dir)
-                if daemon_pid != lease.daemon_pid:
-                    raise MpsControlError(
-                        f"daemon identity changed from {lease.daemon_pid} to "
-                        f"{daemon_pid}"
-                    )
-                clients = self.client.snapshot(self.paths.pipe_dir)
-                lease.attached_clients.update(
-                    self._clients_belonging_to(clients, set(expected_pids))
-                )
-            except MpsControlError as exc:
-                query_error = exc
-        detail = f" Control query failed: {query_error}." if query_error else ""
-        guidance = self._cleanup_guidance(
-            clients,
-            retained_owner_pid=os.getpid(),
-            owned_clients=lease.attached_clients,
-        )
-        return (
-            f"MPS worker(s) {sorted(process_names)} did not exit gracefully; "
-            "automatic process signals are disabled. The owner lease and state "
-            f"directory remain held by PID {os.getpid()} at "
-            f"{self.paths.state_dir}.{detail} {guidance}"
-        )
-
-    def release(self, lease: MpsLease) -> None:
+        *,
+        ownership_complete: bool = True,
+    ) -> None:
         """Release exactly one acquired lease, quitting only as the last owner."""
 
         self._require_live_lease(lease)
         try:
             with state_root_lock(self.paths.state_root, f".lock-{self.gpu_uuid}"):
                 try:
-                    self._release_locked(lease)
+                    self._release_locked(
+                        lease,
+                        ownership_complete=ownership_complete,
+                    )
                 except BaseException as exc:
                     if lease.owner_fd >= 0:
-                        self._mark_retained_locked(lease)
-                        if not isinstance(exc, MpsLeaseRetainedError):
-                            raise self._retained_release_error_locked(
-                                lease, exc
-                            ) from exc
+                        raise self._persist_dirty_locked(lease, exc) from exc
                     raise
+        except MpsDirtyStateError:
+            raise
         except MpsError:
             raise
         except Exception as exc:
+            if lease.owner_fd >= 0:
+                owner_pid = os.getpid()
+                self._abandon_owner(lease)
+                raise MpsDirtyStateError(
+                    f"MPS cleanup could not persist a retained status under the "
+                    f"GPU lock for {self.gpu_uuid}: {exc}. Owner PID {owner_pid} "
+                    f"marker {self._owner_file} was left in place with an "
+                    f"unconfirmed status and its lock is released; state "
+                    f"directory {self.paths.state_dir} is preserved. "
+                    f"{self._cleanup_guidance(None, owned_clients=lease.attached_clients)}"
+                ) from exc
             raise MpsError(
                 f"MPS control I/O failed during release: {exc}. State dir "
                 f"preserved for inspection: {self.paths.state_dir}"
             ) from exc
 
-    def _release_locked(self, lease: MpsLease) -> None:
+    def _release_locked(
+        self,
+        lease: MpsLease,
+        *,
+        ownership_complete: bool = True,
+    ) -> None:
         self._wait_for_owned_clients_to_detach(lease)
 
         try:
@@ -559,61 +497,53 @@ class MpsManager:
                 "owner lease and shared state preserved"
             )
 
-        try:
-            remaining_files = {
-                pid: path
-                for pid, path in self._owner_files().items()
-                if path != self._owner_file
+        remaining_files = {
+            pid: path
+            for pid, path in self._owner_files().items()
+            if path != self._owner_file
+        }
+        remaining = {
+            pid: {
+                "held": self.client.owner_lease_held(path),
+                "status": self._read_owner_status(path),
             }
-            remaining = {
-                pid: self.client.owner_lease_held(path)
-                for pid, path in remaining_files.items()
-            }
-            for path in remaining_files.values():
-                self._read_owner_status(path)
-        except MpsError:
-            raise
+            for pid, path in remaining_files.items()
+        }
 
-        dead_owners = {pid for pid, held in remaining.items() if not held}
-        if dead_owners:
-            raise MpsError(
-                f"dead owner lease(s) {sorted(dead_owners)} appeared while releasing "
-                f"{self.gpu_uuid}; owner lease and shared state preserved"
-            )
         if remaining:
-            if snapshot and not lease.attachment_verified:
-                guidance = self._cleanup_guidance(
-                    snapshot,
-                    retained_owner_pid=os.getpid(),
-                    owned_clients=lease.attached_clients,
-                )
-                raise MpsLeaseRetainedError(
-                    "MPS client ownership was not completely verified before "
-                    "shutdown; refusing to release this owner while a shared "
-                    f"daemon still has clients. State preserved: "
-                    f"{self.paths.state_dir}. {guidance}"
+            if snapshot and (
+                not lease.attachment_verified or not ownership_complete
+            ):
+                raise MpsError(
+                    "MPS client ownership is incomplete at shutdown; refusing "
+                    "to release this owner while a shared daemon still has "
+                    f"clients. State preserved: "
+                    f"{self.paths.state_dir}"
                 )
             self._drop_owner(lease)
-            logger.info(
-                "Leaving shared MPS daemon on %s to owners %s",
+            dirty_owners = {
+                pid
+                for pid, state in remaining.items()
+                if not state["held"] or state["status"] != _OWNER_ACTIVE
+            }
+            logger.log(
+                logging.WARNING if dirty_owners else logging.INFO,
+                "Leaving shared MPS daemon on %s to owners %s%s",
                 self.gpu_uuid,
                 sorted(remaining),
+                f"; dirty owner markers: {sorted(dirty_owners)}"
+                if dirty_owners
+                else "",
             )
             return
 
         if snapshot:
             snapshot = self._wait_for_no_clients()
         if snapshot:
-            guidance = self._cleanup_guidance(
-                snapshot,
-                retained_owner_pid=os.getpid(),
-                owned_clients=lease.attached_clients,
-            )
-            raise MpsLeaseRetainedError(
+            raise MpsError(
                 f"MPS clients {sorted(snapshot)} remain while releasing the last "
                 f"owner; refusing to release its lease or quit daemon "
-                f"{lease.daemon_pid}. State preserved: {self.paths.state_dir}. "
-                f"{guidance}"
+                f"{lease.daemon_pid}. State preserved: {self.paths.state_dir}"
             )
 
         try:
@@ -633,38 +563,74 @@ class MpsManager:
         self._drop_owner(lease)
         shutil.rmtree(self.paths.state_dir)
 
-    def _retained_release_error_locked(
+    def _persist_dirty_locked(
         self,
         lease: MpsLease,
         error: BaseException,
-    ) -> MpsLeaseRetainedError:
-        clients: set[MpsClientRef] | None = None
+        *,
+        clients: set[MpsClientRef] | None = None,
+    ) -> MpsDirtyStateError:
+        owner_pid = os.getpid()
+        status_error: BaseException | None = None
+        try:
+            self._mark_retained_locked(lease)
+        except BaseException as exc:
+            status_error = exc
+
+        observed_daemon_pid: int | None = None
         query_error: MpsControlError | None = None
         try:
-            daemon_pid = self.client.read_daemon_identity(self.paths.pipe_dir)
-            if daemon_pid != lease.daemon_pid:
-                raise MpsControlError(
-                    f"daemon identity changed from {lease.daemon_pid} to "
-                    f"{daemon_pid}"
-                )
-            clients = self.client.snapshot(self.paths.pipe_dir)
+            observed_daemon_pid = self.client.read_daemon_identity(
+                self.paths.pipe_dir
+            )
+            if clients is None:
+                clients = self.client.snapshot(self.paths.pipe_dir)
         except MpsControlError as exc:
             query_error = exc
 
-        inspection = (
-            f" Current control state is unavailable: {query_error}."
-            if query_error is not None
-            else ""
-        )
         guidance = self._cleanup_guidance(
             clients,
-            retained_owner_pid=os.getpid(),
             owned_clients=lease.attached_clients,
         )
-        return MpsLeaseRetainedError(
-            f"MPS release failed while owner PID {os.getpid()} still holds its "
-            f"lease and state directory {self.paths.state_dir}: {error}."
-            f"{inspection} {guidance}"
+        self._abandon_owner(lease)
+        status = (
+            "retained"
+            if status_error is None
+            else f"unconfirmed because the retained-status write failed: {status_error}"
+        )
+        observed = (
+            str(observed_daemon_pid)
+            if observed_daemon_pid is not None
+            else f"unavailable ({query_error})"
+        )
+        snapshot = "unavailable" if clients is None else repr(sorted(clients))
+        return MpsDirtyStateError(
+            f"MPS cleanup persisted dirty state for GPU {self.gpu_uuid}: {error}. "
+            f"Owner PID {owner_pid} marker {self._owner_file} is {status} and its "
+            f"lock is released; state directory {self.paths.state_dir} is preserved. "
+            f"Expected daemon PID {lease.daemon_pid}; observed daemon PID {observed}; "
+            f"last verified owned clients {sorted(lease.attached_clients)}; current "
+            f"snapshot {snapshot}. {guidance}"
+        )
+
+    def _persist_unidentified_dirty(
+        self,
+        owner_fd: int,
+        error: BaseException,
+    ) -> MpsDirtyStateError:
+        owner_pid = os.getpid()
+        status_error = self._abandon_owner_fd(owner_fd)
+        status = (
+            "retained"
+            if status_error is None
+            else f"unconfirmed because the retained-status write failed: {status_error}"
+        )
+        return MpsDirtyStateError(
+            f"MPS startup persisted dirty state for GPU {self.gpu_uuid}: {error}. "
+            f"Owner PID {owner_pid} marker {self._owner_file} is {status} and its "
+            f"lock is released; state directory {self.paths.state_dir} is preserved. "
+            "Daemon identity and client snapshot are unavailable. "
+            f"{self._cleanup_guidance(None, owned_clients=set())}"
         )
 
     def _wait_for_owned_clients_to_detach(self, lease: MpsLease) -> None:
@@ -675,15 +641,10 @@ class MpsManager:
             if not remaining:
                 return
             if time.monotonic() >= deadline:
-                guidance = self._cleanup_guidance(
-                    snapshot,
-                    retained_owner_pid=os.getpid(),
-                    owned_clients=lease.attached_clients,
-                )
-                raise MpsLeaseRetainedError(
+                raise MpsError(
                     f"owned MPS clients {sorted(remaining)} are still attached; "
-                    "refusing to release their owner lease. State dir preserved "
-                    f"for inspection: {self.paths.state_dir}. {guidance}"
+                    "refusing clean release. State dir preserved for inspection: "
+                    f"{self.paths.state_dir}"
                 )
             time.sleep(self.poll_interval)
 
@@ -735,6 +696,26 @@ class MpsManager:
         owner_fd = lease.owner_fd
         lease.owner_fd = -1
         self._discard_owner_fd(owner_fd)
+
+    def _abandon_owner(self, lease: MpsLease) -> None:
+        owner_fd = lease.owner_fd
+        lease.owner_fd = -1
+        os.close(owner_fd)
+
+    def _abandon_owner_fd(self, owner_fd: int) -> BaseException | None:
+        status_error: BaseException | None = None
+        try:
+            self._write_owner_status(owner_fd, _OWNER_RETAINED)
+        except BaseException as exc:
+            status_error = exc
+            logger.error(
+                "Could not write retained status to %s; the unlocked owner marker "
+                "will still block future acquisition: %s",
+                self._owner_file,
+                exc,
+            )
+        os.close(owner_fd)
+        return status_error
 
     def _discard_owner_fd(self, owner_fd: int) -> None:
         os.close(owner_fd)

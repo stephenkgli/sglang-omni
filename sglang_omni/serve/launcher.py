@@ -33,7 +33,7 @@ import socket
 import threading
 import time
 from contextlib import contextmanager, suppress
-from typing import Any, Callable
+from typing import Any
 
 import uvicorn
 from fastapi import APIRouter, HTTPException
@@ -42,7 +42,6 @@ from pydantic import BaseModel
 from sglang_omni.client import Client
 from sglang_omni.config import PipelineConfig
 from sglang_omni.models.model_capabilities import get_model_capabilities
-from sglang_omni.mps.manager import MpsLeaseRetainedError
 from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
@@ -58,10 +57,6 @@ from sglang_omni.utils.gpu_memory import (
 logger = logging.getLogger(__name__)
 
 _HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
-_RetainedLeaseHandler = Callable[
-    [MpsLeaseRetainedError, Callable[[], None], threading.Event],
-    None,
-]
 
 
 class _StartupSignalState:
@@ -69,14 +64,13 @@ class _StartupSignalState:
 
 
 @contextmanager
-def _cancel_startup_on_signal(enabled: bool):
+def _cancel_startup_on_signal():
     """Turn the first CLI startup signal into task cancellation, then defer."""
 
     state = _StartupSignalState()
     task = asyncio.current_task()
     if (
-        not enabled
-        or task is None
+        task is None
         or threading.current_thread() is not threading.main_thread()
     ):
         yield state
@@ -105,78 +99,6 @@ def _cancel_startup_on_signal(enabled: bool):
     finally:
         for sig, handler in original_handlers.items():
             signal.signal(sig, handler)
-
-
-@contextmanager
-def _defer_cleanup_signals(enabled: bool):
-    """Keep repeated CLI termination signals from cutting cleanup short."""
-
-    retry_requested = threading.Event()
-    if not enabled or threading.current_thread() is not threading.main_thread():
-        yield retry_requested
-        return
-
-    def defer(sig: int, frame) -> None:
-        del frame
-        logger.error(
-            "Signal %s requested an explicit retained-lease cleanup recheck; "
-            "the signal will not terminate the owner directly",
-            signal.Signals(sig).name,
-        )
-        retry_requested.set()
-
-    original_handlers = {sig: signal.signal(sig, defer) for sig in _HANDLED_SIGNALS}
-    try:
-        yield retry_requested
-    finally:
-        for sig, handler in original_handlers.items():
-            signal.signal(sig, handler)
-
-
-def _find_retained_lease_error(
-    error: BaseException,
-) -> MpsLeaseRetainedError | None:
-    current: BaseException | None = error
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        if isinstance(current, MpsLeaseRetainedError):
-            return current
-        seen.add(id(current))
-        current = current.__cause__ or current.__context__
-    return None
-
-
-def _hold_retained_mps_owner(
-    error: MpsLeaseRetainedError,
-    retry: Callable[[], None],
-    retry_requested: threading.Event,
-    *,
-    wait: Callable[[], None] | None = None,
-) -> None:
-    """Hold the CLI owner and recheck only after an explicit operator signal."""
-
-    logger.critical(
-        "%s\nThe CLI owner process will remain alive to keep its MPS lease held. "
-        "Follow the cleanup steps above, then send SIGINT or SIGTERM again to "
-        "request a safe lease-release recheck.",
-        error,
-    )
-    wait_once = wait or retry_requested.wait
-    while True:
-        wait_once()
-        retry_requested.clear()
-        try:
-            retry()
-        except MpsLeaseRetainedError as retry_error:
-            logger.critical(
-                "Retained MPS lease is still unsafe to release after the explicit "
-                "recheck:\n%s",
-                retry_error,
-            )
-            continue
-        logger.info("Retained MPS owner lease was released safely.")
-        return
-
 
 class _PipelineUvicornServer(uvicorn.Server):
     """Keep Uvicorn's graceful handling without re-raising process signals.
@@ -486,56 +408,16 @@ async def _stop_pipeline_runner(
     mp_runner: MultiProcessPipelineRunner,
     *,
     primary_error: BaseException | None,
-    retained_lease_handler: _RetainedLeaseHandler | None,
 ) -> None:
-    """Stop one runner and enter the CLI hold only for a live retained lease."""
+    """Stop one runner while preserving the serving failure as primary."""
 
     logger.info("Shutting down pipeline …")
-    cleanup_error: BaseException | None = None
-    with _defer_cleanup_signals(
-        retained_lease_handler is not None
-    ) as retry_requested:
-        try:
-            await mp_runner.stop()
-        except BaseException as exc:
-            cleanup_error = exc
-
-        if getattr(mp_runner, "has_retained_mps_leases", False):
-            retained_error = (
-                _find_retained_lease_error(cleanup_error)
-                if cleanup_error is not None
-                else None
-            )
-            if retained_error is None:
-                retained_error = MpsLeaseRetainedError(
-                    f"MPS owner PID {os.getpid()} still holds a lease after "
-                    "pipeline cleanup; inspect the preceding MPS error for its "
-                    "state directory, client refs, and operator cleanup steps"
-            )
-            if retained_lease_handler is not None:
-                logger.critical(
-                    "MPS cleanup retained its owner lease: %s", retained_error
-                )
-                if primary_error is not None:
-                    logger.error(
-                        "Pipeline failed before MPS cleanup entered retained-owner "
-                        "hold",
-                        exc_info=(
-                            type(primary_error),
-                            primary_error,
-                            primary_error.__traceback__,
-                        ),
-                    )
-                retained_lease_handler(
-                    retained_error,
-                    mp_runner.retry_retained_mps_cleanup,
-                    retry_requested,
-                )
-
-        if cleanup_error is not None:
-            if primary_error is not None:
-                raise primary_error from cleanup_error
-            raise cleanup_error
+    try:
+        await mp_runner.stop()
+    except BaseException as cleanup_error:
+        if primary_error is not None:
+            raise primary_error from cleanup_error
+        raise
     logger.info("Pipeline stopped.")
 
 
@@ -551,7 +433,6 @@ async def _run_server(
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
-    _retained_lease_handler: _RetainedLeaseHandler | None = None,
 ) -> None:
     """Start the pipeline and run the OpenAI server.
 
@@ -562,7 +443,7 @@ async def _run_server(
 
     mp_runner = MultiProcessPipelineRunner(pipeline_config)
     startup_timeout = float(os.environ.get("SGLANG_OMNI_STARTUP_TIMEOUT", "600"))
-    with _cancel_startup_on_signal(_retained_lease_handler is not None) as signal_state:
+    with _cancel_startup_on_signal() as signal_state:
         primary_error: BaseException | None = None
         try:
             try:
@@ -650,13 +531,9 @@ async def _run_server(
                 await _stop_pipeline_runner(
                     mp_runner,
                     primary_error=primary_error,
-                    retained_lease_handler=_retained_lease_handler,
                 )
         except BaseException as final_error:
-            if (
-                signal_state.signum is not None
-                and not getattr(mp_runner, "has_retained_mps_leases", False)
-            ):
+            if signal_state.signum is not None:
                 raise SystemExit(128 + signal_state.signum) from final_error
             raise
         if signal_state.signum is not None:
@@ -737,14 +614,6 @@ def launch_server(
         tts_batch_max_items: Maximum items accepted by
             ``/v1/audio/speech/batch``.
     """
-    if (
-        pipeline_config.mps != "off"
-        and threading.current_thread() is not threading.main_thread()
-    ):
-        raise RuntimeError(
-            "launch_server with native MPS must run in the main thread because "
-            "retained-lease cleanup relies on main-thread SIGINT/SIGTERM handling"
-        )
     apply_gpu_compat_env_defaults()
     asyncio.run(
         _run_server(
@@ -758,6 +627,5 @@ def launch_server(
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
             tts_batch_max_items=tts_batch_max_items,
-            _retained_lease_handler=_hold_retained_mps_owner,
         )
     )
