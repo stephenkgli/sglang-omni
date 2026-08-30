@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Release Notes &#8212; SGLang</title>
+    <title>Audio Translations &#8212; SGLang</title>
   
   
   
@@ -42,26 +42,26 @@
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
-    <script src="../_static/documentation_options.js?v=1a9ffd16"></script>
+    <script src="../_static/documentation_options.js?v=b617ff6d"></script>
     <script src="../_static/doctools.js?v=fd6eb6e6"></script>
     <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=ccdb6887"></script>
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'get_started/release_notes';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'basic_usage/audio_translations';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
-    <script src="../_static/js/qwen3_omni_server_generator.js?v=66f6ff63"></script>
-    <script src="../_static/js/ming_omni_server_generator.js?v=694b1473"></script>
+    <script src="../_static/js/qwen3_omni_server_generator.js?v=d7738e8a"></script>
+    <script src="../_static/js/ming_omni_server_generator.js?v=7979a72f"></script>
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Higgs TTS" href="../cookbook/higgs_tts.html" />
-    <link rel="prev" title="🚀 Installation" href="installation.html" />
+    <link rel="next" title="TTS Model Usage" href="tts.html" />
+    <link rel="prev" title="Omni Model Usage" href="qwen3_omni.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.1.1" />
-    <meta name="docbuild:last-update" content="Aug 13, 2026"/>
+  <meta name="docsearch:version" content="0.1.3" />
+    <meta name="docbuild:last-update" content="Aug 30, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -205,9 +205,9 @@
         <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
     <div class="bd-toc-item navbar-nav active">
         <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
-<ul class="current nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="installation.html">🚀 Installation</a></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Release Notes</a></li>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_xpu.html">🚀 Installation — Intel XPU</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
 <ul class="nav bd-sidenav">
@@ -231,12 +231,14 @@
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/llada2_uni.html">LLaDA2.0-Uni</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">General Usage</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../basic_usage/qwen3_omni.html">Omni Model Usage</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../basic_usage/tts.html">TTS Model Usage</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../basic_usage/tts_process_topology.html">TTS Process Topology</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../basic_usage/omni_router.html">Omni Router Usage</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../basic_usage/mps_dp.html">Same-GPU Data Parallelism with CUDA MPS</a></li>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="qwen3_omni.html">Omni Model Usage</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Audio Translations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tts.html">TTS Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tts_process_topology.html">TTS Process Topology</a></li>
+<li class="toctree-l1"><a class="reference internal" href="process_topology_migration.html">Process Topology Migration</a></li>
+<li class="toctree-l1"><a class="reference internal" href="omni_router.html">Omni Router Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="mps_dp.html">Same-GPU Data Parallelism with CUDA MPS</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
 <ul class="nav bd-sidenav">
@@ -248,11 +250,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/apiserver_design.html">API Server Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/pipeline.html">Pipeline Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/config.html">Config</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/adding_parameters.html">Adding a Parameter</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/communication.html">Communication</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/reference_encode_service.html">Reference Encode Service</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/profiler.html">Request-level profiler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/qwen3_asr_concurrency_profile.html">Qwen3-ASR High-Concurrency Benchmark and Bottleneck Profile</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/rl_admin_control.html">RL Admin Control</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/bump_version.html">Bumping the SGLang Pin</a></li>
 </ul>
 
     </div>
@@ -329,7 +333,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sglang-omni/blob/main/docs/get_started/release_notes.md?plain=1" target="_blank"
+      <li><a href="https://github.com/sgl-project/sglang-omni/blob/main/docs/basic_usage/audio_translations.md?plain=1" target="_blank"
    class="btn btn-sm btn-source-file-button dropdown-item"
    title="Show source"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -346,7 +350,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sglang-omni/edit/main/docs/get_started/release_notes.md" target="_blank"
+      <li><a href="https://github.com/sgl-project/sglang-omni/edit/main/docs/basic_usage/audio_translations.md" target="_blank"
    class="btn btn-sm btn-source-edit-button dropdown-item"
    title="Suggest edit"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -363,7 +367,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sglang-omni/issues/new?title=Issue%20on%20page%20%2Fget_started/release_notes.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/sgl-project/sglang-omni/issues/new?title=Issue%20on%20page%20%2Fbasic_usage/audio_translations.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -393,7 +397,7 @@
       
       
       
-      <li><a href="../_sources/get_started/release_notes.md" target="_blank"
+      <li><a href="../_sources/basic_usage/audio_translations.md" target="_blank"
    class="btn btn-sm btn-download-source-button dropdown-item"
    title="Download source file"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -476,7 +480,7 @@
               
 
 <div id="jb-print-docs-body" class="onlyprint">
-    <h1>Release Notes</h1>
+    <h1>Audio Translations</h1>
     <!-- Table of contents -->
     <div id="print-main-content">
         <div id="jb-print-toc">
@@ -486,7 +490,11 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#v0-1-1">v0.1.1</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-server">Launch the Server</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#translate-audio">Translate Audio</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-support">Model Support</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#response-formats">Response Formats</a></li>
 </ul>
             </nav>
         </div>
@@ -498,20 +506,104 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="release-notes">
-<h1>Release Notes<a class="headerlink" href="#release-notes" title="Link to this heading">#</a></h1>
-<section id="v0-1-1">
-<h2>v0.1.1<a class="headerlink" href="#v0-1-1" title="Link to this heading">#</a></h2>
-<p>First PyPI release. Install: <code class="docutils literal notranslate"><span class="pre">uv</span> <span class="pre">pip</span> <span class="pre">install</span> <span class="pre">&quot;sglang-omni==0.1.1&quot;</span></code>.</p>
-<p>Highlights since the early 0.1 line:</p>
-<ul class="simple">
-<li><p><strong>TTS</strong>: dots.tts, ZONOS2; TTS architecture refactor (shared engine/ref-encode/vocoder paths); OpenAI speech + uploaded voices</p></li>
-<li><p><strong>ASR</strong>: Fun-ASR, ARK-ASR; shared transcription serving; Qwen3-ASR pre-LM encoder and multilingual support</p></li>
-<li><p><strong>Router</strong>: multiprocess CP/DP router; full TTS route set (<code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code>, batch, stream, voices)</p></li>
-<li><p><strong>Runtime</strong>: CUDA-IPC weight sync / MPS-DP; speech API surface cleanup</p></li>
-<li><p><strong>Omni</strong>: Qwen3-Omni talker/streaming fixes and perf work</p></li>
-</ul>
-<p>See <a class="reference internal" href="installation.html"><span class="std std-doc">Installation</span></a>. New model cookbooks are listed on the docs home page.</p>
+  <section class="tex2jax_ignore mathjax_ignore" id="audio-translations">
+<h1>Audio Translations<a class="headerlink" href="#audio-translations" title="Link to this heading">#</a></h1>
+<p>This guide uses <a class="reference internal" href="../cookbook/whisper_asr.html"><span class="std std-doc">Whisper ASR</span></a> as an example model
+with the OpenAI-compatible <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/audio/translations</span></code> endpoint, which
+translates source speech to English. The endpoint is served only by pipelines
+that declare audio-translation capability; other ASR models return an explicit
+HTTP 400 instead of silently transcribing.</p>
+<section id="prerequisites">
+<h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
+<p>Install <code class="docutils literal notranslate"><span class="pre">sglang-omni</span></code> by following <a class="reference internal" href="../get_started/installation.html"><span class="std std-doc">Installation</span></a>,
+then download a multilingual Whisper checkpoint:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>hf<span class="w"> </span>download<span class="w"> </span>openai/whisper-large-v3
+</pre></div>
+</div>
+<p>Translation requires a multilingual, non-turbo checkpoint: <code class="docutils literal notranslate"><span class="pre">*.en</span></code> checkpoints
+have no translate task, and <code class="docutils literal notranslate"><span class="pre">whisper-large-v3-turbo</span></code> was distilled without it,
+so serving those checkpoints returns transcriptions regardless of endpoint.</p>
+</section>
+<section id="launch-the-server">
+<h2>Launch the Server<a class="headerlink" href="#launch-the-server" title="Link to this heading">#</a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>openai/whisper-large-v3<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span>
+</pre></div>
+</div>
+</section>
+<section id="translate-audio">
+<h2>Translate Audio<a class="headerlink" href="#translate-audio" title="Link to this heading">#</a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8000/v1/audio/translations<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="nv">model</span><span class="o">=</span>openai/whisper-large-v3<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="nv">file</span><span class="o">=</span>@tests/data/query_to_cars.wav<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="nv">language</span><span class="o">=</span>fr<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="nv">response_format</span><span class="o">=</span>json
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">language</span></code> is an optional source-language hint and a SGLang-Omni extension;
+OpenAI’s official audio translations schema does not define it, and the
+translation target is English in both APIs.</p>
+</section>
+<section id="model-support">
+<h2>Model Support<a class="headerlink" href="#model-support" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Model</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">/v1/audio/translations</span></code></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><a class="reference internal" href="../cookbook/whisper_asr.html"><span class="std std-doc">Whisper ASR</span></a></p></td>
+<td><p>Supported</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="../cookbook/qwen3_asr.html"><span class="std std-doc">Qwen3-ASR</span></a></p></td>
+<td><p>HTTP 400</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="../cookbook/fun_asr.html"><span class="std std-doc">Fun-ASR</span></a></p></td>
+<td><p>HTTP 400</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="../cookbook/arkasr.html"><span class="std std-doc">ARK-ASR</span></a></p></td>
+<td><p>HTTP 400</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="../cookbook/moss_transcribe_diarize.html"><span class="std std-doc">MOSS-Transcribe-Diarize</span></a></p></td>
+<td><p>HTTP 400</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>See each model’s cookbook for its transcription workflow.</p>
+</section>
+<section id="response-formats">
+<h2>Response Formats<a class="headerlink" href="#response-formats" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">response_format</span></code></p></th>
+<th class="head"><p>Behavior</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">json</span></code></p></td>
+<td><p>JSON object containing <code class="docutils literal notranslate"><span class="pre">text</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">verbose_json</span></code></p></td>
+<td><p>JSON with <code class="docutils literal notranslate"><span class="pre">task=&quot;translate&quot;</span></code>, text, duration, and segments</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">text</span></code></p></td>
+<td><p>Raw translated text with <code class="docutils literal notranslate"><span class="pre">text/plain</span></code> content type</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">srt</span></code>, <code class="docutils literal notranslate"><span class="pre">vtt</span></code></p></td>
+<td><p>Whisper subtitles with model-derived segment timestamps</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> returns a single segment spanning the audio duration, matching
+<code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code>. Subtitle formats require a model adapter with real
+segment timestamps; unsupported models return HTTP 400 before inference.</p>
+<p>Streaming is available with <code class="docutils literal notranslate"><span class="pre">stream=true</span></code> for <code class="docutils literal notranslate"><span class="pre">json</span></code> and <code class="docutils literal notranslate"><span class="pre">text</span></code>, using the same
+SSE lifecycle as transcriptions: <code class="docutils literal notranslate"><span class="pre">transcript.text.delta</span></code> events, one
+<code class="docutils literal notranslate"><span class="pre">transcript.text.done</span></code> event, then <code class="docutils literal notranslate"><span class="pre">data:</span> <span class="pre">[DONE]</span></code>.</p>
 </section>
 </section>
 
@@ -527,20 +619,20 @@
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="installation.html"
+       href="qwen3_omni.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">🚀 Installation</p>
+        <p class="prev-next-title">Omni Model Usage</p>
       </div>
     </a>
     <a class="right-next"
-       href="../cookbook/higgs_tts.html"
+       href="tts.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Higgs TTS</p>
+        <p class="prev-next-title">TTS Model Usage</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -562,7 +654,11 @@
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#v0-1-1">v0.1.1</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-server">Launch the Server</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#translate-audio">Translate Audio</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-support">Model Support</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#response-formats">Response Formats</a></li>
 </ul>
   </nav></div>
 
@@ -596,7 +692,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 13, 2026.
+  Last updated on Aug 30, 2026.
   <br/>
 </p>
   </div>

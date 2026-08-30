@@ -13,7 +13,7 @@ endpoint.
 Install `sglang-omni` by following [Installation](../get_started/installation.md).
 
 Qwen3-TTS Base uses the upstream `qwen-tts` package. Install it without
-dependencies so the SGLang-Omni Transformers 5.12 / SGLang 0.5.16 stack remains
+dependencies so the SGLang-Omni Transformers 5.12 / SGLang 0.5.18 stack remains
 in place:
 
 ```bash
@@ -42,7 +42,7 @@ factories (`create_causal_mask` and friends), which now spell `input_embeds` as
 `inputs_embeds` and no longer accept `cache_position`. SGLang-Omni patches these
 differences in
 `sglang_omni/models/qwen3_tts/compat.py`, which every Qwen3-TTS entry point
-applies before importing `qwen_tts`. The pinned Transformers 5.12 / SGLang 0.5.16
+applies before importing `qwen_tts`. The pinned Transformers 5.12 / SGLang 0.5.18
 stack is therefore the supported configuration, not a workaround.
 
 If you hit a `TypeError` raised from inside `qwen_tts`, do not resolve it by
@@ -78,6 +78,72 @@ sgl-omni serve \
   --config examples/configs/qwen3_tts_1_7b.yaml \
   --port 8000
 ```
+
+### Deterministic Inference
+
+Dynamic batching can change Qwen3-TTS codec and waveform outputs even when the
+prompt, reference audio, and seed are unchanged. Both the 0.6B and 1.7B Base
+checkpoints provide an opt-in deterministic mode:
+
+```yaml
+enable_deterministic_inference: true
+```
+
+When enabled, the same prompt, reference audio, and seed produce byte-identical
+PCM across runtime batch sizes. This mode reduces throughput because it
+serializes reference preprocessing and vocoder decoding and disables Talker
+compilation and the initial vocoder CUDA Graph, so it is disabled by default.
+
+### Overload / admission policy
+
+Two SGLang generation-stage knobs bound how the server behaves past saturation:
+
+| Knob | Meaning | Qwen3-TTS default |
+|---|---|---|
+| `--tts_engine.engine.max_running_requests` | Concurrent running slots | `16` |
+| `--tts_engine.engine.max_queued_requests` | Waiting-queue depth before fast-reject | `16` |
+
+Every request enters the waiting queue first, so `max_queued_requests`
+must be **≥ 1**. Capacity is about `running + queued`. Extra arrivals get
+HTTP **503** (`The request queue is full.`) before preprocessing, or later
+if the AR waiting queue or request-build backlog is full. Qwen3-TTS
+defaults to 4 request-build workers with pending depth 16.
+
+Raising `max_running_requests` does **not** automatically raise the waiting
+bound. For a ceiling-32 experiment:
+
+```bash
+sgl-omni serve \
+  --model-path Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --config examples/configs/qwen3_tts_0_6b.yaml \
+  --tts_engine.engine.max_running_requests 32 \
+  --tts_engine.engine.max_queued_requests 16 \
+  --port 8000
+```
+
+Stepped `--concurrencies` is a closed-loop client: it never holds more than
+N in-flight requests, so past-ceiling load is a burst that drains. Keep
+offered load above `max_running_requests + max_queued_requests` for a
+duration with open-loop sustained overshoot:
+
+```bash
+python -m benchmarks.eval.benchmark_tts_seedtts \
+  --generate-only --use-existing-server --stream \
+  --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --port 8000 \
+  --max-running-requests 32 \
+  --max-queued-requests 16 \
+  --sustained-overshoot \
+  --overshoot-duration-s 10 \
+  --max-samples 64
+```
+
+Arrivals default to `2 × capacity` (`--request-rate` overrides). Stats are
+on successes only; artifacts land in `<output-dir>/overshoot/`.
+
+A closed-loop `--concurrencies 16,32,48,64` sweep is still available for
+comparing healthy vs past-ceiling points, but it does not hold overshoot. Each
+concurrency writes inspectable artifacts under `<output-dir>/c<N>/`.
 
 ## Synthesizing Speech
 
@@ -190,6 +256,12 @@ streaming for both this HTTP endpoint and `/v1/audio/speech/stream` WebSocket
 sessions with `stream_audio=true`. CustomVoice and VoiceDesign remain
 non-streaming.
 
+When `initial_codec_chunk_frames` is omitted, Qwen3-TTS Base defaults to `8`
+codec frames for the first vocoder chunk so concurrent streams stay continuous.
+Pass a smaller value only when trading continuity for lower time-to-first-audio.
+Utterances that finish in fewer than `8` generated codec frames never reach the
+first chunk, so their audio arrives complete in a single final flush.
+
 ## Generation Parameters
 
 | Parameter | Default | Notes |
@@ -207,6 +279,7 @@ non-streaming.
 | `max_new_tokens` | `2048` | Maximum number of generated codec tokens |
 | `seed` | `null` | Random seed for reproducibility |
 | `stream` | `false` | Stream raw PCM audio chunks |
+| `initial_codec_chunk_frames` | `8` (model default when omitted) | First Base streaming vocoder chunk size in codec frames. Smaller values lower TTFA but underrun more easily; `0` uses the steady stride from the start |
 
 ## Model Variants
 

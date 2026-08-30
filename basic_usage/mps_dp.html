@@ -42,7 +42,7 @@
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
-    <script src="../_static/documentation_options.js?v=1a9ffd16"></script>
+    <script src="../_static/documentation_options.js?v=b617ff6d"></script>
     <script src="../_static/doctools.js?v=fd6eb6e6"></script>
     <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -51,8 +51,8 @@
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'basic_usage/mps_dp';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
-    <script src="../_static/js/qwen3_omni_server_generator.js?v=66f6ff63"></script>
-    <script src="../_static/js/ming_omni_server_generator.js?v=694b1473"></script>
+    <script src="../_static/js/qwen3_omni_server_generator.js?v=d7738e8a"></script>
+    <script src="../_static/js/ming_omni_server_generator.js?v=7979a72f"></script>
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -60,8 +60,8 @@
     <link rel="prev" title="Omni Router Usage" href="omni_router.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.1.1" />
-    <meta name="docbuild:last-update" content="Aug 13, 2026"/>
+  <meta name="docsearch:version" content="0.1.3" />
+    <meta name="docbuild:last-update" content="Aug 30, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -207,7 +207,7 @@
         <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Installation</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../get_started/release_notes.html">Release Notes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_xpu.html">🚀 Installation — Intel XPU</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
 <ul class="nav bd-sidenav">
@@ -233,8 +233,10 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">General Usage</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="qwen3_omni.html">Omni Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="audio_translations.html">Audio Translations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tts.html">TTS Model Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tts_process_topology.html">TTS Process Topology</a></li>
+<li class="toctree-l1"><a class="reference internal" href="process_topology_migration.html">Process Topology Migration</a></li>
 <li class="toctree-l1"><a class="reference internal" href="omni_router.html">Omni Router Usage</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Same-GPU Data Parallelism with CUDA MPS</a></li>
 </ul>
@@ -248,11 +250,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/apiserver_design.html">API Server Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/pipeline.html">Pipeline Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/config.html">Config</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/adding_parameters.html">Adding a Parameter</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/communication.html">Communication</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/reference_encode_service.html">Reference Encode Service</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/profiler.html">Request-level profiler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/qwen3_asr_concurrency_profile.html">Qwen3-ASR High-Concurrency Benchmark and Bottleneck Profile</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/rl_admin_control.html">RL Admin Control</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/bump_version.html">Bumping the SGLang Pin</a></li>
 </ul>
 
     </div>
@@ -527,18 +531,18 @@
 <span class="nv">BUS</span><span class="o">=</span><span class="k">$(</span>nvidia-smi<span class="w"> </span>--query-gpu<span class="o">=</span>pci.bus_id<span class="w"> </span>--format<span class="o">=</span>csv,noheader<span class="w"> </span>-i<span class="w"> </span><span class="nv">$GPU_ID</span><span class="k">)</span>
 <span class="nv">BUS</span><span class="o">=</span><span class="si">${</span><span class="nv">BUS</span><span class="p">,,</span><span class="si">}</span><span class="p">;</span><span class="w"> </span><span class="nv">BUS</span><span class="o">=</span><span class="si">${</span><span class="nv">BUS</span><span class="p">:</span><span class="nv">4</span><span class="si">}</span>
 <span class="nv">NODE</span><span class="o">=</span><span class="k">$(</span>cat<span class="w"> </span>/sys/bus/pci/devices/<span class="nv">$BUS</span>/numa_node<span class="k">)</span><span class="w">   </span><span class="c1"># if -1, set the node explicitly</span>
-numactl<span class="w"> </span>-H<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span><span class="s2">&quot;node </span><span class="nv">$NODE</span><span class="s2"> cpus&quot;</span>
+numactl<span class="w"> </span>-H<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span><span class="s2">"node </span><span class="nv">$NODE</span><span class="s2"> cpus"</span>
 </pre></div>
 </div>
 <p>Pick a GPU that is idle, then find its NUMA node from the PCI bus id (drm card ordinals do not always match nvidia-smi ordinals). Choose non-overlapping physical CPU-core blocks from that node, one block per replica.</p>
 <ol class="arabic simple" start="2">
 <li><p><strong>Launch the replicas.</strong></p></li>
 </ol>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">CONFIG</span><span class="o">=</span>examples/mps_dp/configs/higgs_h100_dp3.yaml<span class="w"> </span><span class="nv">N</span><span class="o">=</span><span class="m">3</span><span class="w"> </span><span class="nv">CORE_BLOCKS</span><span class="o">=</span><span class="s2">&quot;0-9 10-19 20-29&quot;</span><span class="w"> </span>bash<span class="w"> </span>examples/mps_dp/launch.sh<span class="w"> </span>up
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">CONFIG</span><span class="o">=</span>examples/mps_dp/configs/higgs_h100_dp3.yaml<span class="w"> </span><span class="nv">N</span><span class="o">=</span><span class="m">3</span><span class="w"> </span><span class="nv">CORE_BLOCKS</span><span class="o">=</span><span class="s2">"0-9 10-19 20-29"</span><span class="w"> </span>bash<span class="w"> </span>examples/mps_dp/launch.sh<span class="w"> </span>up
 </pre></div>
 </div>
 <p>The command above is the validated H100 Higgs DP3 recipe. For the validated H200 Higgs DP8 recipe, use:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">CONFIG</span><span class="o">=</span>examples/mps_dp/configs/higgs_h200_dp8.yaml<span class="w"> </span><span class="nv">N</span><span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="nv">CORE_BLOCKS</span><span class="o">=</span><span class="s2">&quot;0-3 4-7 8-11 12-15 16-19 20-23 24-27 28-31&quot;</span><span class="w"> </span>bash<span class="w"> </span>examples/mps_dp/launch.sh<span class="w"> </span>up
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">CONFIG</span><span class="o">=</span>examples/mps_dp/configs/higgs_h200_dp8.yaml<span class="w"> </span><span class="nv">N</span><span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="nv">CORE_BLOCKS</span><span class="o">=</span><span class="s2">"0-3 4-7 8-11 12-15 16-19 20-23 24-27 28-31"</span><span class="w"> </span>bash<span class="w"> </span>examples/mps_dp/launch.sh<span class="w"> </span>up
 </pre></div>
 </div>
 <p>The pipeline config supplies the model and per-replica runtime settings. The launcher environment supplies host-local placement, including the GPU, replica count, and CPU blocks. The launcher resolves the GPU’s NUMA node, assigns local ports automatically, starts a private MPS daemon, waits for each replica’s health check before starting the next, and verifies MPS attachment. The CPU blocks above are specific to the tested hosts; derive the correct non-overlapping blocks for your own CPU topology.</p>
@@ -597,7 +601,7 @@ numactl<span class="w"> </span>-H<span class="w"> </span><span class="p">|</span
 <section id="shared-weights-across-replicas-opt-in-default-off">
 <h2>Shared weights across replicas (opt-in, default off)<a class="headerlink" href="#shared-weights-across-replicas-opt-in-default-off" title="Link to this heading">#</a></h2>
 <p>By default every replica loads its own full copy of the AR backbone (7.60 GiB for Higgs 3-4B — about a third of a DP3 footprint). Since all replicas run the same read-only weights on the same GPU, the launcher can instead share <strong>one</strong> copy over CUDA IPC:</p>
-<p><strong>Scope and contract.</strong> This is opt-in (<code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code>, default off) and gated to <strong>validated architectures with tp=pp=1</strong>; anything else is rejected before any resource is created, because a model that writes per-request state into a shared parameter would corrupt co-located replicas. An architecture audit alone does not enable sharing: a model is supported only after the documented launcher command passed end-to-end validation (shared N=2 boot under MPS, health, attach verification, concurrent-request correctness, clean teardown) at the current revision. <code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code> requires <code class="docutils literal notranslate"><span class="pre">CONFIG</span></code>, so the supported-config check runs in preflight, before the MPS daemon, state directory, or any replica exists. Each supported architecture carries a share policy: registered tensors the model writes at serving time (per-step decode staging scratch) are classified <strong>replica-private</strong> — every replica keeps its own storage for them and only the immutable weights alias one storage. Leader and follower derive the classification from the same policy and fail closed on any disagreement (it is part of the manifest). Sharing is a whole-group lifecycle: the leader must outlive followers, restart the whole run together (never a single replica), online weight updates are refused while sharing is active, and each follower requires an explicit <code class="docutils literal notranslate"><span class="pre">--max-total-tokens</span></code> (its dummy weights are freed before KV profiling, so KV sizing must be pinned). <code class="docutils literal notranslate"><span class="pre">autodp.sh</span></code> sizes a <strong>maximum <em>estimated</em></strong> DP (boot-validated), not an absolute safe maximum; because its sizing assumes sharing, it defaults <code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code>, while <code class="docutils literal notranslate"><span class="pre">launch.sh</span></code> itself defaults off.</p>
+<p><strong>Scope and contract.</strong> This is opt-in (<code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code>, default off) and gated to <strong>validated architectures with tp=pp=1</strong>; anything else is rejected before any resource is created, because a model that writes per-request state into a shared parameter would corrupt co-located replicas. An architecture audit alone does not enable sharing: a model is supported only after the documented launcher command passed end-to-end validation (shared N=2 boot under MPS, health, attach verification, concurrent-request correctness, clean teardown) at the current revision. <code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code> requires <code class="docutils literal notranslate"><span class="pre">CONFIG</span></code>, so the supported-config check runs in preflight, before the MPS daemon, state directory, or any replica exists. Each supported architecture carries a share policy: registered tensors the model writes at serving time (per-step decode staging scratch) are classified <strong>replica-private</strong> — every replica keeps its own storage for them and only the immutable weights alias one storage. Leader and follower derive the classification from the same policy and fail closed on any disagreement (it is part of the manifest). Sharing is a whole-group lifecycle: the leader must outlive followers, restart the whole run together (never a single replica), online weight updates are refused while sharing is active, and each follower requires an explicit <code class="docutils literal notranslate"><span class="pre">MAX_TOTAL_TOKENS</span></code> (its dummy weights are freed before KV profiling, so KV sizing must be pinned). <code class="docutils literal notranslate"><span class="pre">autodp.sh</span></code> sizes a <strong>maximum <em>estimated</em></strong> DP (boot-validated), not an absolute safe maximum; because its sizing assumes sharing, it defaults <code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code>, while <code class="docutils literal notranslate"><span class="pre">launch.sh</span></code> itself defaults off.</p>
 <p>A model is either <strong>supported</strong> or <strong>not supported</strong>; there is no intermediate tier. Supported means all of the following passed at the current revision, with commands and logs recorded in the PR: the documented <code class="docutils literal notranslate"><span class="pre">launch.sh</span></code> command boots <code class="docutils literal notranslate"><span class="pre">N=2</span></code> with <code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code> under a private MPS daemon, every replica passes its health check and MPS attach verification, the follower attaches the leader’s weights over CUDA IPC and holds no second resident copy of the shared weights after boot, concurrent requests across replicas return correct outputs (byte-identical audio to the single-replica baseline for TTS; word-identical transcripts for ASR, where timestamp fields may jitter under batching), and teardown leaves no replica process or MPS client behind. This is one-H100 end-to-end smoke validation — executable support evidence at the current revision, not a long-term stability or CI claim.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -654,14 +658,16 @@ numactl<span class="w"> </span>-H<span class="w"> </span><span class="p">|</span
 </tbody>
 </table>
 </div>
+<p>Validation update for #1401 Part 1: at code revision <a class="reference external" href="https://github.com/sgl-project/sglang-omni/pull/1557/commits/5e7a8c717b9ec85b1f72aa7d3444f9f5ff7ec72e"><code class="docutils literal notranslate"><span class="pre">5e7a8c7</span></code></a>, MOSS TTS local and MOSS TTS delay passed <code class="docutils literal notranslate"><span class="pre">N=2</span></code>, <code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code> health, MPS attachment, leader/follower byte-identity, request completion, and clean teardown on H200. Other Supported rows were not revalidated.</p>
 <p>Each supported model launches with its config from <code class="docutils literal notranslate"><span class="pre">examples/mps_dp/configs/</span></code> and the same command shape, for example:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">CONFIG</span><span class="o">=</span>examples/mps_dp/configs/moss_delay_h100_dp2.yaml<span class="w"> </span><span class="nv">N</span><span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="nv">WEIGHT_SHARE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">CORE_BLOCKS</span><span class="o">=</span><span class="s2">&quot;0-7 8-15&quot;</span><span class="w"> </span>bash<span class="w"> </span>examples/mps_dp/launch.sh<span class="w"> </span>up
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">CONFIG</span><span class="o">=</span>examples/mps_dp/configs/moss_delay_h100_dp2.yaml<span class="w"> </span><span class="nv">N</span><span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="nv">WEIGHT_SHARE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">CORE_BLOCKS</span><span class="o">=</span><span class="s2">"0-7 8-15"</span><span class="w"> </span>bash<span class="w"> </span>examples/mps_dp/launch.sh<span class="w"> </span>up
 </pre></div>
 </div>
 <p>Everything else is <strong>not supported</strong> and is rejected in preflight, before the MPS daemon, state directory, handle file, or any replica process exists. For these, a completed architecture audit is recorded where one exists, but support is still in progress:</p>
 <ul class="simple">
 <li><p>Ming TTS (<code class="docutils literal notranslate"><span class="pre">MingTTSSGLangModel</span></code>): audit complete; blocked on VRAM (the 16.8B leader alone reaches the 80 GB card edge), pending an H200 pass.</p></li>
-<li><p>Voxtral TTS (<code class="docutils literal notranslate"><span class="pre">VoxtralSGLangTTSModel</span></code>), Fish S2-Pro (<code class="docutils literal notranslate"><span class="pre">S2ProSGLangTextModel</span></code>), Qwen3-TTS (<code class="docutils literal notranslate"><span class="pre">Qwen3TTSTalker</span></code>): audit complete; shared boots were observed in exploratory runs, but concurrent-request correctness needs each model’s own client, which this validation does not have yet.</p></li>
+<li><p>Voxtral TTS (<code class="docutils literal notranslate"><span class="pre">VoxtralSGLangTTSModel</span></code>), Fish S2-Pro (<code class="docutils literal notranslate"><span class="pre">S2ProSGLangTextModel</span></code>): audit complete; shared boots were observed in exploratory runs, but concurrent-request correctness needs each model’s own client, which this validation does not have yet.</p></li>
+<li><p>Qwen3-TTS (<code class="docutils literal notranslate"><span class="pre">Qwen3TTSTalker</span></code>): audit complete. At code revision <a class="reference external" href="https://github.com/sgl-project/sglang-omni/commit/cd45a47a1838017c89fb2178f167aac0cd7412a3"><code class="docutils literal notranslate"><span class="pre">cd45a47</span></code></a>, deterministic inference passed the <code class="docutils literal notranslate"><span class="pre">N=2</span></code>, <code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code> concurrent byte-identity qualification on H200 with a 30,000-token cap. It remains not supported because that result requires <code class="docutils literal notranslate"><span class="pre">enable_deterministic_inference:</span> <span class="pre">true</span></code>, which serializes preprocessing and vocoder decoding and disables Talker compilation and the initial vocoder CUDA graph, materially reducing throughput. Default-mode inference has not passed the byte-identity contract, so the launcher continues to reject weight sharing for this pipeline.</p></li>
 <li><p>LLaDA2 (<code class="docutils literal notranslate"><span class="pre">LLaDA2MoeModelLM</span></code>): audit complete; its pipeline declares no generation SGLang stage, so the launcher cannot drive it at any <code class="docutils literal notranslate"><span class="pre">N</span></code>.</p></li>
 <li><p>Qwen3-Omni (<code class="docutils literal notranslate"><span class="pre">Qwen3OmniThinkerForCausalLM</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen3OmniTalker</span></code>): audit of both engines complete; the speech pipeline runs two SGLang engines and the text pipeline declares no generation stage, so the launcher cannot drive either.</p></li>
 <li><p>Ming-Omni thinker (<code class="docutils literal notranslate"><span class="pre">BailingMoeV2ForCausalLM</span></code>) and every other architecture: no completed audit; adding one requires a post-load mutation audit, a policy entry, and the full launcher validation above.</p></li>
@@ -877,7 +883,7 @@ numactl<span class="w"> </span>-H<span class="w"> </span><span class="p">|</span
 </table>
 </div>
 <p>The failures: one DP2 benchmark run hit <code class="docutils literal notranslate"><span class="pre">cudaErrorMpsRpcFailure</span></code>, and one DP2 and one DP3 replica failed to start, all coinciding with host-load spikes. One DP3 run completed every request but at 13.3 qps, so it is marked degraded rather than excluded. The core-pinned single stayed within a few percent across all runs, and DP3 was not clearly repeatably better than DP2.</p>
-<p>Note: the <code class="docutils literal notranslate"><span class="pre">--max-total-tokens</span></code> option makes per-replica KV sizing more explicit and comparable. It is not a direct fix for <code class="docutils literal notranslate"><span class="pre">cudaErrorMpsRpcFailure</span></code>, and the launch and runtime failure rate has not been re-measured with it in place; the failures in the table reflect the runs as recorded.</p>
+<p>Note: the <code class="docutils literal notranslate"><span class="pre">MAX_TOTAL_TOKENS</span></code> setting makes per-replica KV sizing more explicit and comparable. It is not a direct fix for <code class="docutils literal notranslate"><span class="pre">cudaErrorMpsRpcFailure</span></code>, and the launch and runtime failure rate has not been re-measured with it in place; the failures in the table reflect the runs as recorded.</p>
 <p>The #907 profiling, this repeated case study, and the reviewer verification below are three separate measurement series. They ran on different dates and load, and in some cases different software, so they should not be compared by absolute QPS; the differences between roughly 61, 21, and 29.9 qps are not attributed to a single cause.</p>
 <blockquote>
 <div><p>A separate reviewer verification on the same pinned software revision measured 29.9, 59.7, and 64.5 qps for single, DP2, and DP3. Absolute throughput differed between the two runtime environments, including different observed admission behavior, so the two series should not be combined. Both nevertheless showed a clear DP gain once every configuration was saturated.</p>
@@ -894,7 +900,7 @@ nsys<span class="w"> </span>profile<span class="w"> </span>--gpu-metrics-devices
 <h2>Limits and next steps<a class="headerlink" href="#limits-and-next-steps" title="Link to this heading">#</a></h2>
 <ol class="arabic simple">
 <li><p><strong>Generality is not fully validated.</strong> Beyond the pinned H100 Higgs case study, we also ran related experiments on H200 and used SGLang to serve Qwen3-4B directly; both lines of work largely confirmed the same-GPU DP gains. Space and time limit how completely we can present those results here, and the measurements are not yet as polished as we would like. We believe same-GPU DP is a promising direction for smaller models on GPUs with ample memory and compute headroom, but the experimental coverage is still incomplete.</p></li>
-<li><p><strong>KV sizing is hardware- and workload-specific.</strong> The launcher enforces equal per-replica KV capacity through a common <code class="docutils literal notranslate"><span class="pre">--max-total-tokens</span></code>. A sizing procedure that generalizes across models, runtimes, and GPU configurations still requires further study.</p></li>
+<li><p><strong>KV sizing is hardware- and workload-specific.</strong> The launcher enforces equal per-replica KV capacity through a common <code class="docutils literal notranslate"><span class="pre">MAX_TOTAL_TOKENS</span></code>. A sizing procedure that generalizes across models, runtimes, and GPU configurations still requires further study.</p></li>
 <li><p><strong>Router and scheduler still need a deeper dive.</strong> Both the router and the SGLang Omni scheduler need further optimization. On the router side, better routing strategies for a colocated pool are clearly required. On the scheduler side, a more ambitious question is whether we can borrow the spirit of LLM prefill–decode (PD) disaggregation: keep one large shared KV cache and let multiple replicas share it. That direction is extremely challenging, and we believe the potential payoff is correspondingly large.</p></li>
 </ol>
 <p>Same-GPU DP with MPS can recover idle GPU time on host- or dispatch-bound serving today, but broader validation and the work above are still unfinished. If this direction interests you, or you have results from other models, GPUs, or workloads that confirm or challenge these findings, we would like to work with you.</p>
@@ -992,7 +998,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 13, 2026.
+  Last updated on Aug 30, 2026.
   <br/>
 </p>
   </div>
