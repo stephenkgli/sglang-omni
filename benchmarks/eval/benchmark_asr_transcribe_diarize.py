@@ -480,6 +480,11 @@ def _add_dataset_args(
         default=None,
         help="Optional number of samples to evaluate. Defaults to the full split.",
     )
+    parser.add_argument(
+        "--exclude-sample-ids",
+        default="",
+        help="Comma-separated sample IDs to exclude from the evaluation.",
+    )
     parser.add_argument("--output-dir", default=dataset_config.output_dir)
 
 
@@ -611,7 +616,7 @@ def _add_server_args(parser: argparse.ArgumentParser) -> None:
 
 def _load_samples(args: argparse.Namespace) -> list[Movies800Sample]:
     dataset_config = DATASET_CONFIGS[args.dataset]
-    return load_movies800_samples(
+    samples = load_movies800_samples(
         repo_id=args.repo_id,
         split=args.split,
         audio_column=args.audio_column,
@@ -619,6 +624,12 @@ def _load_samples(args: argparse.Namespace) -> list[Movies800Sample]:
         max_samples=args.max_samples,
         expected_sample_count=dataset_config.expected_sample_count,
     )
+    excluded = {
+        sample_id.strip()
+        for sample_id in args.exclude_sample_ids.split(",")
+        if sample_id.strip()
+    }
+    return [sample for sample in samples if sample.sample_id not in excluded]
 
 
 def _run_with_or_without_server(
@@ -939,6 +950,7 @@ def _asr_results_config(
         "request_timeout_s": args.request_timeout_s,
         "max_new_tokens": args.max_new_tokens,
         "max_samples": args.max_samples,
+        "exclude_sample_ids": args.exclude_sample_ids,
         "wall_clock_s": wall_clock_s,
         "timing_scope": "asr_requests_only",
     }
